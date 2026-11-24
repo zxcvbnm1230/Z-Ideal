@@ -131,16 +131,10 @@ impl Commands {
     }
 
     /// Queues insertion or replacement of a component on an existing or pending entity.
-    pub fn insert<T: Component>(
-        &mut self,
-        target: impl Into<EntityTarget>,
-        component: T,
-    ) {
+    pub fn insert<T: Component>(&mut self, target: impl Into<EntityTarget>, component: T) {
         self.commands.push(Command::Insert {
             target: target.into(),
-            operation: Box::new(move |world, entity| {
-                world.insert(entity, component).map(|_| ())
-            }),
+            operation: Box::new(move |world, entity| world.insert(entity, component).map(|_| ())),
         });
     }
 
@@ -159,11 +153,7 @@ impl Commands {
 
     /// Queues a parent change. Pending targets must have had their spawn command
     /// queued earlier in this buffer.
-    pub fn set_parent(
-        &mut self,
-        child: impl Into<EntityTarget>,
-        parent: Option<EntityTarget>,
-    ) {
+    pub fn set_parent(&mut self, child: impl Into<EntityTarget>, parent: Option<EntityTarget>) {
         self.commands.push(Command::SetParent {
             child: child.into(),
             parent,
@@ -181,13 +171,10 @@ impl Commands {
                 Command::Despawn(entity) => world.despawn(entity)?,
                 Command::SetParent { child, parent } => {
                     let child = resolve(child, &spawned)?;
-                    let parent = parent
-                        .map(|target| resolve(target, &spawned))
-                        .transpose()?;
+                    let parent = parent.map(|target| resolve(target, &spawned)).transpose()?;
                     world.set_parent(child, parent)?;
                 }
-                Command::Insert { target, operation }
-                | Command::Remove { target, operation } => {
+                Command::Insert { target, operation } | Command::Remove { target, operation } => {
                     let entity = resolve(target, &spawned)?;
                     operation(world, entity)?;
                 }

@@ -77,7 +77,10 @@ impl Schedule {
         }
         self.systems.push(SystemNode {
             name,
-            after: after.iter().map(|dependency| (*dependency).to_owned()).collect(),
+            after: after
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
             run: Box::new(run),
         });
         Ok(())
@@ -102,11 +105,9 @@ impl Schedule {
         for index in self.ordered_indices()? {
             let system = &mut self.systems[index];
             let mut commands = Commands::new();
-            (system.run)(world, &mut commands).map_err(|message| {
-                ScheduleError::SystemFailed {
-                    system: system.name.clone(),
-                    message,
-                }
+            (system.run)(world, &mut commands).map_err(|message| ScheduleError::SystemFailed {
+                system: system.name.clone(),
+                message,
             })?;
             commands.apply(world)?;
         }
@@ -212,7 +213,10 @@ mod tests {
         schedule
             .run(&mut World::new())
             .expect("run dependency schedule");
-        assert_eq!(*events.lock().expect("event mutex"), vec!["update", "render"]);
+        assert_eq!(
+            *events.lock().expect("event mutex"),
+            vec!["update", "render"]
+        );
     }
 
     #[test]
@@ -333,7 +337,6 @@ mod tests {
         assert_eq!(entities.len(), 1);
         assert_eq!(world.get::<Marker>(entities[0]), Some(&Marker(1)));
     }
-
 
     #[test]
     fn failed_system_discards_its_commands() {

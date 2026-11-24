@@ -116,7 +116,9 @@ mod tests {
     #[test]
     fn stable_component_ids_cannot_be_reused() {
         let mut world = World::new();
-        world.register_component::<Health>().expect("register Health");
+        world
+            .register_component::<Health>()
+            .expect("register Health");
         assert_eq!(
             world.register_component::<DuplicateId>(),
             Err(WorldError::DuplicateComponentId("sample.health"))
