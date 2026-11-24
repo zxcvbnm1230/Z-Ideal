@@ -356,6 +356,12 @@ pub enum SceneError {
         /// Referenced entity ID that was not found.
         target: SceneEntityId,
     },
+    /// An override targets an entity that is not part of the prefab.
+    #[error("prefab override targets unknown source entity {0:?}")]
+    UnknownPrefabEntity(SceneEntityId),
+    /// A prefab entity could not be resolved after a successful scene load.
+    #[error("instantiated prefab entity is missing for source ID {0:?}")]
+    PrefabInstanceEntityMissing(SceneEntityId),
     /// Persistent scene ID allocation is exhausted.
     #[error("persistent scene entity ID space is exhausted")]
     SceneEntityIdExhausted,
