@@ -1,0 +1,12 @@
+[package]
+name = "z-ideal-runtime-app"
+description = "Z Ideal game runtime executable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+z-ideal-runtime = { path = "../../crates/z-ideal-runtime" }
+z-ideal-core = { path = "../../crates/z-ideal-core" }
+tracing.workspace = true

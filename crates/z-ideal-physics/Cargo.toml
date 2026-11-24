@@ -1,0 +1,12 @@
+[package]
+name = "z-ideal-physics"
+description = "Engine-facing physics API and isolated Box3D adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+z-ideal-core = { path = "../z-ideal-core" }
+z-ideal-math = { path = "../z-ideal-math" }
+z-ideal-scene = { path = "../z-ideal-scene" }

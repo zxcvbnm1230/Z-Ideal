@@ -1,0 +1,12 @@
+[package]
+name = "z-ideal-editor-app"
+description = "Z Ideal editor executable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+z-ideal-editor = { path = "../../crates/z-ideal-editor" }
+z-ideal-core = { path = "../../crates/z-ideal-core" }
+tracing.workspace = true
