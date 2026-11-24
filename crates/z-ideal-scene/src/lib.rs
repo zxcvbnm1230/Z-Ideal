@@ -2,14 +2,18 @@
 
 #![forbid(unsafe_code)]
 
+mod commands;
 mod component;
 mod entity;
 mod hierarchy;
+mod schedule;
 mod world;
 
+pub use commands::{CommandError, Commands, EntityTarget, PendingEntity};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use hierarchy::HierarchyError;
+pub use schedule::{Schedule, ScheduleError};
 pub use world::{World, WorldError};
 
 use z_ideal_math::Transform;
@@ -112,9 +116,7 @@ mod tests {
     #[test]
     fn stable_component_ids_cannot_be_reused() {
         let mut world = World::new();
-        world
-            .register_component::<Health>()
-            .expect("register Health");
+        world.register_component::<Health>().expect("register Health");
         assert_eq!(
             world.register_component::<DuplicateId>(),
             Err(WorldError::DuplicateComponentId("sample.health"))
