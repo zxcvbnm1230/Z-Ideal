@@ -204,3 +204,301 @@ pub enum SceneError {
     #[error(transparent)]
     World(#[from] crate::WorldError),
 }
+
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+
+    use super::{
+        SCENE_SCHEMA_VERSION, SceneDocument, SceneEntityId, SceneEntityRecord, SceneError,
+        SerializedComponent,
+    };
+    use crate::{Component, World};
+    use z_ideal_math::{Quat, Transform, Vec3};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Health {
+        current: u32,
+    }
+
+    impl Component for Health {
+        const ID: &'static str = "test.scene_health";
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MigratingValue {
+        value: u32,
+    }
+
+    impl Component for MigratingValue {
+        const ID: &'static str = "test.migrating_value";
+        const VERSION: u32 = 2;
+
+        fn migrate(from_version: u32, data: Value) -> Result<Value, String> {
+            match from_version {
+                1 => {
+                    let old_value = data
+                        .get("legacy_value")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "legacy_value must be an unsigned integer".to_owned())?;
+                    Ok(json!({ "value": old_value }))
+                }
+                2 => Ok(data),
+                _ => Err(format!("unsupported test migration source version {from_version}")),
+            }
+        }
+    }
+
+    fn test_id(value: u64) -> SceneEntityId {
+        SceneEntityId::new(value).expect("valid scene entity ID")
+    }
+
+    fn world_with_components() -> World {
+        let mut world = World::new();
+        world
+            .register_component::<Health>()
+            .expect("register Health");
+        world
+            .register_component::<Transform>()
+            .expect("register Transform");
+        world
+    }
+
+    #[test]
+    fn scene_json_round_trip_preserves_ids_components_and_hierarchy() {
+        let mut source = world_with_components();
+        let parent = source.spawn().expect("spawn parent");
+        let child = source.spawn().expect("spawn child");
+        source
+            .insert(parent, Health { current: 100 })
+            .expect("insert parent health");
+        source
+            .insert(child, Health { current: 40 })
+            .expect("insert child health");
+        source
+            .insert(
+                parent,
+                Transform::new(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE)
+                    .expect("parent transform"),
+            )
+            .expect("insert parent transform");
+        source
+            .set_parent(child, Some(parent))
+            .expect("set child parent");
+
+        let parent_id = source.scene_entity_id(parent).expect("parent scene ID");
+        let child_id = source.scene_entity_id(child).expect("child scene ID");
+        let first_json = source.to_scene_json().expect("serialize source");
+        assert_eq!(first_json, source.to_scene_json().expect("serialize again"));
+
+        let mut loaded = world_with_components();
+        loaded.load_scene_json(&first_json).expect("load scene");
+        let loaded_parent = loaded
+            .entity_for_scene_id(parent_id)
+            .expect("resolve parent ID");
+        let loaded_child = loaded
+            .entity_for_scene_id(child_id)
+            .expect("resolve child ID");
+
+        assert_eq!(
+            loaded.get::<Health>(loaded_parent),
+            Some(&Health { current: 100 })
+        );
+        assert_eq!(
+            loaded.get::<Health>(loaded_child),
+            Some(&Health { current: 40 })
+        );
+        assert_eq!(loaded.parent_of(loaded_child), Some(loaded_parent));
+        assert_eq!(
+            loaded
+                .world_transform(loaded_child)
+                .expect("child world transform")
+                .transform_point3(Vec3::ZERO),
+            Vec3::new(3.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn scene_load_is_transactional_when_component_is_unknown() {
+        let mut world = World::new();
+        world
+            .register_component::<Health>()
+            .expect("register Health");
+        let existing = world.spawn().expect("spawn existing");
+        world
+            .insert(existing, Health { current: 88 })
+            .expect("insert existing health");
+
+        let mut record = SceneEntityRecord::new(test_id(10), None);
+        record.components.insert(
+            "unknown.component".to_owned(),
+            SerializedComponent {
+                schema_version: 1,
+                data: json!({ "value": 1 }),
+            },
+        );
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![record],
+        };
+
+        assert_eq!(
+            world.load_scene_document(&document),
+            Err(SceneError::UnknownComponent(
+                "unknown.component".to_owned()
+            ))
+        );
+        assert!(world.is_alive(existing));
+        assert_eq!(
+            world.get::<Health>(existing),
+            Some(&Health { current: 88 })
+        );
+    }
+
+    #[test]
+    fn component_schema_migration_is_explicit_and_applied() {
+        let mut world = World::new();
+        world
+            .register_component::<MigratingValue>()
+            .expect("register migrating component");
+        let mut record = SceneEntityRecord::new(test_id(7), None);
+        record.components.insert(
+            MigratingValue::ID.to_owned(),
+            SerializedComponent {
+                schema_version: 1,
+                data: json!({ "legacy_value": 73 }),
+            },
+        );
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![record],
+        };
+
+        world
+            .load_scene_document(&document)
+            .expect("migrate old component");
+        let entity = world
+            .entity_for_scene_id(test_id(7))
+            .expect("resolve migrated entity");
+        assert_eq!(
+            world.get::<MigratingValue>(entity),
+            Some(&MigratingValue { value: 73 })
+        );
+    }
+
+    #[test]
+    fn default_component_migration_rejects_unknown_versions() {
+        let mut world = World::new();
+        world
+            .register_component::<Health>()
+            .expect("register Health");
+        let mut record = SceneEntityRecord::new(test_id(1), None);
+        record.components.insert(
+            Health::ID.to_owned(),
+            SerializedComponent {
+                schema_version: 9,
+                data: json!({ "current": 5 }),
+            },
+        );
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![record],
+        };
+
+        assert!(matches!(
+            world.load_scene_document(&document),
+            Err(SceneError::ComponentMigration {
+                component_id: "test.scene_health",
+                from_version: 9,
+                to_version: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn component_payload_rejects_unknown_fields() {
+        let mut world = World::new();
+        world
+            .register_component::<Health>()
+            .expect("register Health");
+        let mut record = SceneEntityRecord::new(test_id(1), None);
+        record.components.insert(
+            Health::ID.to_owned(),
+            SerializedComponent {
+                schema_version: 1,
+                data: json!({ "current": 5, "unexpected": true }),
+            },
+        );
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![record],
+        };
+
+        assert!(matches!(
+            world.load_scene_document(&document),
+            Err(SceneError::InvalidComponentData {
+                component_id: "test.scene_health",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn document_validation_rejects_duplicate_and_missing_parent_ids() {
+        let duplicate = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![
+                SceneEntityRecord::new(test_id(3), None),
+                SceneEntityRecord::new(test_id(3), None),
+            ],
+        };
+        assert_eq!(
+            duplicate.validate(),
+            Err(SceneError::DuplicateSceneEntityId(test_id(3)))
+        );
+
+        let missing_parent = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: vec![SceneEntityRecord::new(test_id(3), Some(test_id(99)))],
+        };
+        assert_eq!(
+            missing_parent.validate(),
+            Err(SceneError::MissingParent {
+                entity: test_id(3),
+                parent: test_id(99),
+            })
+        );
+    }
+
+    #[test]
+    fn scene_schema_version_is_checked() {
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION + 1,
+            entities: Vec::new(),
+        };
+        assert_eq!(
+            document.validate(),
+            Err(SceneError::UnsupportedSceneVersion(
+                SCENE_SCHEMA_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_json_and_unknown_document_fields_are_rejected() {
+        let mut world = World::new();
+        assert!(matches!(
+            world.load_scene_json(r#"{"schema_version":1,"entities":[],"unexpected":true}"#),
+            Err(SceneError::Json(_))
+        ));
+        assert!(matches!(
+            world.load_scene_json("not-json"),
+            Err(SceneError::Json(_))
+        ));
+    }
+}

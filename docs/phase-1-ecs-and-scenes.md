@@ -31,9 +31,8 @@ Phase 1 establishes engine math conventions, generation-safe entities, authorita
 - A failed system discards its own command buffer. Command application is sequential, not transactional; if a command fails, earlier commands in that buffer remain applied.
 
 ## Phase completion requirements
-- Versioned scene documents, stable serialized component IDs, explicit migrations, malformed-input rejection and round-trip fixtures.
 - Prefab instantiation with entity-reference remapping and explicit override semantics.
-- Unit, integration, fixture, and cross-platform CI coverage for these contracts.
+- Unit, integration, fixture, and cross-platform CI coverage for all scene and prefab contracts.
 
 ## Implementation status
-Implemented in this Phase 1 slice: math conventions and validated Transform, generation-safe entity lifecycle, registered sparse-set component storage, cycle-safe hierarchy operations, deterministic dependency-aware scheduling, and deferred command buffers. Versioned scene serialization/migrations and prefab workflows remain incomplete and are not represented as implemented.
+Implemented in this Phase 1 slice: math conventions and validated Transform, generation-safe entity lifecycle, registered sparse-set component storage, cycle-safe hierarchy operations, deterministic dependency-aware scheduling, deferred command buffers, versioned scene documents, stable serialized component IDs, transactional loading, strict component payload validation, and explicit component migrations. Prefab workflows remain incomplete and are not represented as implemented.
