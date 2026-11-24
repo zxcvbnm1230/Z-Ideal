@@ -49,7 +49,9 @@ mod tests {
 
     fn world_with_health() -> World {
         let mut world = World::new();
-        world.register_component::<Health>().expect("register Health");
+        world
+            .register_component::<Health>()
+            .expect("register Health");
         world
     }
 
@@ -120,7 +122,9 @@ mod tests {
     #[test]
     fn invalid_transform_component_is_rejected() {
         let mut world = World::new();
-        world.register_component::<Transform>().expect("register Transform");
+        world
+            .register_component::<Transform>()
+            .expect("register Transform");
         let entity = world.spawn().expect("spawn");
         let invalid = serde_json::from_str::<Transform>(
             r#"{"translation":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,0.0],"scale":[1.0,1.0,1.0]}"#,
