@@ -512,6 +512,7 @@ mod tests {
         );
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 11,
             entities: vec![record],
         };
 
@@ -539,6 +540,7 @@ mod tests {
         );
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 8,
             entities: vec![record],
         };
 
@@ -570,6 +572,7 @@ mod tests {
         );
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 2,
             entities: vec![record],
         };
 
@@ -600,6 +603,7 @@ mod tests {
         );
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 2,
             entities: vec![record],
         };
 
@@ -616,6 +620,7 @@ mod tests {
     fn document_validation_rejects_duplicate_and_missing_parent_ids() {
         let duplicate = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 4,
             entities: vec![
                 SceneEntityRecord::new(test_id(3), None),
                 SceneEntityRecord::new(test_id(3), None),
@@ -628,6 +633,7 @@ mod tests {
 
         let missing_parent = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 4,
             entities: vec![SceneEntityRecord::new(test_id(3), Some(test_id(99)))],
         };
         assert_eq!(
@@ -643,6 +649,7 @@ mod tests {
     fn scene_schema_version_is_checked() {
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION + 1,
+            next_scene_entity_id: 1,
             entities: Vec::new(),
         };
         assert_eq!(
@@ -651,6 +658,29 @@ mod tests {
                 SCENE_SCHEMA_VERSION + 1
             ))
         );
+    }
+
+    #[test]
+    fn scene_document_preserves_deleted_entity_id_gaps() {
+        let mut source = World::new();
+        let retained = source.spawn().expect("spawn retained entity");
+        let deleted = source.spawn().expect("spawn entity to delete");
+        source.despawn(deleted).expect("despawn entity");
+
+        let document = source.to_scene_document().expect("serialize source");
+        assert_eq!(document.next_scene_entity_id, 3);
+
+        let mut restored = World::new();
+        restored
+            .load_scene_document(&document)
+            .expect("restore source");
+        let new_entity = restored.spawn().expect("spawn after restore");
+        assert_eq!(
+            restored.scene_entity_id(new_entity),
+            SceneEntityId::new(3)
+        );
+        let retained_id = source.scene_entity_id(retained).expect("retained scene ID");
+        assert!(restored.entity_for_scene_id(retained_id).is_some());
     }
 
     #[test]
