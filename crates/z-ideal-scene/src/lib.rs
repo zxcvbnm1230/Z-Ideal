@@ -6,6 +6,7 @@ mod commands;
 mod component;
 mod entity;
 mod hierarchy;
+mod prefab;
 mod scene_document;
 mod schedule;
 mod world;

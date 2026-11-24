@@ -677,7 +677,10 @@ mod tests {
             .load_scene_document(&document)
             .expect("restore source");
         let new_entity = restored.spawn().expect("spawn after restore");
-        assert_eq!(restored.scene_entity_id(new_entity), SceneEntityId::new(3));
+        assert_eq!(
+            restored.scene_entity_id(new_entity).expect("new scene ID"),
+            SceneEntityId::new(3).expect("expected scene ID")
+        );
         let retained_id = source.scene_entity_id(retained).expect("retained scene ID");
         assert!(restored.entity_for_scene_id(retained_id).is_some());
     }
