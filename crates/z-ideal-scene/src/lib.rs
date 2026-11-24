@@ -7,6 +7,7 @@ mod component;
 mod entity;
 mod hierarchy;
 mod schedule;
+mod scene_document;
 mod world;
 
 pub use commands::{CommandError, Commands, EntityTarget, PendingEntity};
@@ -14,6 +15,10 @@ pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use hierarchy::HierarchyError;
 pub use schedule::{Schedule, ScheduleError};
+pub use scene_document::{
+    SCENE_SCHEMA_VERSION, SceneDocument, SceneEntityId, SceneEntityRecord, SceneError,
+    SerializedComponent,
+};
 pub use world::{World, WorldError};
 
 use z_ideal_math::Transform;
@@ -38,6 +43,7 @@ mod tests {
     use z_ideal_math::{Quat, Vec3};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Health(f32);
 
     impl Component for Health {

@@ -5,8 +5,11 @@ use std::{
     collections::HashMap,
 };
 
+use serde_json::Value;
+
 use crate::{
-    Component, ComponentInfo, Entity,
+    Component, ComponentInfo, Entity, SceneDocument, SceneEntityId, SceneEntityRecord, SceneError,
+    SerializedComponent, SCENE_SCHEMA_VERSION,
     hierarchy::{Hierarchy, HierarchyError},
 };
 use z_ideal_math::{Mat4, Transform};
@@ -20,6 +23,9 @@ pub enum WorldError {
     /// The world has exhausted its representable entity slots.
     #[error("entity capacity exceeds the u32 slot index range")]
     EntityCapacityExceeded,
+    /// Persistent scene entity ID allocation is exhausted.
+    #[error("persistent scene entity ID space is exhausted")]
+    SceneEntityIdExhausted,
     /// Component storage must be registered before use.
     #[error("component is not registered: {0}")]
     ComponentNotRegistered(&'static str),
@@ -41,12 +47,14 @@ pub enum WorldError {
 struct EntitySlot {
     generation: u32,
     alive: bool,
+    scene_id: SceneEntityId,
 }
 
 trait ErasedStorage: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn remove_entity(&mut self, entity: Entity);
+    fn serialize_entity(&self, entity: Entity) -> Result<Option<Value>, serde_json::Error>;
 }
 
 #[derive(Debug)]
@@ -131,7 +139,7 @@ impl<T> SparseSet<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> ErasedStorage for SparseSet<T> {
+impl<T: Component> ErasedStorage for SparseSet<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -143,17 +151,58 @@ impl<T: Send + Sync + 'static> ErasedStorage for SparseSet<T> {
     fn remove_entity(&mut self, entity: Entity) {
         let _ = self.remove(entity);
     }
+
+    fn serialize_entity(&self, entity: Entity) -> Result<Option<Value>, serde_json::Error> {
+        self.get(entity).map(serde_json::to_value).transpose()
+    }
+}
+
+type ComponentDecoder = fn(&mut World, Entity, u32, Value) -> Result<(), SceneError>;
+type StorageFactory = fn() -> Box<dyn ErasedStorage>;
+
+#[derive(Clone)]
+struct ComponentDescriptor {
+    info: ComponentInfo,
+    decoder: ComponentDecoder,
+    storage_factory: StorageFactory,
+}
+
+fn create_storage<T: Component>() -> Box<dyn ErasedStorage> {
+    Box::<SparseSet<T>>::default()
+}
+
+fn decode_component<T: Component>(
+    world: &mut World,
+    entity: Entity,
+    version: u32,
+    data: Value,
+) -> Result<(), SceneError> {
+    let migrated = T::migrate(version, data).map_err(|message| SceneError::ComponentMigration {
+        component_id: T::ID,
+        from_version: version,
+        to_version: T::VERSION,
+        message,
+    })?;
+    let component = serde_json::from_value::<T>(migrated).map_err(|error| {
+        SceneError::InvalidComponentData {
+            component_id: T::ID,
+            message: error.to_string(),
+        }
+    })?;
+    world.insert(entity, component)?;
+    Ok(())
 }
 
 /// A single owned ECS world.
 ///
-/// Structural operations require mutable world access. Systems will use the
+/// Structural operations require mutable world access. Systems use the
 /// scheduler command buffer to defer structural changes to synchronization points.
 pub struct World {
     slots: Vec<EntitySlot>,
     free_slots: Vec<u32>,
+    next_scene_id: u64,
     storages: HashMap<TypeId, Box<dyn ErasedStorage>>,
-    component_by_type: HashMap<TypeId, ComponentInfo>,
+    component_by_type: HashMap<TypeId, ComponentDescriptor>,
     component_by_id: HashMap<&'static str, TypeId>,
     hierarchy: Hierarchy,
 }
@@ -171,6 +220,7 @@ impl World {
         Self {
             slots: Vec::new(),
             free_slots: Vec::new(),
+            next_scene_id: 1,
             storages: HashMap::new(),
             component_by_type: HashMap::new(),
             component_by_id: HashMap::new(),
@@ -197,27 +247,48 @@ impl World {
             return Err(WorldError::DuplicateComponentId(T::ID));
         }
 
-        self.storages
-            .insert(type_id, Box::<SparseSet<T>>::default());
+        self.storages.insert(type_id, create_storage::<T>());
         self.component_by_id.insert(T::ID, type_id);
-        self.component_by_type
-            .insert(type_id, ComponentInfo::new(T::ID, T::VERSION, type_id));
+        self.component_by_type.insert(
+            type_id,
+            ComponentDescriptor {
+                info: ComponentInfo::new(T::ID, T::VERSION, type_id),
+                decoder: decode_component::<T>,
+                storage_factory: create_storage::<T>,
+            },
+        );
         Ok(())
     }
 
     /// Returns registered component metadata sorted by stable ID.
     #[must_use]
     pub fn registered_components(&self) -> Vec<ComponentInfo> {
-        let mut components: Vec<_> = self.component_by_type.values().cloned().collect();
+        let mut components: Vec<_> = self
+            .component_by_type
+            .values()
+            .map(|descriptor| descriptor.info.clone())
+            .collect();
         components.sort_by_key(|component| component.id);
         components
     }
 
-    /// Creates a new entity, reusing a free slot with an incremented generation.
+    /// Creates a new entity with a fresh persistent scene ID.
     pub fn spawn(&mut self) -> Result<Entity, WorldError> {
+        let next_scene_id = self
+            .next_scene_id
+            .checked_add(1)
+            .ok_or(WorldError::SceneEntityIdExhausted)?;
+        let scene_id = SceneEntityId::new_unchecked(self.next_scene_id);
+        let entity = self.spawn_with_scene_id(scene_id)?;
+        self.next_scene_id = next_scene_id;
+        Ok(entity)
+    }
+
+    fn spawn_with_scene_id(&mut self, scene_id: SceneEntityId) -> Result<Entity, WorldError> {
         if let Some(index) = self.free_slots.pop() {
             let slot = &mut self.slots[index as usize];
             slot.alive = true;
+            slot.scene_id = scene_id;
             return Ok(Entity::new(index, slot.generation));
         }
 
@@ -226,8 +297,27 @@ impl World {
         self.slots.push(EntitySlot {
             generation: 1,
             alive: true,
+            scene_id,
         });
         Ok(Entity::new(index, 1))
+    }
+
+    /// Returns the persistent scene ID for a live entity.
+    pub fn scene_entity_id(&self, entity: Entity) -> Result<SceneEntityId, WorldError> {
+        if !self.is_alive(entity) {
+            return Err(WorldError::StaleEntity(entity));
+        }
+        Ok(self.slots[entity.index() as usize].scene_id)
+    }
+
+    /// Resolves a persistent scene ID to its current runtime handle.
+    #[must_use]
+    pub fn entity_for_scene_id(&self, scene_id: SceneEntityId) -> Option<Entity> {
+        self.slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.alive && slot.scene_id == scene_id)
+            .map(|(index, slot)| Entity::new(index as u32, slot.generation))
     }
 
     /// Returns whether the exact entity generation is alive in this world.
@@ -406,5 +496,145 @@ impl World {
             world_matrix *= local.matrix();
         }
         Ok(world_matrix)
+    }
+
+    /// Serializes the world to a validated, deterministic scene document.
+    pub fn to_scene_document(&self) -> Result<SceneDocument, SceneError> {
+        let mut entities = self.entities();
+        entities.sort_by_key(|entity| {
+            self.scene_entity_id(*entity)
+                .map(SceneEntityId::get)
+                .unwrap_or_default()
+        });
+
+        let mut records = Vec::with_capacity(entities.len());
+        let mut record_indices = HashMap::with_capacity(entities.len());
+        for entity in &entities {
+            let id = self.scene_entity_id(*entity)?;
+            let parent = self
+                .parent_of(*entity)
+                .map(|parent| self.scene_entity_id(parent))
+                .transpose()?;
+            record_indices.insert(*entity, records.len());
+            records.push(SceneEntityRecord::new(id, parent));
+        }
+
+        for (type_id, storage) in &self.storages {
+            let descriptor = self
+                .component_by_type
+                .get(type_id)
+                .ok_or(WorldError::StorageTypeMismatch("component registry"))?;
+            for entity in &entities {
+                if let Some(data) = storage.serialize_entity(*entity).map_err(|error| {
+                    SceneError::ComponentSerialization {
+                        component_id: descriptor.info.id.to_owned(),
+                        message: error.to_string(),
+                    }
+                })? {
+                    let index = record_indices
+                        .get(entity)
+                        .copied()
+                        .ok_or(WorldError::StaleEntity(*entity))?;
+                    records[index].components.insert(
+                        descriptor.info.id.to_owned(),
+                        SerializedComponent {
+                            schema_version: descriptor.info.version,
+                            data,
+                        },
+                    );
+                }
+            }
+        }
+
+        let document = SceneDocument {
+            schema_version: SCENE_SCHEMA_VERSION,
+            entities: records,
+        };
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// Serializes the world as pretty-printed JSON.
+    pub fn to_scene_json(&self) -> Result<String, SceneError> {
+        Ok(serde_json::to_string_pretty(&self.to_scene_document()?)?)
+    }
+
+    /// Loads a scene document transactionally.
+    ///
+    /// The existing world is replaced only after all entities, components,
+    /// migrations, and hierarchy relationships have been validated.
+    pub fn load_scene_document(&mut self, document: &SceneDocument) -> Result<(), SceneError> {
+        document.validate()?;
+        let max_id = document
+            .entities
+            .iter()
+            .map(|entity| entity.id.get())
+            .max()
+            .unwrap_or(0);
+        let next_scene_id = max_id
+            .checked_add(1)
+            .ok_or(SceneError::SceneEntityIdExhausted)?;
+
+        let mut staging = self.empty_with_registry();
+        staging.next_scene_id = next_scene_id.max(1);
+        let mut entities_by_id = HashMap::with_capacity(document.entities.len());
+
+        for record in &document.entities {
+            let entity = staging.spawn_with_scene_id(record.id)?;
+            entities_by_id.insert(record.id, entity);
+        }
+
+        for record in &document.entities {
+            let entity = entities_by_id[&record.id];
+            for (component_id, component) in &record.components {
+                let type_id = staging
+                    .component_by_id
+                    .get(component_id.as_str())
+                    .copied()
+                    .ok_or_else(|| SceneError::UnknownComponent(component_id.clone()))?;
+                let decoder = staging
+                    .component_by_type
+                    .get(&type_id)
+                    .map(|descriptor| descriptor.decoder)
+                    .ok_or(WorldError::StorageTypeMismatch("component registry"))?;
+                decoder(
+                    &mut staging,
+                    entity,
+                    component.schema_version,
+                    component.data.clone(),
+                )?;
+            }
+
+            if let Some(parent_id) = record.parent {
+                let parent = entities_by_id.get(&parent_id).copied().ok_or(
+                    SceneError::MissingParent {
+                        entity: record.id,
+                        parent: parent_id,
+                    },
+                )?;
+                staging.set_parent(entity, Some(parent))?;
+            }
+        }
+
+        *self = staging;
+        Ok(())
+    }
+
+    /// Parses and loads a JSON scene document transactionally.
+    pub fn load_scene_json(&mut self, source: &str) -> Result<(), SceneError> {
+        let document: SceneDocument = serde_json::from_str(source)?;
+        self.load_scene_document(&document)
+    }
+
+    fn empty_with_registry(&self) -> Self {
+        let mut world = Self::new();
+        world.component_by_type = self.component_by_type.clone();
+        world.component_by_id = self.component_by_id.clone();
+        for (type_id, descriptor) in &world.component_by_type {
+            world
+                .storages
+                .insert(*type_id, (descriptor.storage_factory)());
+        }
+        world
     }
 }
