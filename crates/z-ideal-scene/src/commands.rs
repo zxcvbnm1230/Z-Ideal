@@ -1,15 +1,37 @@
 //! Deferred, ordered world mutations produced by systems.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::{Component, Entity, World, WorldError};
 
 /// A handle to an entity that will be created when a command buffer is applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PendingEntity(u64);
+#[derive(Debug, Clone)]
+pub struct PendingEntity {
+    buffer_identity: Arc<()>,
+    id: u64,
+}
+
+impl PartialEq for PendingEntity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.buffer_identity, &other.buffer_identity) && self.id == other.id
+    }
+}
+
+impl Eq for PendingEntity {}
+
+impl Hash for PendingEntity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.buffer_identity) as usize).hash(state);
+        self.id.hash(state);
+    }
+}
 
 /// Identifies either an existing world entity or an entity reserved in this command buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EntityTarget {
     /// An entity that already exists in the world.
     Existing(Entity),
@@ -69,10 +91,20 @@ enum Command {
 /// A failed system discards its buffer. Application is sequential rather than
 /// transactional: if a command fails, earlier commands in that buffer remain
 /// applied and later commands are discarded.
-#[derive(Default)]
 pub struct Commands {
+    buffer_identity: Arc<()>,
     commands: Vec<Command>,
     next_pending_id: u64,
+}
+
+impl Default for Commands {
+    fn default() -> Self {
+        Self {
+            buffer_identity: Arc::new(()),
+            commands: Vec::new(),
+            next_pending_id: 0,
+        }
+    }
 }
 
 impl Commands {
@@ -89,9 +121,12 @@ impl Commands {
             .next_pending_id
             .checked_add(1)
             .ok_or(CommandError::PendingIdExhausted)?;
-        let pending = PendingEntity(self.next_pending_id);
+        let pending = PendingEntity {
+            buffer_identity: Arc::clone(&self.buffer_identity),
+            id: self.next_pending_id,
+        };
         self.next_pending_id = next;
-        self.commands.push(Command::Spawn(pending));
+        self.commands.push(Command::Spawn(pending.clone()));
         Ok(pending)
     }
 

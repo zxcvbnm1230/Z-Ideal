@@ -170,7 +170,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{Schedule, ScheduleError};
-    use crate::{Component, World};
+    use crate::{Commands, Component, World};
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +306,34 @@ mod tests {
         schedule.run(&mut world).expect("run schedule");
         assert_eq!(world.entities_with::<Marker>().len(), 1);
     }
+
+    #[test]
+    fn pending_entities_cannot_cross_command_buffers() {
+        let mut world = world_with_marker();
+        let mut foreign_commands = Commands::new();
+        let foreign_pending = foreign_commands.spawn().expect("reserve foreign entity");
+        let mut schedule = Schedule::new();
+
+        schedule
+            .add_system("create", &[], move |_, commands| {
+                let local_pending = commands.spawn().map_err(|error| error.to_string())?;
+                commands.insert(local_pending, Marker(1));
+                commands.insert(foreign_pending.clone(), Marker(2));
+                Ok(())
+            })
+            .expect("register create");
+
+        assert!(matches!(
+            schedule.run(&mut world),
+            Err(ScheduleError::Command(
+                crate::CommandError::UnresolvedPendingEntity(_)
+            ))
+        ));
+        let entities = world.entities_with::<Marker>();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(world.get::<Marker>(entities[0]), Some(&Marker(1)));
+    }
+
 
     #[test]
     fn failed_system_discards_its_commands() {
