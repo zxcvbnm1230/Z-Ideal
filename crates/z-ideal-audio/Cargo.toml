@@ -1,0 +1,11 @@
+[package]
+name = "z-ideal-audio"
+description = "Audio device, resource and spatial audio contracts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+z-ideal-core = { path = "../z-ideal-core" }
+z-ideal-math = { path = "../z-ideal-math" }

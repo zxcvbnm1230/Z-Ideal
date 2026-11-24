@@ -1,0 +1,10 @@
+[package]
+name = "z-ideal-math"
+description = "Engine math types and coordinate conventions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
