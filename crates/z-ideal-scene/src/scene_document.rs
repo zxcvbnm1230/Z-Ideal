@@ -167,7 +167,9 @@ pub enum SceneError {
     #[error("scene references an unregistered component ID: {0}")]
     UnknownComponent(String),
     /// A component migration failed.
-    #[error("migration for component {component_id} from schema {from_version} to {to_version} failed: {message}")]
+    #[error(
+        "migration for component {component_id} from schema {from_version} to {to_version} failed: {message}"
+    )]
     ComponentMigration {
         /// Stable component identifier.
         component_id: &'static str,

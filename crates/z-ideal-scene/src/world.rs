@@ -8,8 +8,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    Component, ComponentInfo, Entity, SceneDocument, SceneEntityId, SceneEntityRecord, SceneError,
-    SerializedComponent, SCENE_SCHEMA_VERSION,
+    Component, ComponentInfo, Entity, SCENE_SCHEMA_VERSION, SceneDocument, SceneEntityId,
+    SceneEntityRecord, SceneError, SerializedComponent,
     hierarchy::{Hierarchy, HierarchyError},
 };
 use z_ideal_math::{Mat4, Transform};
@@ -606,12 +606,13 @@ impl World {
             }
 
             if let Some(parent_id) = record.parent {
-                let parent = entities_by_id.get(&parent_id).copied().ok_or(
-                    SceneError::MissingParent {
+                let parent = entities_by_id
+                    .get(&parent_id)
+                    .copied()
+                    .ok_or(SceneError::MissingParent {
                         entity: record.id,
                         parent: parent_id,
-                    },
-                )?;
+                    })?;
                 staging.set_parent(entity, Some(parent))?;
             }
         }
