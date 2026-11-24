@@ -4,7 +4,7 @@ Z Ideal is a cross-platform 3D game engine targeting Windows, macOS, and Ubuntu 
 
 ## Project status
 
-**Phase 0 — foundation.** The workspace and CI baseline are being established. Engine subsystems are intentionally skeletal until their contracts and tests are implemented in their scheduled phases. No renderer, physics backend, editor workflow, or game-export capability is claimed complete.
+**Phase 1 — core, math, ECS and scenes (ready for review).** The current Phase 1 branch implements the math conventions and Transform contract, generation-safe entities, registered sparse-set components, transform hierarchy, deterministic scheduling, deferred structural commands, versioned scene serialization with migrations, and prefab instantiation with entity-reference remapping and overrides. Phase 1 is not merged yet. Rendering, physics, Lua scripting, audio, editor workflows, and game export remain future phases.
 
 ## Requirements
 

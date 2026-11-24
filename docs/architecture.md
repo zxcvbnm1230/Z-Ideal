@@ -21,6 +21,8 @@
 
 No cyclic crate dependencies. The test-support crate must never be a production dependency. Editor dependencies must never flow into runtime.
 
+Dependency rows above describe the intended architecture. A crate adds a direct Cargo dependency only when its implementation actually uses that crate; future subsystem dependencies are added with the corresponding implementation rather than kept as unused manifest entries.
+
 ## Cross-cutting contracts
 
 - Stable Rust; workspace-managed dependencies.
