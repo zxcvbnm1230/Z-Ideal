@@ -112,7 +112,9 @@ mod tests {
     #[test]
     fn stable_component_ids_cannot_be_reused() {
         let mut world = World::new();
-        world.register_component::<Health>().expect("register Health");
+        world
+            .register_component::<Health>()
+            .expect("register Health");
         assert_eq!(
             world.register_component::<DuplicateId>(),
             Err(WorldError::DuplicateComponentId("sample.health"))
@@ -179,7 +181,9 @@ mod tests {
     #[test]
     fn world_transform_composes_parent_and_local_translation() {
         let mut world = World::new();
-        world.register_component::<Transform>().expect("register Transform");
+        world
+            .register_component::<Transform>()
+            .expect("register Transform");
         let parent = world.spawn().expect("parent");
         let child = world.spawn().expect("child");
         world
