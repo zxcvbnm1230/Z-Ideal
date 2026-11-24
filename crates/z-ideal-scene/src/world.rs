@@ -78,7 +78,11 @@ impl<T> SparseSet<T> {
     }
 
     fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
-        let dense_index = self.sparse.get(entity.index() as usize).copied().flatten()?;
+        let dense_index = self
+            .sparse
+            .get(entity.index() as usize)
+            .copied()
+            .flatten()?;
         if self.dense_entities.get(dense_index).copied() != Some(entity) {
             return None;
         }
