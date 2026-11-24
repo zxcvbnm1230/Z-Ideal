@@ -29,7 +29,7 @@ pub const CRATE_NAME: &str = "z-ideal-scene";
 
 #[cfg(test)]
 mod tests {
-    use super::{Component, Entity, HierarchyError, Transform, World, WorldError};
+    use super::{Component, Entity, HierarchyError, Transform, World, WorldError, CRATE_NAME};
     use serde::{Deserialize, Serialize};
     use z_ideal_math::{Quat, Vec3};
 
