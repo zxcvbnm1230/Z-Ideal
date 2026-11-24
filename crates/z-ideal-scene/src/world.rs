@@ -606,13 +606,14 @@ impl World {
             }
 
             if let Some(parent_id) = record.parent {
-                let parent = entities_by_id
-                    .get(&parent_id)
-                    .copied()
-                    .ok_or(SceneError::MissingParent {
-                        entity: record.id,
-                        parent: parent_id,
-                    })?;
+                let parent =
+                    entities_by_id
+                        .get(&parent_id)
+                        .copied()
+                        .ok_or(SceneError::MissingParent {
+                            entity: record.id,
+                            parent: parent_id,
+                        })?;
                 staging.set_parent(entity, Some(parent))?;
             }
         }

@@ -213,7 +213,6 @@ impl From<serde_json::Error> for SceneError {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
@@ -256,7 +255,9 @@ mod tests {
                     Ok(json!({ "value": old_value }))
                 }
                 2 => Ok(data),
-                _ => Err(format!("unsupported test migration source version {from_version}")),
+                _ => Err(format!(
+                    "unsupported test migration source version {from_version}"
+                )),
             }
         }
     }
@@ -356,15 +357,10 @@ mod tests {
 
         assert_eq!(
             world.load_scene_document(&document),
-            Err(SceneError::UnknownComponent(
-                "unknown.component".to_owned()
-            ))
+            Err(SceneError::UnknownComponent("unknown.component".to_owned()))
         );
         assert!(world.is_alive(existing));
-        assert_eq!(
-            world.get::<Health>(existing),
-            Some(&Health { current: 88 })
-        );
+        assert_eq!(world.get::<Health>(existing), Some(&Health { current: 88 }));
     }
 
     #[test]
