@@ -31,7 +31,11 @@ pub struct ComponentInfo {
 
 impl ComponentInfo {
     pub(crate) fn new(id: &'static str, version: u32, type_id: TypeId) -> Self {
-        Self { id, version, type_id }
+        Self {
+            id,
+            version,
+            type_id,
+        }
     }
 
     /// Returns the Rust type identity for registry checks.
