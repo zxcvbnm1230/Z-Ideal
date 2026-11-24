@@ -34,10 +34,12 @@ pub enum ScheduleError {
     Command(#[from] crate::CommandError),
 }
 
+type SystemRunner = Box<dyn FnMut(&World, &mut Commands) -> Result<(), String> + Send + 'static>;
+
 struct SystemNode {
     name: String,
     after: Vec<String>,
-    run: Box<dyn FnMut(&World, &mut Commands) -> Result<(), String> + Send + 'static>,
+    run: SystemRunner,
 }
 
 /// Serial deterministic schedule.
