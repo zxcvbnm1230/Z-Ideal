@@ -27,13 +27,18 @@ pub struct LoggingConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { filter: "info".to_owned() }
+        Self {
+            filter: "info".to_owned(),
+        }
     }
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { schema_version: CONFIG_SCHEMA_VERSION, logging: LoggingConfig::default() }
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            logging: LoggingConfig::default(),
+        }
     }
 }
 
@@ -70,7 +75,10 @@ mod tests {
 
     #[test]
     fn default_configuration_has_current_schema() {
-        assert_eq!(EngineConfig::default().schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            EngineConfig::default().schema_version,
+            CONFIG_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -88,6 +96,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_schema_version() {
         let result = EngineConfig::from_toml("schema_version = 99\n");
-        assert!(matches!(result, Err(ConfigError::UnsupportedVersion { found: 99, .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::UnsupportedVersion { found: 99, .. })
+        ));
     }
 }
