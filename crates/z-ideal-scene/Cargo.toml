@@ -9,3 +9,8 @@ license.workspace = true
 [dependencies]
 z-ideal-core = { path = "../z-ideal-core" }
 z-ideal-math = { path = "../z-ideal-math" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
