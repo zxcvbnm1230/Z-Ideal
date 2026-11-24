@@ -14,12 +14,12 @@ pub use commands::{CommandError, Commands, EntityTarget, PendingEntity};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use hierarchy::HierarchyError;
+pub use prefab::{Prefab, PrefabInstance, PrefabOverrides};
 pub use scene_document::{
     SCENE_SCHEMA_VERSION, SceneDocument, SceneEntityId, SceneEntityRecord, SceneEntityRef,
     SceneError, SerializedComponent,
 };
 pub use schedule::{Schedule, ScheduleError};
-pub use prefab::{Prefab, PrefabInstance, PrefabOverrides};
 pub use world::{World, WorldError};
 
 use z_ideal_math::Transform;

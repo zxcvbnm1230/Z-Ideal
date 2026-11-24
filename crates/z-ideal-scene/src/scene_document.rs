@@ -33,8 +33,6 @@ impl SceneEntityId {
     }
 }
 
-
-
 /// Serializable reference to another entity in a scene.
 ///
 /// The reserved JSON marker is remapped when a prefab is instantiated.
@@ -196,8 +194,6 @@ impl Default for SceneDocument {
         Self::new()
     }
 }
-
-
 
 pub(crate) fn remap_entity_references(
     value: &mut Value,
@@ -681,10 +677,7 @@ mod tests {
             .load_scene_document(&document)
             .expect("restore source");
         let new_entity = restored.spawn().expect("spawn after restore");
-        assert_eq!(
-            restored.scene_entity_id(new_entity),
-            SceneEntityId::new(3)
-        );
+        assert_eq!(restored.scene_entity_id(new_entity), SceneEntityId::new(3));
         let retained_id = source.scene_entity_id(retained).expect("retained scene ID");
         assert!(restored.entity_for_scene_id(retained_id).is_some());
     }
