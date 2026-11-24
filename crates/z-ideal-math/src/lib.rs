@@ -157,9 +157,8 @@ mod tests {
 
     #[test]
     fn constructor_normalizes_rotation() {
-        let transform =
-            Transform::new(Vec3::ZERO, Quat::from_xyzw(0.0, 2.0, 0.0, 0.0), Vec3::ONE)
-                .expect("valid rotation");
+        let transform = Transform::new(Vec3::ZERO, Quat::from_xyzw(0.0, 2.0, 0.0, 0.0), Vec3::ONE)
+            .expect("valid rotation");
         assert!((transform.rotation().length_squared() - 1.0).abs() < 1.0e-6);
     }
 
@@ -178,20 +177,15 @@ mod tests {
     #[test]
     fn rejects_zero_quaternion() {
         assert_eq!(
-            Transform::new(
-                Vec3::ZERO,
-                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
-                Vec3::ONE
-            ),
+            Transform::new(Vec3::ZERO, Quat::from_xyzw(0.0, 0.0, 0.0, 0.0), Vec3::ONE),
             Err(TransformError::InvalidRotation)
         );
     }
 
     #[test]
     fn matrix_applies_translation() {
-        let transform =
-            Transform::new(Vec3::new(2.0, 3.0, 4.0), Quat::IDENTITY, Vec3::ONE)
-                .expect("valid transform");
+        let transform = Transform::new(Vec3::new(2.0, 3.0, 4.0), Quat::IDENTITY, Vec3::ONE)
+            .expect("valid transform");
         assert_eq!(
             transform.matrix().transform_point3(Vec3::ZERO),
             Vec3::new(2.0, 3.0, 4.0)
