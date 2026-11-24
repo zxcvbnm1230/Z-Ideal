@@ -1,0 +1,57 @@
+# Z Ideal workspace
+[workspace]
+resolver = "3"
+members = [
+    "crates/z-ideal-core",
+    "crates/z-ideal-math",
+    "crates/z-ideal-scene",
+    "crates/z-ideal-assets",
+    "crates/z-ideal-renderer",
+    "crates/z-ideal-physics",
+    "crates/z-ideal-scripting",
+    "crates/z-ideal-audio",
+    "crates/z-ideal-platform",
+    "crates/z-ideal-test-support",
+    "crates/z-ideal-editor",
+    "crates/z-ideal-runtime",
+    "apps/editor",
+    "apps/runtime",
+]
+default-members = [
+    "crates/z-ideal-core",
+    "crates/z-ideal-math",
+    "crates/z-ideal-scene",
+    "crates/z-ideal-assets",
+    "crates/z-ideal-renderer",
+    "crates/z-ideal-physics",
+    "crates/z-ideal-scripting",
+    "crates/z-ideal-audio",
+    "crates/z-ideal-platform",
+    "crates/z-ideal-test-support",
+    "crates/z-ideal-editor",
+    "crates/z-ideal-runtime",
+    "apps/editor",
+    "apps/runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Z Ideal contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
