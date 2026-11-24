@@ -39,11 +39,7 @@ impl PrefabOverrides {
     }
 
     /// Removes a component from a prefab entity in the instantiated copy.
-    pub fn remove_component(
-        &mut self,
-        entity: SceneEntityId,
-        component_id: impl Into<String>,
-    ) {
+    pub fn remove_component(&mut self, entity: SceneEntityId, component_id: impl Into<String>) {
         self.components
             .entry(entity)
             .or_default()
@@ -89,7 +85,12 @@ impl Prefab {
         overrides: &PrefabOverrides,
     ) -> Result<PrefabInstance, SceneError> {
         self.document.validate()?;
-        let source_ids: HashSet<_> = self.document.entities.iter().map(|entity| entity.id).collect();
+        let source_ids: HashSet<_> = self
+            .document
+            .entities
+            .iter()
+            .map(|entity| entity.id)
+            .collect();
         for entity in overrides.components.keys() {
             if !source_ids.contains(entity) {
                 return Err(SceneError::UnknownPrefabEntity(*entity));
@@ -169,7 +170,9 @@ impl PrefabInstance {
 
     /// Iterates source prefab IDs and their instantiated runtime entities in ID order.
     pub fn entities(&self) -> impl Iterator<Item = (SceneEntityId, crate::Entity)> + '_ {
-        self.entities.iter().map(|(source, entity)| (*source, *entity))
+        self.entities
+            .iter()
+            .map(|(source, entity)| (*source, *entity))
     }
 }
 
@@ -210,7 +213,9 @@ mod tests {
 
     fn registered_world() -> World {
         let mut world = World::new();
-        world.register_component::<Health>().expect("register Health");
+        world
+            .register_component::<Health>()
+            .expect("register Health");
         world.register_component::<Link>().expect("register Link");
         world
     }
@@ -300,7 +305,10 @@ mod tests {
             instantiated_target_id
         );
         assert_ne!(instantiated_target_id, target);
-        assert_eq!(world.parent_of(instantiated_target), Some(instantiated_source));
+        assert_eq!(
+            world.parent_of(instantiated_target),
+            Some(instantiated_source)
+        );
         assert_eq!(
             world.get::<Health>(instantiated_target),
             Some(&Health { current: 99 })
@@ -318,7 +326,11 @@ mod tests {
         let instance = prefab.instantiate(&mut world).expect("instantiate prefab");
         let entity = instance.entity(id(10)).expect("resolve prefab entity");
         assert_eq!(
-            world.get::<Link>(entity).expect("link component").target.id(),
+            world
+                .get::<Link>(entity)
+                .expect("link component")
+                .target
+                .id(),
             existing_id
         );
     }
