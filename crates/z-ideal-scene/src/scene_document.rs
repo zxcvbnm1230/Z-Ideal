@@ -200,11 +200,17 @@ pub enum SceneError {
     #[error("persistent scene entity ID space is exhausted")]
     SceneEntityIdExhausted,
     /// JSON encoding or decoding failed.
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    #[error("invalid scene JSON: {0}")]
+    Json(String),
     /// The world rejected a scene operation.
     #[error(transparent)]
     World(#[from] crate::WorldError),
+}
+
+impl From<serde_json::Error> for SceneError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error.to_string())
+    }
 }
 
 
