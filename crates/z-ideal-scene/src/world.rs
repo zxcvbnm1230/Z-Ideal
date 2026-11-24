@@ -244,10 +244,8 @@ impl World {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.alive
-                    .then(|| Entity::new(index as u32, slot.generation))
-            })
+            .filter(|(_, slot)| slot.alive)
+            .map(|(index, slot)| Entity::new(index as u32, slot.generation))
             .collect()
     }
 
