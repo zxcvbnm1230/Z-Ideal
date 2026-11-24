@@ -8,5 +8,3 @@ license.workspace = true
 
 [dependencies]
 z-ideal-core = { path = "../z-ideal-core" }
-z-ideal-math = { path = "../z-ideal-math" }
-z-ideal-assets = { path = "../z-ideal-assets" }
