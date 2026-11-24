@@ -548,9 +548,10 @@ impl World {
 
         let document = SceneDocument {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: self.next_scene_id,
             entities: records,
         };
-        document.validate()?;
+        document.validate_entity_references()?;
         Ok(document)
     }
 
@@ -564,19 +565,10 @@ impl World {
     /// The existing world is replaced only after all entities, components,
     /// migrations, and hierarchy relationships have been validated.
     pub fn load_scene_document(&mut self, document: &SceneDocument) -> Result<(), SceneError> {
-        document.validate()?;
-        let max_id = document
-            .entities
-            .iter()
-            .map(|entity| entity.id.get())
-            .max()
-            .unwrap_or(0);
-        let next_scene_id = max_id
-            .checked_add(1)
-            .ok_or(SceneError::SceneEntityIdExhausted)?;
+        document.validate_entity_references()?;
 
         let mut staging = self.empty_with_registry();
-        staging.next_scene_id = next_scene_id.max(1);
+        staging.next_scene_id = document.next_scene_entity_id;
         let mut entities_by_id = HashMap::with_capacity(document.entities.len());
 
         for record in &document.entities {
@@ -626,6 +618,10 @@ impl World {
     pub fn load_scene_json(&mut self, source: &str) -> Result<(), SceneError> {
         let document: SceneDocument = serde_json::from_str(source)?;
         self.load_scene_document(&document)
+    }
+
+    pub(crate) const fn next_scene_entity_id(&self) -> u64 {
+        self.next_scene_id
     }
 
     fn empty_with_registry(&self) -> Self {

@@ -33,6 +33,31 @@ impl SceneEntityId {
     }
 }
 
+
+
+/// Serializable reference to another entity in a scene.
+///
+/// The reserved JSON marker is remapped when a prefab is instantiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SceneEntityRef {
+    #[serde(rename = "$entity_ref")]
+    id: SceneEntityId,
+}
+
+impl SceneEntityRef {
+    /// Creates a reference to a persistent scene entity ID.
+    #[must_use]
+    pub const fn new(id: SceneEntityId) -> Self {
+        Self { id }
+    }
+
+    /// Returns the referenced persistent scene entity ID.
+    #[must_use]
+    pub const fn id(self) -> SceneEntityId {
+        self.id
+    }
+}
+
 /// Versioned component payload stored in a scene document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +98,8 @@ impl SceneEntityRecord {
 pub struct SceneDocument {
     /// Scene schema version.
     pub schema_version: u32,
+    /// Next persistent entity ID to allocate, preserving deleted-ID gaps.
+    pub next_scene_entity_id: u64,
     /// Entities in stable serialized-ID order.
     pub entities: Vec<SceneEntityRecord>,
 }
@@ -83,6 +110,7 @@ impl SceneDocument {
     pub fn new() -> Self {
         Self {
             schema_version: SCENE_SCHEMA_VERSION,
+            next_scene_entity_id: 1,
             entities: Vec::new(),
         }
     }
@@ -91,6 +119,19 @@ impl SceneDocument {
     pub fn validate(&self) -> Result<(), SceneError> {
         if self.schema_version != SCENE_SCHEMA_VERSION {
             return Err(SceneError::UnsupportedSceneVersion(self.schema_version));
+        }
+
+        let maximum_id = self
+            .entities
+            .iter()
+            .map(|entity| entity.id.get())
+            .max()
+            .unwrap_or(0);
+        if self.next_scene_entity_id == 0 || self.next_scene_entity_id <= maximum_id {
+            return Err(SceneError::NextSceneEntityIdNotAhead {
+                next: self.next_scene_entity_id,
+                maximum: maximum_id,
+            });
         }
 
         let mut ids = HashSet::with_capacity(self.entities.len());
@@ -126,11 +167,109 @@ impl SceneDocument {
         }
         Ok(())
     }
+
+    /// Validates that every serialized entity reference resolves within this scene.
+    pub fn validate_entity_references(&self) -> Result<(), SceneError> {
+        self.validate()?;
+        let ids: HashSet<_> = self.entities.iter().map(|entity| entity.id).collect();
+        for entity in &self.entities {
+            for (component_id, component) in &entity.components {
+                let mut references = Vec::new();
+                collect_entity_references(&component.data, &mut references)?;
+                for target in references {
+                    if !ids.contains(&target) {
+                        return Err(SceneError::MissingEntityReference {
+                            entity: entity.id,
+                            component_id: component_id.clone(),
+                            target,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for SceneDocument {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+
+
+pub(crate) fn remap_entity_references(
+    value: &mut Value,
+    remap: &std::collections::HashMap<SceneEntityId, SceneEntityId>,
+) -> Result<(), SceneError> {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$entity_ref") {
+                if object.len() != 1 {
+                    return Err(SceneError::InvalidEntityReference(
+                        "the reserved $entity_ref marker must be the only object field".to_owned(),
+                    ));
+                }
+                let raw = reference.as_u64().ok_or_else(|| {
+                    SceneError::InvalidEntityReference(
+                        "$entity_ref must contain an unsigned integer".to_owned(),
+                    )
+                })?;
+                let old_id = SceneEntityId::new(raw)?;
+                if let Some(new_id) = remap.get(&old_id) {
+                    object.insert("$entity_ref".to_owned(), Value::from(new_id.get()));
+                }
+                Ok(())
+            } else {
+                for child in object.values_mut() {
+                    remap_entity_references(child, remap)?;
+                }
+                Ok(())
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                remap_entity_references(child, remap)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_entity_references(
+    value: &Value,
+    references: &mut Vec<SceneEntityId>,
+) -> Result<(), SceneError> {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$entity_ref") {
+                if object.len() != 1 {
+                    return Err(SceneError::InvalidEntityReference(
+                        "the reserved $entity_ref marker must be the only object field".to_owned(),
+                    ));
+                }
+                let raw = reference.as_u64().ok_or_else(|| {
+                    SceneError::InvalidEntityReference(
+                        "$entity_ref must contain an unsigned integer".to_owned(),
+                    )
+                })?;
+                references.push(SceneEntityId::new(raw)?);
+            } else {
+                for child in object.values() {
+                    collect_entity_references(child, references)?;
+                }
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_entity_references(child, references)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -195,6 +334,27 @@ pub enum SceneError {
         component_id: String,
         /// Serialization failure detail.
         message: String,
+    },
+    /// The next persistent entity ID is not greater than all IDs in the document.
+    #[error("next scene entity ID {next} must be greater than maximum existing ID {maximum}")]
+    NextSceneEntityIdNotAhead {
+        /// Next ID to allocate.
+        next: u64,
+        /// Largest ID present in the document.
+        maximum: u64,
+    },
+    /// A reserved serialized entity-reference marker is malformed.
+    #[error("invalid serialized entity reference: {0}")]
+    InvalidEntityReference(String),
+    /// A component references an entity that is absent from the scene.
+    #[error("entity {entity:?} component {component_id} references missing entity {target:?}")]
+    MissingEntityReference {
+        /// Entity containing the component.
+        entity: SceneEntityId,
+        /// Stable component identifier.
+        component_id: String,
+        /// Referenced entity ID that was not found.
+        target: SceneEntityId,
     },
     /// Persistent scene ID allocation is exhausted.
     #[error("persistent scene entity ID space is exhausted")]
