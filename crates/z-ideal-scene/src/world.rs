@@ -68,7 +68,11 @@ impl<T> Default for SparseSet<T> {
 
 impl<T> SparseSet<T> {
     fn get(&self, entity: Entity) -> Option<&T> {
-        let dense_index = self.sparse.get(entity.index() as usize).copied().flatten()?;
+        let dense_index = self
+            .sparse
+            .get(entity.index() as usize)
+            .copied()
+            .flatten()?;
         (self.dense_entities.get(dense_index).copied() == Some(entity))
             .then(|| &self.dense_values[dense_index])
     }
@@ -85,7 +89,10 @@ impl<T> SparseSet<T> {
         let slot_index = entity.index() as usize;
         if let Some(dense_index) = self.sparse.get(slot_index).copied().flatten() {
             if self.dense_entities.get(dense_index).copied() == Some(entity) {
-                return Some(std::mem::replace(&mut self.dense_values[dense_index], value));
+                return Some(std::mem::replace(
+                    &mut self.dense_values[dense_index],
+                    value,
+                ));
             }
         }
 
@@ -186,7 +193,8 @@ impl World {
             return Err(WorldError::DuplicateComponentId(T::ID));
         }
 
-        self.storages.insert(type_id, Box::<SparseSet<T>>::default());
+        self.storages
+            .insert(type_id, Box::<SparseSet<T>>::default());
         self.component_by_id.insert(T::ID, type_id);
         self.component_by_type
             .insert(type_id, ComponentInfo::new(T::ID, T::VERSION, type_id));
@@ -209,8 +217,8 @@ impl World {
             return Ok(Entity::new(index, slot.generation));
         }
 
-        let index = u32::try_from(self.slots.len())
-            .map_err(|_| WorldError::EntityCapacityExceeded)?;
+        let index =
+            u32::try_from(self.slots.len()).map_err(|_| WorldError::EntityCapacityExceeded)?;
         self.slots.push(EntitySlot {
             generation: 1,
             alive: true,
@@ -233,7 +241,8 @@ impl World {
             .iter()
             .enumerate()
             .filter_map(|(index, slot)| {
-                slot.alive.then(|| Entity::new(index as u32, slot.generation))
+                slot.alive
+                    .then(|| Entity::new(index as u32, slot.generation))
             })
             .collect()
     }
@@ -270,10 +279,9 @@ impl World {
         if !self.component_by_type.contains_key(&TypeId::of::<T>()) {
             return Err(WorldError::ComponentNotRegistered(T::ID));
         }
-        component.validate().map_err(|reason| WorldError::InvalidComponent {
-            id: T::ID,
-            reason,
-        })?;
+        component
+            .validate()
+            .map_err(|reason| WorldError::InvalidComponent { id: T::ID, reason })?;
 
         let storage = self
             .storages
@@ -340,11 +348,7 @@ impl World {
     }
 
     /// Changes an entity's parent. Passing None makes it a root entity.
-    pub fn set_parent(
-        &mut self,
-        child: Entity,
-        parent: Option<Entity>,
-    ) -> Result<(), WorldError> {
+    pub fn set_parent(&mut self, child: Entity, parent: Option<Entity>) -> Result<(), WorldError> {
         if !self.is_alive(child) {
             return Err(WorldError::StaleEntity(child));
         }
