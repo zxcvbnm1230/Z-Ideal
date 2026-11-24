@@ -8,6 +8,7 @@ fn main() {
     }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        subsystem = z_ideal_runtime::CRATE_NAME,
         "Z Ideal runtime foundation initialized"
     );
     println!(

@@ -8,6 +8,7 @@ fn main() {
     }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        subsystem = z_ideal_editor::CRATE_NAME,
         "Z Ideal editor foundation initialized"
     );
     println!("Z Ideal Editor — foundation build; editor functionality is not implemented yet.");
