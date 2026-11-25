@@ -21,8 +21,9 @@ mod sync;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use descriptor::{
-    DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize, DescriptorSetLayoutConfig,
-    VulkanDescriptorPool, VulkanDescriptorSet, VulkanDescriptorSetLayout,
+    BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
+    DescriptorResourceLease, DescriptorSetLayoutConfig, VulkanDescriptorPool, VulkanDescriptorSet,
+    VulkanDescriptorSetLayout,
 };
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use pipeline_layout::VulkanPipelineLayout;
@@ -209,6 +210,27 @@ pub enum VulkanError {
     /// Push-constant ranges overlap for at least one common shader stage.
     #[error("Vulkan push-constant ranges overlap for a shared shader stage")]
     OverlappingPushConstantRanges,
+    /// A descriptor update repeats the same binding and array element.
+    #[error("Vulkan descriptor update contains a duplicate binding array element")]
+    DuplicateDescriptorWrite,
+    /// A descriptor update references a binding absent from its layout.
+    #[error("Vulkan descriptor update references an unknown binding")]
+    DescriptorBindingNotFound,
+    /// A descriptor update references an array element outside its binding.
+    #[error("Vulkan descriptor array element is outside the binding count")]
+    DescriptorArrayElementOutOfBounds,
+    /// The descriptor binding is not a supported uniform/storage buffer type.
+    #[error("Vulkan descriptor binding is not a supported buffer descriptor type")]
+    UnsupportedBufferDescriptorType,
+    /// The buffer does not have the usage required by its descriptor type.
+    #[error("Vulkan buffer usage does not match its descriptor type")]
+    BufferDescriptorUsageMismatch,
+    /// The descriptor buffer offset or range violates device limits or buffer bounds.
+    #[error("Vulkan descriptor buffer offset or range is invalid")]
+    InvalidBufferDescriptorRange,
+    /// A buffer-only descriptor update does not populate every layout slot.
+    #[error("Vulkan buffer descriptor update must populate every binding array element")]
+    IncompleteDescriptorWrite,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -461,6 +483,10 @@ pub struct VulkanDevice {
     max_sampler_anisotropy: f32,
     max_sampler_lod_bias: f32,
     max_push_constants_size: u32,
+    min_uniform_buffer_offset_alignment: vk::DeviceSize,
+    min_storage_buffer_offset_alignment: vk::DeviceSize,
+    max_uniform_buffer_range: vk::DeviceSize,
+    max_storage_buffer_range: vk::DeviceSize,
     info: PhysicalDeviceInfo,
 }
 
@@ -631,6 +657,18 @@ impl VulkanDevice {
         let max_sampler_anisotropy = physical_device_properties.limits.max_sampler_anisotropy;
         let max_sampler_lod_bias = physical_device_properties.limits.max_sampler_lod_bias;
         let max_push_constants_size = physical_device_properties.limits.max_push_constants_size;
+        let min_uniform_buffer_offset_alignment = physical_device_properties
+            .limits
+            .min_uniform_buffer_offset_alignment
+            .max(1);
+        let min_storage_buffer_offset_alignment = physical_device_properties
+            .limits
+            .min_storage_buffer_offset_alignment
+            .max(1);
+        let max_uniform_buffer_range =
+            u64::from(physical_device_properties.limits.max_uniform_buffer_range);
+        let max_storage_buffer_range =
+            u64::from(physical_device_properties.limits.max_storage_buffer_range);
         let priorities = [1.0_f32];
         let mut queue_family_indices = vec![graphics_queue_family];
         if present_queue_family != graphics_queue_family {
@@ -680,6 +718,10 @@ impl VulkanDevice {
             max_sampler_anisotropy,
             max_sampler_lod_bias,
             max_push_constants_size,
+            min_uniform_buffer_offset_alignment,
+            min_storage_buffer_offset_alignment,
+            max_uniform_buffer_range,
+            max_storage_buffer_range,
             info,
         })
     }
