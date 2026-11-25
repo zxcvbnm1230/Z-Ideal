@@ -11,11 +11,13 @@ use thiserror::Error;
 use winit::window::Window;
 
 mod image;
+mod sampler;
 mod surface;
 mod swapchain;
 mod sync;
 
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
+pub use sampler::{SamplerConfig, VulkanSampler};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
@@ -140,6 +142,21 @@ pub enum VulkanError {
     /// Image and image-view dimensionalities or cube requirements do not match.
     #[error("Vulkan image-view type is incompatible with the image")]
     IncompatibleImageViewType,
+    /// Sampler enum values are not recognized by the supported Vulkan core API.
+    #[error("Vulkan sampler contains an unsupported enum value")]
+    InvalidSamplerEnum,
+    /// Sampler LOD bounds are non-finite or inverted.
+    #[error("Vulkan sampler LOD range must be finite and ordered")]
+    InvalidSamplerLodRange,
+    /// Sampler LOD bias is non-finite or exceeds the physical-device limit.
+    #[error("Vulkan sampler mip LOD bias exceeds the device limit or is not finite")]
+    InvalidSamplerLodBias,
+    /// Requested sampler anisotropy is outside the physical-device limit.
+    #[error("Vulkan sampler anisotropy must be finite and within the device limit")]
+    InvalidSamplerAnisotropy,
+    /// Sampler anisotropy was requested but the logical-device feature is unavailable.
+    #[error("Vulkan sampler anisotropy feature is not enabled on this device")]
+    SamplerAnisotropyUnavailable,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -388,6 +405,9 @@ pub struct VulkanDevice {
     present_queue: vk::Queue,
     present_queue_family: u32,
     presentation_enabled: bool,
+    sampler_anisotropy_enabled: bool,
+    max_sampler_anisotropy: f32,
+    max_sampler_lod_bias: f32,
     info: PhysicalDeviceInfo,
 }
 
@@ -532,6 +552,31 @@ impl VulkanDevice {
             .iter()
             .map(|name| name.as_ptr())
             .collect();
+        // Enable sampler anisotropy only when the selected physical device supports it.
+        // Other optional features remain disabled until explicitly required by the renderer.
+        // SAFETY: The selected physical device belongs to the retained instance.
+        let supported_features = unsafe {
+            instance
+                .handle
+                .get_physical_device_features(physical_device)
+        };
+        let sampler_anisotropy_enabled = supported_features.sampler_anisotropy == vk::TRUE;
+        let enabled_features = vk::PhysicalDeviceFeatures {
+            sampler_anisotropy: if sampler_anisotropy_enabled {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            ..Default::default()
+        };
+        // SAFETY: The selected physical device belongs to the retained instance.
+        let physical_device_properties = unsafe {
+            instance
+                .handle
+                .get_physical_device_properties(physical_device)
+        };
+        let max_sampler_anisotropy = physical_device_properties.limits.max_sampler_anisotropy;
+        let max_sampler_lod_bias = physical_device_properties.limits.max_sampler_lod_bias;
         let priorities = [1.0_f32];
         let mut queue_family_indices = vec![graphics_queue_family];
         if present_queue_family != graphics_queue_family {
@@ -551,6 +596,7 @@ impl VulkanDevice {
             p_queue_create_infos: queue_info.as_ptr(),
             enabled_extension_count: extension_pointers.len() as u32,
             pp_enabled_extension_names: extension_pointers.as_ptr(),
+            p_enabled_features: &enabled_features,
             ..Default::default()
         };
 
@@ -576,6 +622,9 @@ impl VulkanDevice {
             present_queue,
             present_queue_family,
             presentation_enabled: surface.is_some(),
+            sampler_anisotropy_enabled,
+            max_sampler_anisotropy,
+            max_sampler_lod_bias,
             info,
         })
     }
@@ -608,6 +657,24 @@ impl VulkanDevice {
     #[must_use]
     pub const fn presentation_enabled(&self) -> bool {
         self.presentation_enabled
+    }
+
+    /// Returns whether sampler anisotropy was supported and enabled on this device.
+    #[must_use]
+    pub const fn sampler_anisotropy_enabled(&self) -> bool {
+        self.sampler_anisotropy_enabled
+    }
+
+    /// Returns the maximum supported sampler anisotropy for this device.
+    #[must_use]
+    pub const fn max_sampler_anisotropy(&self) -> f32 {
+        self.max_sampler_anisotropy
+    }
+
+    /// Returns the maximum absolute sampler mip LOD bias for this device.
+    #[must_use]
+    pub const fn max_sampler_lod_bias(&self) -> f32 {
+        self.max_sampler_lod_bias
     }
 
     /// Returns the presentation queue.

@@ -31,12 +31,13 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Swapchain recreation waits for device idle and preserves the old swapchain for zero-size/minimized-window deferrals; failed nonzero recreation leaves a clear not-ready state that callers can retry.
 - Explicitly owned Vulkan fence and binary-semaphore wrappers with device-borrowed lifetimes, structured API errors, fence timeout reporting, and conservative device-idle waits before destruction.
 - Explicitly owned Vulkan images with dedicated compatible memory allocations, device-local memory preference, validated dimensionality/mip/layer/sample configuration, and image views whose Rust lifetimes are bounded by their parent images. Image layout transitions, barriers, queue ownership transfers, allocator pooling, and deferred retirement remain caller/future-scheduler responsibilities.
+- Explicitly owned Vulkan samplers with validated LOD ranges/bias, optional depth comparison, and device-limit-checked anisotropy. Logical-device creation enables sampler anisotropy only when supported; sampler ownership is device-borrowed and destruction waits for device idle.
 - Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
 
 - Higher-level frame scheduling and automatic scheduling policy for redraw, pause, and minimized-window behavior.
-- General GPU buffer/image/view/sampler/descriptor/pipeline wrappers; synchronization primitives now have basic owned wrappers, but frame scheduling and reusable per-frame synchronization policy remain outstanding.
+- Vulkan buffer ownership and host-access wrappers are not yet merged to main. Descriptor-set layouts/pools/sets, pipeline layouts, and graphics/compute pipelines remain outstanding; frame scheduling and reusable per-frame synchronization policy also remain outstanding.
 - Shader compiler integration, reflection, and pipeline-layout validation.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.
 
