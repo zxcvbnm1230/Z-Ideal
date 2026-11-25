@@ -38,10 +38,11 @@ pub struct BufferConfig {
 /// before destroying the buffer and memory; this is deliberately conservative until
 /// deferred resource retirement exists.
 pub struct VulkanBuffer<'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+    pub(super) usage: vk::BufferUsageFlags,
     allocation_size: vk::DeviceSize,
     memory_flags: vk::MemoryPropertyFlags,
     atom_size: vk::DeviceSize,
@@ -124,6 +125,7 @@ impl<'device> VulkanBuffer<'device> {
             handle,
             memory,
             size: config.size,
+            usage: config.usage,
             allocation_size: requirements.size,
             memory_flags,
             atom_size: limits.non_coherent_atom_size.max(1),
