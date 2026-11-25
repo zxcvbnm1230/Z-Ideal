@@ -3,7 +3,7 @@
 
 use std::{
     ffi::{CStr, CString, NulError},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use ash::{Entry, vk};
@@ -11,24 +11,43 @@ use thiserror::Error;
 use winit::window::Window;
 
 mod buffer;
+mod command;
 mod descriptor;
+mod graphics_pipeline;
 mod image;
+mod pipeline;
 mod pipeline_layout;
+mod render_pass;
 mod sampler;
+mod shader;
 mod surface;
 mod swapchain;
 mod sync;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
+pub use command::{
+    BufferBarrier, CommandBufferRecording, CommandPoolConfig, ExecutableCommandBuffer,
+    ImageBarrier, VulkanCommandBuffer, VulkanCommandPool, VulkanQueue, VulkanSubmission,
+};
 pub use descriptor::{
     BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
     DescriptorResourceLease, DescriptorResourceWrite, DescriptorSetLayoutConfig,
-    ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet,
-    VulkanDescriptorSetLayout,
+    DescriptorSetLeaseRef, ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool,
+    VulkanDescriptorSet, VulkanDescriptorSetLayout,
 };
+pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
+pub use pipeline::VulkanComputePipeline;
 pub use pipeline_layout::VulkanPipelineLayout;
+pub use render_pass::{
+    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
+    RenderPassDependency, RenderPassSubpassConfig, VulkanFramebuffer, VulkanRenderPass,
+};
 pub use sampler::{SamplerConfig, VulkanSampler};
+pub use shader::{
+    CompiledShader, ShaderCompileConfig, ShaderDescriptorBinding, ShaderReflection, ShaderStage,
+    ShaderVertexInput, VulkanShaderModule, compile_glsl,
+};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
@@ -244,6 +263,63 @@ pub enum VulkanError {
     /// The physical device does not support the image format feature required by the descriptor.
     #[error("Vulkan image format does not support the descriptor's sampling or storage operation")]
     UnsupportedImageFormatFeature,
+    /// GLSL source could not be parsed into a shader module.
+    #[error("GLSL shader compilation failed: {0}")]
+    ShaderCompilation(String),
+    /// Shader uses a descriptor or resource form unsupported by renderer reflection.
+    #[error("shader uses an unsupported descriptor resource or descriptor array form")]
+    UnsupportedShaderResource,
+    /// Shader declares an invalid or unsupported push-constant block.
+    #[error("shader push-constant declaration is invalid or unsupported")]
+    InvalidShaderPushConstants,
+    /// SPIR-V binary header or instruction stream is malformed.
+    #[error("SPIR-V binary is malformed or structurally invalid")]
+    InvalidSpirv,
+    /// A Vulkan shader module was created from a different logical device.
+    #[error("Vulkan shader module belongs to a different logical device")]
+    ShaderModuleDeviceMismatch,
+    /// A shader stage is incompatible with the requested pipeline type.
+    #[error("Vulkan shader stage is incompatible with the requested pipeline")]
+    PipelineShaderStageMismatch,
+    /// Reflected shader descriptors or push constants are not covered by the pipeline layout.
+    #[error("Vulkan pipeline layout does not match the compiled shader interface")]
+    ShaderInterfaceMismatch,
+    /// Render-pass attachment or subpass references are invalid.
+    #[error("Vulkan render-pass attachment, subpass, or dependency configuration is invalid")]
+    InvalidRenderPassConfig,
+    /// Framebuffer extent, layer count, attachments, or compatibility is invalid.
+    #[error("Vulkan framebuffer extent, layers, or attachment configuration is invalid")]
+    InvalidFramebufferConfig,
+    /// A framebuffer attachment belongs to a different logical device.
+    #[error("Vulkan framebuffer attachments belong to a different logical device")]
+    FramebufferDeviceMismatch,
+    /// Graphics pipeline fixed-function state or render-pass compatibility is invalid.
+    #[error("Vulkan graphics pipeline fixed-function configuration is invalid")]
+    InvalidGraphicsPipelineConfig,
+    /// Command-pool flags or selected queue family are invalid.
+    #[error("Vulkan command-pool configuration or queue family is invalid")]
+    InvalidCommandPoolConfig,
+    /// Command-buffer recording, render-pass, or pipeline state is invalid.
+    #[error("Vulkan command-buffer operation is invalid for its current state")]
+    InvalidCommandBufferState,
+    /// Queue submission parameters or command-buffer state are invalid.
+    #[error("Vulkan queue submission parameters or command-buffer state are invalid")]
+    InvalidQueueSubmission,
+    /// Dynamic descriptor offsets violate count, alignment, or buffer bounds.
+    #[error("Vulkan dynamic descriptor offsets are invalid")]
+    InvalidDynamicDescriptorOffset,
+    /// Push-constant write is not covered by the pipeline layout.
+    #[error("Vulkan push-constant write is invalid or not covered by the pipeline layout")]
+    InvalidPushConstantWrite,
+    /// Host synchronization for queue submission was poisoned.
+    #[error("Vulkan queue submission synchronization lock was poisoned")]
+    QueueSynchronizationPoisoned,
+    /// A shader resource is missing an explicit descriptor set or binding.
+    #[error("shader descriptor resources must declare both set and binding")]
+    MissingShaderDescriptorBinding,
+    /// A shader declares the same descriptor set and binding more than once.
+    #[error("shader contains duplicate descriptor set and binding declarations")]
+    DuplicateShaderDescriptorBinding,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -489,6 +565,7 @@ pub struct VulkanDevice {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
+    queue_submit_lock: Mutex<()>,
     present_queue: vk::Queue,
     present_queue_family: u32,
     presentation_enabled: bool,
@@ -724,6 +801,7 @@ impl VulkanDevice {
             physical_device,
             graphics_queue,
             graphics_queue_family,
+            queue_submit_lock: Mutex::new(()),
             present_queue,
             present_queue_family,
             presentation_enabled: surface.is_some(),
@@ -807,7 +885,11 @@ impl VulkanDevice {
 
     /// Waits for all work submitted to this logical device to complete.
     pub fn wait_idle(&self) -> Result<(), VulkanError> {
-        // SAFETY: The logical device is live and uniquely owned by this wrapper.
+        let _queue_guard = self
+            .queue_submit_lock
+            .lock()
+            .map_err(|_| VulkanError::QueueSynchronizationPoisoned)?;
+        // SAFETY: The logical device is live and queue host access is serialized by the lock.
         unsafe {
             self.handle
                 .device_wait_idle()

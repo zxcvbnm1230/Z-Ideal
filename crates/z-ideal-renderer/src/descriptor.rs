@@ -301,6 +301,7 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
         let mut image_infos = Vec::with_capacity(writes.len());
         let mut prepared = Vec::with_capacity(writes.len());
         let mut retained_resources = Vec::with_capacity(writes.len().saturating_mul(2));
+        let mut dynamic_offsets = Vec::new();
 
         for write in writes {
             let (binding_number, array_element) = match write {
@@ -352,6 +353,20 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
                     } else {
                         write.range
                     };
+                    if matches!(
+                        binding.descriptor_type,
+                        vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                            | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                    ) {
+                        dynamic_offsets.push(DynamicOffsetRequirement {
+                            binding: binding_number,
+                            array_element,
+                            descriptor_type: binding.descriptor_type,
+                            base_offset: write.offset,
+                            range,
+                            buffer_size: write.buffer.size(),
+                        });
+                    }
                     let index = buffer_infos.len();
                     buffer_infos.push(
                         vk::DescriptorBufferInfo::default()
@@ -419,6 +434,8 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
             }
         }
         validate_complete_descriptor_write_set(&self.layout.config, &seen)?;
+        dynamic_offsets
+            .sort_unstable_by_key(|requirement| (requirement.binding, requirement.array_element));
 
         let descriptor_writes: Vec<_> = prepared
             .iter()
@@ -452,6 +469,7 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
         Ok(DescriptorResourceLease {
             set: self,
             retained_resources,
+            dynamic_offsets,
         })
     }
 
@@ -489,6 +507,30 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
 pub struct DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device> {
     set: &'set mut VulkanDescriptorSet<'pool, 'layout, 'device>,
     retained_resources: Vec<RetainedDescriptorResource<'resource, 'image, 'device>>,
+    dynamic_offsets: Vec<DynamicOffsetRequirement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DynamicOffsetRequirement {
+    pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub base_offset: vk::DeviceSize,
+    pub range: vk::DeviceSize,
+    pub buffer_size: vk::DeviceSize,
+}
+
+trait DescriptorLeaseMarker {}
+impl DescriptorLeaseMarker for DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {}
+
+/// A borrowable descriptor-set lease reference for command-buffer recording.
+#[derive(Clone, Copy)]
+pub struct DescriptorSetLeaseRef<'lease> {
+    _lease: &'lease dyn DescriptorLeaseMarker,
+    pub(super) device: &'lease VulkanDevice,
+    pub(super) handle: vk::DescriptorSet,
+    pub(super) layout_handle: vk::DescriptorSetLayout,
+    pub(super) dynamic_offsets: &'lease [DynamicOffsetRequirement],
 }
 
 enum RetainedDescriptorResource<'resource, 'image, 'device> {
@@ -510,6 +552,18 @@ struct PreparedDescriptorWrite {
 }
 
 impl DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {
+    /// Creates a lightweight borrow that keeps this descriptor lease alive while recording/submitting commands.
+    #[must_use]
+    pub fn as_ref(&self) -> DescriptorSetLeaseRef<'_> {
+        DescriptorSetLeaseRef {
+            _lease: self,
+            device: self.set._pool.device,
+            handle: self.set.handle,
+            layout_handle: self.set.layout.handle(),
+            dynamic_offsets: &self.dynamic_offsets,
+        }
+    }
+
     /// Returns the descriptor-set handle while its referenced resources are leased.
     #[must_use]
     pub const fn handle(&self) -> vk::DescriptorSet {

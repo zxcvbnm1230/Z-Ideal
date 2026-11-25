@@ -1,0 +1,1480 @@
+//! Owned Vulkan command pools, command-buffer recording, and queue submissions.
+use ash::vk;
+
+use crate::{
+    DescriptorSetLeaseRef, FenceConfig, FenceWaitResult, VulkanBuffer, VulkanComputePipeline,
+    VulkanDevice, VulkanError, VulkanFence, VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage,
+    VulkanPipelineLayout, VulkanRenderPass, VulkanSemaphore, api_error,
+};
+
+trait CommandResource {}
+impl CommandResource for VulkanRenderPass<'_> {}
+impl CommandResource for VulkanFramebuffer<'_, '_, '_, '_> {}
+impl CommandResource for VulkanGraphicsPipeline<'_, '_, '_> {}
+impl CommandResource for VulkanComputePipeline<'_, '_, '_> {}
+impl CommandResource for VulkanPipelineLayout<'_, '_> {}
+impl CommandResource for VulkanBuffer<'_> {}
+impl CommandResource for VulkanImage<'_> {}
+
+/// Buffer memory dependency recorded into a command buffer.
+pub struct BufferBarrier<'buffer, 'device> {
+    /// Buffer whose accesses are synchronized.
+    pub buffer: &'buffer VulkanBuffer<'device>,
+    /// Accesses made available before the barrier.
+    pub source_access: vk::AccessFlags,
+    /// Accesses made visible after the barrier.
+    pub destination_access: vk::AccessFlags,
+    /// Byte offset in the buffer.
+    pub offset: vk::DeviceSize,
+    /// Byte range; `vk::WHOLE_SIZE` selects the remaining buffer.
+    pub size: vk::DeviceSize,
+}
+
+/// Image layout and memory dependency recorded into a command buffer.
+pub struct ImageBarrier<'image, 'device> {
+    /// Image whose layout/accesses are synchronized.
+    pub image: &'image VulkanImage<'device>,
+    /// Previous image layout, or `UNDEFINED` when prior contents are discarded.
+    pub old_layout: vk::ImageLayout,
+    /// Layout required after the barrier.
+    pub new_layout: vk::ImageLayout,
+    /// Accesses made available before the barrier.
+    pub source_access: vk::AccessFlags,
+    /// Accesses made visible after the barrier.
+    pub destination_access: vk::AccessFlags,
+    /// Image aspect mask.
+    pub aspect: vk::ImageAspectFlags,
+    /// First mip level covered by the barrier.
+    pub base_mip_level: u32,
+    /// Number of mip levels covered by the barrier.
+    pub level_count: u32,
+    /// First array layer covered by the barrier.
+    pub base_array_layer: u32,
+    /// Number of array layers covered by the barrier.
+    pub layer_count: u32,
+}
+
+/// Command-pool creation options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandPoolConfig {
+    /// Vulkan command-pool creation flags. Individual command-buffer reset is required.
+    pub flags: vk::CommandPoolCreateFlags,
+}
+
+impl Default for CommandPoolConfig {
+    fn default() -> Self {
+        Self {
+            flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        }
+    }
+}
+
+/// Owns a command pool for the device's graphics queue family.
+pub struct VulkanCommandPool<'device> {
+    device: &'device VulkanDevice,
+    handle: vk::CommandPool,
+    queue_family: u32,
+    queue_flags: vk::QueueFlags,
+}
+
+impl<'device> VulkanCommandPool<'device> {
+    /// Creates a resettable command pool for the selected graphics queue family.
+    pub fn new(
+        device: &'device VulkanDevice,
+        config: CommandPoolConfig,
+    ) -> Result<Self, VulkanError> {
+        if !validate_command_pool_flags(config.flags) {
+            return Err(VulkanError::InvalidCommandPoolConfig);
+        }
+        // SAFETY: Physical-device metadata belongs to the instance retained by the device.
+        let queue_families = unsafe {
+            device
+                ._instance
+                .handle
+                .get_physical_device_queue_family_properties(device.physical_device)
+        };
+        let family = queue_families
+            .get(device.graphics_queue_family as usize)
+            .ok_or(VulkanError::InvalidCommandPoolConfig)?;
+        if family.queue_count == 0 || !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+            return Err(VulkanError::InvalidCommandPoolConfig);
+        }
+        let info = vk::CommandPoolCreateInfo::default()
+            .flags(config.flags)
+            .queue_family_index(device.graphics_queue_family);
+        // SAFETY: The queue family belongs to the retained physical device and is enabled.
+        let handle = unsafe {
+            device
+                .handle
+                .create_command_pool(&info, None)
+                .map_err(|error| api_error("create Vulkan command pool", error))?
+        };
+        Ok(Self {
+            device,
+            handle,
+            queue_family: device.graphics_queue_family,
+            queue_flags: family.queue_flags,
+        })
+    }
+
+    /// Allocates one primary command buffer from this pool.
+    pub fn allocate_primary(&self) -> Result<VulkanCommandBuffer<'_, 'device>, VulkanError> {
+        let info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.handle)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: The pool is live and the allocation requests one primary command buffer.
+        let mut buffers = unsafe {
+            self.device
+                .handle
+                .allocate_command_buffers(&info)
+                .map_err(|error| api_error("allocate Vulkan command buffer", error))?
+        };
+        let handle = buffers.pop().ok_or(VulkanError::Api {
+            operation: "allocate Vulkan command buffer",
+            result: vk::Result::ERROR_UNKNOWN,
+        })?;
+        Ok(VulkanCommandBuffer {
+            pool: self,
+            handle,
+            state: CommandBufferState::Initial,
+            current_render_pass: None,
+            current_subpass: 0,
+            graphics_pipeline: None,
+            compute_pipeline_layout: None,
+            viewport_set: false,
+            scissor_set: false,
+            index_buffer_bound: false,
+        })
+    }
+
+    /// Returns the raw Vulkan command-pool handle.
+    #[must_use]
+    pub const fn handle(&self) -> vk::CommandPool {
+        self.handle
+    }
+
+    /// Returns the queue-family index this pool submits to.
+    #[must_use]
+    pub const fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+}
+
+impl Drop for VulkanCommandPool<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.device.wait_idle() {
+            tracing::warn!(
+                ?error,
+                "Vulkan device idle wait failed before command-pool destruction"
+            );
+        }
+        // SAFETY: This wrapper uniquely owns the pool; Vulkan frees its command buffers with it.
+        unsafe {
+            self.device.handle.destroy_command_pool(self.handle, None);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandBufferState {
+    Initial,
+    Recording,
+    Executable,
+    Pending,
+}
+
+/// Primary command buffer allocated from a borrowed command pool.
+pub struct VulkanCommandBuffer<'pool, 'device> {
+    pool: &'pool VulkanCommandPool<'device>,
+    handle: vk::CommandBuffer,
+    state: CommandBufferState,
+    current_render_pass: Option<vk::RenderPass>,
+    current_subpass: u32,
+    graphics_pipeline: Option<(vk::PipelineLayout, vk::RenderPass, u32)>,
+    compute_pipeline_layout: Option<vk::PipelineLayout>,
+    viewport_set: bool,
+    scissor_set: bool,
+    index_buffer_bound: bool,
+}
+
+impl<'pool, 'device> VulkanCommandBuffer<'pool, 'device> {
+    /// Begins recording and returns a guard that retains every referenced resource and descriptor lease through submission completion.
+    pub fn begin<'recording>(
+        &'recording mut self,
+        flags: vk::CommandBufferUsageFlags,
+    ) -> Result<CommandBufferRecording<'recording, 'pool, 'device>, VulkanError> {
+        match self.state {
+            CommandBufferState::Pending | CommandBufferState::Recording => {
+                return Err(VulkanError::InvalidCommandBufferState);
+            }
+            CommandBufferState::Executable => self.reset_internal()?,
+            CommandBufferState::Initial => {}
+        }
+        let info = vk::CommandBufferBeginInfo::default().flags(flags);
+        // SAFETY: The command buffer is initial and belongs to the retained pool/device.
+        unsafe {
+            self.pool
+                .device
+                .handle
+                .begin_command_buffer(self.handle, &info)
+                .map_err(|error| api_error("begin Vulkan command buffer", error))?;
+        }
+        self.state = CommandBufferState::Recording;
+        self.clear_recording_state();
+        Ok(CommandBufferRecording {
+            command_buffer: Some(self),
+            descriptor_leases: Vec::new(),
+            resources: Vec::new(),
+        })
+    }
+
+    /// Returns the raw Vulkan command-buffer handle.
+    #[must_use]
+    pub const fn handle(&self) -> vk::CommandBuffer {
+        self.handle
+    }
+
+    fn require_recording(&self) -> Result<(), VulkanError> {
+        if self.state == CommandBufferState::Recording {
+            Ok(())
+        } else {
+            Err(VulkanError::InvalidCommandBufferState)
+        }
+    }
+
+    fn clear_recording_state(&mut self) {
+        self.current_render_pass = None;
+        self.current_subpass = 0;
+        self.graphics_pipeline = None;
+        self.compute_pipeline_layout = None;
+        self.viewport_set = false;
+        self.scissor_set = false;
+        self.index_buffer_bound = false;
+    }
+
+    fn reset_internal(&mut self) -> Result<(), VulkanError> {
+        if matches!(
+            self.state,
+            CommandBufferState::Recording | CommandBufferState::Pending
+        ) {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command pool was created with RESET_COMMAND_BUFFER and the buffer is not pending.
+        unsafe {
+            self.pool
+                .device
+                .handle
+                .reset_command_buffer(self.handle, vk::CommandBufferResetFlags::empty())
+                .map_err(|error| api_error("reset Vulkan command buffer", error))?;
+        }
+        self.state = CommandBufferState::Initial;
+        self.clear_recording_state();
+        Ok(())
+    }
+
+    /// Abandons an unfinished recording scope and resets the command buffer.
+    ///
+    /// The recording guard also invokes this automatically when dropped unfinished.
+    pub fn abort_recording(&mut self) -> Result<(), VulkanError> {
+        if self.state != CommandBufferState::Recording {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is recording; close its active render pass, end it, then reset.
+        unsafe {
+            if self.current_render_pass.is_some() {
+                self.pool.device.handle.cmd_end_render_pass(self.handle);
+            }
+            self.pool
+                .device
+                .handle
+                .end_command_buffer(self.handle)
+                .map_err(|error| api_error("abort Vulkan command buffer recording", error))?;
+            self.pool
+                .device
+                .handle
+                .reset_command_buffer(self.handle, vk::CommandBufferResetFlags::empty())
+                .map_err(|error| api_error("reset aborted Vulkan command buffer", error))?;
+        }
+        self.state = CommandBufferState::Initial;
+        self.clear_recording_state();
+        Ok(())
+    }
+
+    fn end_internal(&mut self) -> Result<(), VulkanError> {
+        self.require_recording()?;
+        if self.current_render_pass.is_some() {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is recording and no render pass remains open.
+        unsafe {
+            self.pool
+                .device
+                .handle
+                .end_command_buffer(self.handle)
+                .map_err(|error| api_error("end Vulkan command buffer", error))?;
+        }
+        self.state = CommandBufferState::Executable;
+        Ok(())
+    }
+}
+
+/// Active recording scope. Dropping it without `end` safely aborts and resets the buffer.
+pub struct CommandBufferRecording<'recording, 'pool, 'device> {
+    command_buffer: Option<&'recording mut VulkanCommandBuffer<'pool, 'device>>,
+    descriptor_leases: Vec<DescriptorSetLeaseRef<'recording>>,
+    resources: Vec<&'recording dyn CommandResource>,
+}
+
+impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'device> {
+    fn buffer_mut(&mut self) -> &mut VulkanCommandBuffer<'pool, 'device> {
+        self.command_buffer
+            .as_deref_mut()
+            .expect("recording guard owns its command buffer")
+    }
+
+    /// Ends recording and returns an executable command buffer retaining all bound descriptor leases.
+    pub fn end(
+        mut self,
+    ) -> Result<ExecutableCommandBuffer<'recording, 'pool, 'device>, VulkanError> {
+        let command_buffer = self
+            .command_buffer
+            .take()
+            .expect("recording guard owns its command buffer until end");
+        if let Err(error) = command_buffer.end_internal() {
+            let _ = command_buffer.abort_recording();
+            return Err(error);
+        }
+        Ok(ExecutableCommandBuffer {
+            command_buffer,
+            _descriptor_leases: std::mem::take(&mut self.descriptor_leases),
+            _resources: std::mem::take(&mut self.resources),
+        })
+    }
+
+    /// Begins a render pass with one clear value per render-pass attachment.
+    pub fn begin_render_pass(
+        &mut self,
+        render_pass: &'recording VulkanRenderPass<'device>,
+        framebuffer: &'recording VulkanFramebuffer<'_, '_, '_, 'device>,
+        clear_values: &[vk::ClearValue],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(self.buffer_mut().pool.device, render_pass.device)
+            || !std::ptr::eq(
+                self.buffer_mut().pool.device,
+                framebuffer.render_pass().device,
+            )
+            || framebuffer.render_pass().handle() != render_pass.handle()
+            || clear_values.len() != render_pass.attachment_count()
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: framebuffer.extent(),
+        };
+        let info = vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass.handle())
+            .framebuffer(framebuffer.handle())
+            .render_area(area)
+            .clear_values(clear_values);
+        // SAFETY: The render pass/framebuffer are compatible and retained by the caller;
+        // the command-buffer recording guard's borrow prevents them being dropped here.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_begin_render_pass(
+                self.buffer_mut().handle,
+                &info,
+                vk::SubpassContents::INLINE,
+            );
+        }
+        self.buffer_mut().current_render_pass = Some(render_pass.handle());
+        self.buffer_mut().current_subpass = 0;
+        self.buffer_mut().graphics_pipeline = None;
+        self.buffer_mut().viewport_set = false;
+        self.buffer_mut().scissor_set = false;
+        self.resources.push(render_pass);
+        self.resources.push(framebuffer);
+        Ok(())
+    }
+
+    /// Advances to the next subpass in the active render pass.
+    pub fn next_subpass(
+        &mut self,
+        render_pass: &'recording VulkanRenderPass<'device>,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if !std::ptr::eq(self.buffer_mut().pool.device, render_pass.device)
+            || self.buffer_mut().current_render_pass != Some(render_pass.handle())
+            || self.buffer_mut().current_subpass + 1 >= render_pass.subpass_count() as u32
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is inside the specified render pass and a next subpass exists.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_next_subpass(self.buffer_mut().handle, vk::SubpassContents::INLINE);
+        }
+        self.buffer_mut().current_subpass += 1;
+        self.buffer_mut().graphics_pipeline = None;
+        self.buffer_mut().viewport_set = false;
+        self.buffer_mut().scissor_set = false;
+        self.resources.push(render_pass);
+        Ok(())
+    }
+
+    /// Ends the active render pass.
+    pub fn end_render_pass(&mut self) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_none() {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is inside a render pass.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_end_render_pass(self.buffer_mut().handle);
+        }
+        self.buffer_mut().current_render_pass = None;
+        self.buffer_mut().current_subpass = 0;
+        self.buffer_mut().graphics_pipeline = None;
+        self.buffer_mut().viewport_set = false;
+        self.buffer_mut().scissor_set = false;
+        Ok(())
+    }
+
+    /// Binds a graphics pipeline compatible with the active render-pass subpass.
+    pub fn bind_graphics_pipeline(
+        &mut self,
+        pipeline: &'recording VulkanGraphicsPipeline<'_, '_, 'device>,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if !std::ptr::eq(self.buffer_mut().pool.device, pipeline.device)
+            || self.buffer_mut().current_render_pass != Some(pipeline.render_pass)
+            || self.buffer_mut().current_subpass != pipeline.subpass
+        {
+            return Err(VulkanError::PipelineShaderStageMismatch);
+        }
+        // SAFETY: Pipeline and device are compatible and pipeline is retained by the caller.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_bind_pipeline(
+                self.buffer_mut().handle,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.handle(),
+            );
+        }
+        self.buffer_mut().graphics_pipeline = Some((
+            pipeline.layout_handle,
+            pipeline.render_pass,
+            pipeline.subpass,
+        ));
+        self.buffer_mut().viewport_set = false;
+        self.buffer_mut().scissor_set = false;
+        self.resources.push(pipeline);
+        Ok(())
+    }
+
+    /// Binds a compute pipeline outside a render pass.
+    pub fn bind_compute_pipeline(
+        &mut self,
+        pipeline: &'recording VulkanComputePipeline<'_, '_, 'device>,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(self.buffer_mut().pool.device, pipeline.device)
+            || !self
+                .buffer_mut()
+                .pool
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE)
+        {
+            return Err(VulkanError::PipelineShaderStageMismatch);
+        }
+        // SAFETY: Pipeline and device are compatible and pipeline is retained by the caller.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_bind_pipeline(
+                self.buffer_mut().handle,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.handle(),
+            );
+        }
+        self.buffer_mut().compute_pipeline_layout = Some(pipeline.layout_handle);
+        self.resources.push(pipeline);
+        Ok(())
+    }
+
+    /// Sets the dynamic viewport required by the initial graphics pipeline configuration.
+    pub fn set_viewport(&mut self, viewport: vk::Viewport) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if !viewport.x.is_finite()
+            || !viewport.y.is_finite()
+            || !viewport.width.is_finite()
+            || !viewport.height.is_finite()
+            || !viewport.min_depth.is_finite()
+            || !viewport.max_depth.is_finite()
+            || viewport.width <= 0.0
+            || viewport.height <= 0.0
+            || viewport.min_depth < 0.0
+            || viewport.max_depth > 1.0
+            || viewport.min_depth > viewport.max_depth
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is recording and viewport values were validated.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_set_viewport(
+                self.buffer_mut().handle,
+                0,
+                &[viewport],
+            );
+        }
+        self.buffer_mut().viewport_set = true;
+        Ok(())
+    }
+
+    /// Sets the dynamic scissor required by the initial graphics pipeline configuration.
+    pub fn set_scissor(&mut self, scissor: vk::Rect2D) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if scissor.extent.width == 0 || scissor.extent.height == 0 {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is recording and scissor extent is nonzero.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_set_scissor(
+                self.buffer_mut().handle,
+                0,
+                &[scissor],
+            );
+        }
+        self.buffer_mut().scissor_set = true;
+        Ok(())
+    }
+
+    /// Binds vertex buffers after checking device identity, usage, and offsets.
+    pub fn bind_vertex_buffers(
+        &mut self,
+        first_binding: u32,
+        buffers: &[&'recording VulkanBuffer<'device>],
+        offsets: &[vk::DeviceSize],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let binding_count =
+            u32::try_from(buffers.len()).map_err(|_| VulkanError::InvalidCommandBufferState)?;
+        if buffers.is_empty()
+            || buffers.len() != offsets.len()
+            || first_binding.checked_add(binding_count).is_none()
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        for (buffer, offset) in buffers.iter().zip(offsets) {
+            if !std::ptr::eq(self.buffer_mut().pool.device, buffer.device)
+                || !buffer.usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER)
+                || *offset >= buffer.size()
+            {
+                return Err(VulkanError::InvalidCommandBufferState);
+            }
+        }
+        let handles: Vec<_> = buffers.iter().map(|buffer| buffer.handle()).collect();
+        // SAFETY: Buffers are live, device-compatible, and remain borrowed for this call.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_bind_vertex_buffers(
+                    self.buffer_mut().handle,
+                    first_binding,
+                    &handles,
+                    offsets,
+                );
+        }
+        self.resources
+            .extend(buffers.iter().map(|buffer| *buffer as &dyn CommandResource));
+        Ok(())
+    }
+
+    /// Binds an index buffer after checking device identity, usage, offset, and index type.
+    pub fn bind_index_buffer(
+        &mut self,
+        buffer: &'recording VulkanBuffer<'device>,
+        offset: vk::DeviceSize,
+        index_type: vk::IndexType,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if !std::ptr::eq(self.buffer_mut().pool.device, buffer.device)
+            || !buffer.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
+            || offset >= buffer.size()
+            || !matches!(index_type, vk::IndexType::UINT16 | vk::IndexType::UINT32)
+            || (index_type == vk::IndexType::UINT16 && offset % 2 != 0)
+            || (index_type == vk::IndexType::UINT32 && offset % 4 != 0)
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The buffer is live, device-compatible, and has index-buffer usage.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_bind_index_buffer(
+                self.buffer_mut().handle,
+                buffer.handle(),
+                offset,
+                index_type,
+            );
+        }
+        self.buffer_mut().index_buffer_bound = true;
+        self.resources.push(buffer);
+        Ok(())
+    }
+
+    /// Binds descriptor-set leases and validates dynamic offsets and pipeline-layout compatibility.
+    pub fn bind_descriptor_sets(
+        &mut self,
+        bind_point: vk::PipelineBindPoint,
+        layout: &'recording VulkanPipelineLayout<'_, 'device>,
+        first_set: u32,
+        leases: &[DescriptorSetLeaseRef<'recording>],
+        dynamic_offsets: &[u32],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let lease_count =
+            u32::try_from(leases.len()).map_err(|_| VulkanError::InvalidCommandBufferState)?;
+        if !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
+            || leases.is_empty()
+            || first_set
+                .checked_add(lease_count)
+                .is_none_or(|end| end as usize > layout.set_layouts().len())
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        let expected_layout = match bind_point {
+            vk::PipelineBindPoint::GRAPHICS if self.buffer_mut().current_render_pass.is_some() => {
+                self.buffer_mut()
+                    .graphics_pipeline
+                    .map(|pipeline| pipeline.0)
+            }
+            vk::PipelineBindPoint::COMPUTE if self.buffer_mut().current_render_pass.is_none() => {
+                self.buffer_mut().compute_pipeline_layout
+            }
+            _ => None,
+        };
+        if expected_layout != Some(layout.handle()) {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+
+        let mut required_dynamic_count = 0_usize;
+        for (index, lease) in leases.iter().enumerate() {
+            let set_index = first_set as usize + index;
+            let set_layout = layout
+                .set_layouts()
+                .get(set_index)
+                .ok_or(VulkanError::InvalidCommandBufferState)?;
+            if !std::ptr::eq(self.buffer_mut().pool.device, lease.device)
+                || set_layout.handle() != lease.layout_handle
+            {
+                return Err(VulkanError::InvalidCommandBufferState);
+            }
+            let mut dynamic_bindings: Vec<_> = set_layout
+                .config()
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    matches!(
+                        binding.descriptor_type,
+                        vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                            | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                    )
+                })
+                .collect();
+            dynamic_bindings.sort_unstable_by_key(|binding| binding.binding);
+            let expected_slots: Vec<_> = dynamic_bindings
+                .iter()
+                .flat_map(|binding| {
+                    (0..binding.descriptor_count).map(move |array_element| {
+                        (binding.binding, array_element, binding.descriptor_type)
+                    })
+                })
+                .collect();
+            if lease.dynamic_offsets.len() != expected_slots.len() {
+                return Err(VulkanError::InvalidDynamicDescriptorOffset);
+            }
+            for (requirement, (binding, array_element, descriptor_type)) in
+                lease.dynamic_offsets.iter().zip(expected_slots)
+            {
+                if requirement.binding != binding
+                    || requirement.array_element != array_element
+                    || requirement.descriptor_type != descriptor_type
+                {
+                    return Err(VulkanError::InvalidDynamicDescriptorOffset);
+                }
+                let offset = *dynamic_offsets
+                    .get(required_dynamic_count)
+                    .ok_or(VulkanError::InvalidDynamicDescriptorOffset)?;
+                let (uniform_alignment, storage_alignment) = (
+                    self.buffer_mut()
+                        .pool
+                        .device
+                        .min_uniform_buffer_offset_alignment,
+                    self.buffer_mut()
+                        .pool
+                        .device
+                        .min_storage_buffer_offset_alignment,
+                );
+                validate_dynamic_offset_requirement(
+                    requirement,
+                    offset,
+                    uniform_alignment,
+                    storage_alignment,
+                )?;
+                required_dynamic_count += 1;
+            }
+        }
+        if required_dynamic_count != dynamic_offsets.len() {
+            return Err(VulkanError::InvalidDynamicDescriptorOffset);
+        }
+
+        let handles: Vec<_> = leases.iter().map(|lease| lease.handle).collect();
+        // SAFETY: Every descriptor set is retained by a lease stored in this recording
+        // guard and has been checked against the pipeline layout and dynamic offsets.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_bind_descriptor_sets(
+                    self.buffer_mut().handle,
+                    bind_point,
+                    layout.handle(),
+                    first_set,
+                    &handles,
+                    dynamic_offsets,
+                );
+        }
+        self.descriptor_leases.extend_from_slice(leases);
+        self.resources.push(layout);
+        Ok(())
+    }
+
+    /// Records buffer/image memory barriers and image layout transitions.
+    ///
+    /// Queue-family ownership transfers are not exposed yet; all barriers use
+    /// `QUEUE_FAMILY_IGNORED` because this initial queue wrapper submits to one family.
+    pub fn pipeline_barrier(
+        &mut self,
+        source_stages: vk::PipelineStageFlags,
+        destination_stages: vk::PipelineStageFlags,
+        dependency_flags: vk::DependencyFlags,
+        buffers: &[BufferBarrier<'recording, 'device>],
+        images: &[ImageBarrier<'recording, 'device>],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if source_stages.is_empty()
+            || destination_stages.is_empty()
+            || (buffers.is_empty() && images.is_empty())
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        let mut raw_buffers = Vec::with_capacity(buffers.len());
+        for barrier in buffers {
+            validate_buffer_barrier(barrier, self.buffer_mut().pool.device)?;
+            raw_buffers.push(
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(barrier.source_access)
+                    .dst_access_mask(barrier.destination_access)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(barrier.buffer.handle())
+                    .offset(barrier.offset)
+                    .size(if barrier.size == vk::WHOLE_SIZE {
+                        barrier.buffer.size() - barrier.offset
+                    } else {
+                        barrier.size
+                    }),
+            );
+        }
+        let mut raw_images = Vec::with_capacity(images.len());
+        for barrier in images {
+            validate_image_barrier(barrier, self.buffer_mut().pool.device)?;
+            raw_images.push(
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(barrier.source_access)
+                    .dst_access_mask(barrier.destination_access)
+                    .old_layout(barrier.old_layout)
+                    .new_layout(barrier.new_layout)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(barrier.image.handle())
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(barrier.aspect)
+                            .base_mip_level(barrier.base_mip_level)
+                            .level_count(barrier.level_count)
+                            .base_array_layer(barrier.base_array_layer)
+                            .layer_count(barrier.layer_count),
+                    ),
+            );
+        }
+        // SAFETY: Every resource is device-compatible and retained by this recording guard;
+        // all subresource/range bounds and stage masks were validated above.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_pipeline_barrier(
+                self.buffer_mut().handle,
+                source_stages,
+                destination_stages,
+                dependency_flags,
+                &[],
+                &raw_buffers,
+                &raw_images,
+            );
+        }
+        self.resources.extend(
+            buffers
+                .iter()
+                .map(|barrier| barrier.buffer as &dyn CommandResource),
+        );
+        self.resources.extend(
+            images
+                .iter()
+                .map(|barrier| barrier.image as &dyn CommandResource),
+        );
+        Ok(())
+    }
+
+    /// Pushes bytes to a validated push-constant range for the active pipeline layout.
+    pub fn push_constants(
+        &mut self,
+        bind_point: vk::PipelineBindPoint,
+        layout: &'recording VulkanPipelineLayout<'_, 'device>,
+        stages: vk::ShaderStageFlags,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let expected_layout = match bind_point {
+            vk::PipelineBindPoint::GRAPHICS => self.buffer_mut().graphics_pipeline.map(|p| p.0),
+            vk::PipelineBindPoint::COMPUTE => self.buffer_mut().compute_pipeline_layout,
+            _ => None,
+        };
+        let size = u32::try_from(data.len()).map_err(|_| VulkanError::InvalidPushConstantWrite)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(VulkanError::InvalidPushConstantWrite)?;
+        if !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
+            || expected_layout != Some(layout.handle())
+            || stages.is_empty()
+            || offset % 4 != 0
+            || size == 0
+            || size % 4 != 0
+            || !push_constant_range_covers(layout.push_constant_ranges(), stages, offset, end)
+        {
+            return Err(VulkanError::InvalidPushConstantWrite);
+        }
+        // SAFETY: The pipeline layout is live and every requested stage/byte is covered.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_push_constants(
+                self.buffer_mut().handle,
+                layout.handle(),
+                stages,
+                offset,
+                data,
+            );
+        }
+        self.resources.push(layout);
+        Ok(())
+    }
+
+    /// Records a non-indexed draw in the active render-pass subpass.
+    pub fn draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_none()
+            || self.buffer_mut().graphics_pipeline.is_none()
+            || !self.buffer_mut().viewport_set
+            || !self.buffer_mut().scissor_set
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is inside a compatible render pass with pipeline and dynamic state bound.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_draw(
+                self.buffer_mut().handle,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            );
+        }
+        Ok(())
+    }
+
+    /// Records an indexed draw in the active render-pass subpass.
+    pub fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_none()
+            || self.buffer_mut().graphics_pipeline.is_none()
+            || !self.buffer_mut().viewport_set
+            || !self.buffer_mut().scissor_set
+            || !self.buffer_mut().index_buffer_bound
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer has a compatible graphics pipeline, dynamic state, and index buffer bound.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_draw_indexed(
+                self.buffer_mut().handle,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            );
+        }
+        Ok(())
+    }
+
+    /// Records a compute dispatch outside a render pass.
+    pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || self.buffer_mut().compute_pipeline_layout.is_none()
+            || !self
+                .buffer_mut()
+                .pool
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE)
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        // SAFETY: The command buffer is recording outside a render pass with a compute pipeline bound.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_dispatch(self.buffer_mut().handle, x, y, z);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CommandBufferRecording<'_, '_, '_> {
+    fn drop(&mut self) {
+        if let Some(command_buffer) = self.command_buffer.as_deref_mut() {
+            if command_buffer.state == CommandBufferState::Recording {
+                if let Err(error) = command_buffer.abort_recording() {
+                    tracing::warn!(
+                        ?error,
+                        "failed to abort unfinished Vulkan command-buffer recording"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Executable command buffer retaining every resource referenced during recording.
+pub struct ExecutableCommandBuffer<'recording, 'pool, 'device> {
+    command_buffer: &'recording mut VulkanCommandBuffer<'pool, 'device>,
+    _descriptor_leases: Vec<DescriptorSetLeaseRef<'recording>>,
+    _resources: Vec<&'recording dyn CommandResource>,
+}
+
+impl Drop for ExecutableCommandBuffer<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.command_buffer.state == CommandBufferState::Executable {
+            // SAFETY: The command buffer is executable and not pending; its pool allows individual reset.
+            if let Err(error) = unsafe {
+                self.command_buffer.pool.device.handle.reset_command_buffer(
+                    self.command_buffer.handle,
+                    vk::CommandBufferResetFlags::empty(),
+                )
+            } {
+                tracing::warn!(
+                    ?error,
+                    "failed to reset abandoned executable command buffer"
+                );
+            }
+            self.command_buffer.state = CommandBufferState::Initial;
+            self.command_buffer.clear_recording_state();
+        }
+    }
+}
+
+impl ExecutableCommandBuffer<'_, '_, '_> {
+    /// Returns the raw executable command-buffer handle.
+    #[must_use]
+    pub const fn handle(&self) -> vk::CommandBuffer {
+        self.command_buffer.handle
+    }
+}
+
+/// Submits one executable primary command buffer to the device graphics queue.
+pub struct VulkanQueue<'device> {
+    device: &'device VulkanDevice,
+    handle: vk::Queue,
+    family: u32,
+}
+
+impl<'device> VulkanQueue<'device> {
+    /// Creates a queue wrapper for the selected graphics queue.
+    #[must_use]
+    pub const fn graphics(device: &'device VulkanDevice) -> Self {
+        Self {
+            device,
+            handle: device.graphics_queue,
+            family: device.graphics_queue_family,
+        }
+    }
+
+    /// Submits an executable command buffer and returns a fence-backed completion guard.
+    pub fn submit<'recording, 'pool>(
+        &self,
+        executable: ExecutableCommandBuffer<'recording, 'pool, 'device>,
+        wait_semaphores: &[&VulkanSemaphore<'device>],
+        wait_stage_masks: &[vk::PipelineStageFlags],
+        signal_semaphores: &[&VulkanSemaphore<'device>],
+    ) -> Result<VulkanSubmission<'recording, 'pool, 'device>, VulkanError> {
+        if !std::ptr::eq(self.device, executable.command_buffer.pool.device)
+            || executable.command_buffer.pool.queue_family != self.family
+            || executable.command_buffer.state != CommandBufferState::Executable
+            || wait_semaphores.len() != wait_stage_masks.len()
+            || wait_stage_masks.iter().any(|stage| stage.is_empty())
+            || wait_semaphores
+                .iter()
+                .chain(signal_semaphores)
+                .any(|semaphore| !std::ptr::eq(self.device, semaphore.device))
+        {
+            return Err(VulkanError::InvalidQueueSubmission);
+        }
+        let wait_handles: Vec<_> = wait_semaphores
+            .iter()
+            .map(|semaphore| semaphore.handle())
+            .collect();
+        let signal_handles: Vec<_> = signal_semaphores
+            .iter()
+            .map(|semaphore| semaphore.handle())
+            .collect();
+        if !validate_semaphore_handle_sets(&wait_handles, &signal_handles) {
+            return Err(VulkanError::InvalidQueueSubmission);
+        }
+        let command_handles = [executable.command_buffer.handle];
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_handles)
+            .wait_dst_stage_mask(wait_stage_masks)
+            .command_buffers(&command_handles)
+            .signal_semaphores(&signal_handles);
+        let fence = VulkanFence::new(self.device, FenceConfig { signaled: false })?;
+        let _queue_guard = self
+            .device
+            .queue_submit_lock
+            .lock()
+            .map_err(|_| VulkanError::QueueSynchronizationPoisoned)?;
+        // SAFETY: All submit arrays remain alive through the call; the queue is externally
+        // synchronized by the device mutex and every handle belongs to this device.
+        unsafe {
+            self.device
+                .handle
+                .queue_submit(self.handle, &[info], fence.handle())
+                .map_err(|error| api_error("submit Vulkan command buffer", error))?;
+        }
+        executable.command_buffer.state = CommandBufferState::Pending;
+        Ok(VulkanSubmission {
+            executable: Some(executable),
+            fence,
+            completed: false,
+        })
+    }
+
+    /// Returns the queue-family index used by this wrapper.
+    #[must_use]
+    pub const fn family(&self) -> u32 {
+        self.family
+    }
+}
+
+/// Retains a submitted command buffer and its descriptor leases until its fence signals.
+pub struct VulkanSubmission<'recording, 'pool, 'device> {
+    executable: Option<ExecutableCommandBuffer<'recording, 'pool, 'device>>,
+    fence: VulkanFence<'device>,
+    completed: bool,
+}
+
+impl VulkanSubmission<'_, '_, '_> {
+    /// Waits for submission completion or returns `Timeout` without releasing resources.
+    pub fn wait(&mut self, timeout_nanoseconds: u64) -> Result<FenceWaitResult, VulkanError> {
+        let result = self.fence.wait(timeout_nanoseconds)?;
+        if result == FenceWaitResult::Signaled {
+            self.mark_completed();
+        }
+        Ok(result)
+    }
+
+    /// Returns whether the submission fence has signaled.
+    pub fn is_complete(&mut self) -> Result<bool, VulkanError> {
+        if self.fence.is_signaled()? {
+            self.mark_completed();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns the fence handle associated with this submission.
+    #[must_use]
+    pub const fn fence(&self) -> vk::Fence {
+        self.fence.handle()
+    }
+
+    fn mark_completed(&mut self) {
+        if let Some(executable) = &mut self.executable {
+            executable.command_buffer.state = CommandBufferState::Executable;
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for VulkanSubmission<'_, '_, '_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(executable) = &mut self.executable {
+                if let Err(error) = executable.command_buffer.pool.device.wait_idle() {
+                    tracing::warn!(
+                        ?error,
+                        "Vulkan device idle wait failed before submission resources were released"
+                    );
+                }
+                executable.command_buffer.state = CommandBufferState::Executable;
+            }
+        }
+    }
+}
+
+fn validate_command_pool_flags(flags: vk::CommandPoolCreateFlags) -> bool {
+    let allowed =
+        vk::CommandPoolCreateFlags::TRANSIENT | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER;
+    flags.contains(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+        && flags.as_raw() & !allowed.as_raw() == 0
+}
+
+fn validate_buffer_barrier_range(
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    buffer_size: vk::DeviceSize,
+) -> bool {
+    let range = if size == vk::WHOLE_SIZE {
+        buffer_size.checked_sub(offset)
+    } else {
+        Some(size)
+    };
+    range.is_some_and(|range| {
+        range > 0
+            && offset
+                .checked_add(range)
+                .is_some_and(|end| end <= buffer_size)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ImageBarrierSubresourceRange {
+    aspect: vk::ImageAspectFlags,
+    base_mip_level: u32,
+    level_count: u32,
+    mip_levels: u32,
+    base_array_layer: u32,
+    layer_count: u32,
+    array_layers: u32,
+}
+
+fn validate_image_barrier_range(
+    range: ImageBarrierSubresourceRange,
+    new_layout: vk::ImageLayout,
+) -> bool {
+    !range.aspect.is_empty()
+        && range.level_count > 0
+        && range.layer_count > 0
+        && range
+            .base_mip_level
+            .checked_add(range.level_count)
+            .is_some_and(|end| end <= range.mip_levels)
+        && range
+            .base_array_layer
+            .checked_add(range.layer_count)
+            .is_some_and(|end| end <= range.array_layers)
+        && new_layout != vk::ImageLayout::UNDEFINED
+        && new_layout != vk::ImageLayout::PREINITIALIZED
+}
+
+fn validate_buffer_barrier(
+    barrier: &BufferBarrier<'_, '_>,
+    device: &VulkanDevice,
+) -> Result<(), VulkanError> {
+    if !std::ptr::eq(device, barrier.buffer.device)
+        || !validate_buffer_barrier_range(barrier.offset, barrier.size, barrier.buffer.size())
+    {
+        return Err(VulkanError::InvalidCommandBufferState);
+    }
+    Ok(())
+}
+
+fn validate_image_barrier(
+    barrier: &ImageBarrier<'_, '_>,
+    device: &VulkanDevice,
+) -> Result<(), VulkanError> {
+    let config = barrier.image.config();
+    if !std::ptr::eq(device, barrier.image.device)
+        || !validate_image_barrier_range(
+            ImageBarrierSubresourceRange {
+                aspect: barrier.aspect,
+                base_mip_level: barrier.base_mip_level,
+                level_count: barrier.level_count,
+                mip_levels: config.mip_levels,
+                base_array_layer: barrier.base_array_layer,
+                layer_count: barrier.layer_count,
+                array_layers: config.array_layers,
+            },
+            barrier.new_layout,
+        )
+    {
+        return Err(VulkanError::InvalidCommandBufferState);
+    }
+    Ok(())
+}
+
+fn validate_dynamic_offset_requirement(
+    requirement: &crate::descriptor::DynamicOffsetRequirement,
+    dynamic_offset: u32,
+    uniform_alignment: vk::DeviceSize,
+    storage_alignment: vk::DeviceSize,
+) -> Result<(), VulkanError> {
+    let alignment = match requirement.descriptor_type {
+        vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => uniform_alignment,
+        vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => storage_alignment,
+        _ => return Err(VulkanError::InvalidDynamicDescriptorOffset),
+    };
+    let effective_offset = requirement
+        .base_offset
+        .checked_add(u64::from(dynamic_offset))
+        .ok_or(VulkanError::InvalidDynamicDescriptorOffset)?;
+    let end = effective_offset
+        .checked_add(requirement.range)
+        .ok_or(VulkanError::InvalidDynamicDescriptorOffset)?;
+    if (alignment > 1 && u64::from(dynamic_offset) % alignment != 0)
+        || end > requirement.buffer_size
+    {
+        return Err(VulkanError::InvalidDynamicDescriptorOffset);
+    }
+    Ok(())
+}
+
+fn validate_semaphore_handle_sets(
+    wait_handles: &[vk::Semaphore],
+    signal_handles: &[vk::Semaphore],
+) -> bool {
+    if wait_handles
+        .iter()
+        .any(|handle| *handle == vk::Semaphore::null())
+        || signal_handles
+            .iter()
+            .any(|handle| *handle == vk::Semaphore::null())
+    {
+        return false;
+    }
+    for (index, handle) in wait_handles.iter().enumerate() {
+        if wait_handles[..index].contains(handle) || signal_handles.contains(handle) {
+            return false;
+        }
+    }
+    for (index, handle) in signal_handles.iter().enumerate() {
+        if signal_handles[..index].contains(handle) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_constant_range_covers(
+    ranges: &[vk::PushConstantRange],
+    stages: vk::ShaderStageFlags,
+    offset: u32,
+    end: u32,
+) -> bool {
+    let supported = vk::ShaderStageFlags::VERTEX
+        | vk::ShaderStageFlags::FRAGMENT
+        | vk::ShaderStageFlags::COMPUTE;
+    if stages.as_raw() & !supported.as_raw() != 0 {
+        return false;
+    }
+    for stage in [
+        vk::ShaderStageFlags::VERTEX,
+        vk::ShaderStageFlags::FRAGMENT,
+        vk::ShaderStageFlags::COMPUTE,
+    ] {
+        if !stages.contains(stage) {
+            continue;
+        }
+        let mut stage_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|range| range.stage_flags.contains(stage))
+            .collect();
+        stage_ranges.sort_unstable_by_key(|range| range.offset);
+        let mut covered = offset;
+        for range in stage_ranges {
+            let range_end = match range.offset.checked_add(range.size) {
+                Some(end) => end,
+                None => return false,
+            };
+            if range_end <= covered || range.offset > covered {
+                continue;
+            }
+            covered = covered.max(range_end);
+            if covered >= end {
+                break;
+            }
+        }
+        if covered < end {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ImageBarrierSubresourceRange, push_constant_range_covers, validate_buffer_barrier_range,
+        validate_command_pool_flags, validate_dynamic_offset_requirement,
+        validate_image_barrier_range, validate_semaphore_handle_sets,
+    };
+    use crate::descriptor::DynamicOffsetRequirement;
+    use ash::vk;
+
+    #[test]
+    fn validates_command_pool_flags_and_barrier_ranges() {
+        assert!(validate_command_pool_flags(
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                | vk::CommandPoolCreateFlags::TRANSIENT
+        ));
+        assert!(!validate_command_pool_flags(
+            vk::CommandPoolCreateFlags::empty()
+        ));
+        assert!(!validate_command_pool_flags(
+            vk::CommandPoolCreateFlags::PROTECTED
+        ));
+
+        assert!(validate_buffer_barrier_range(128, 256, 1024));
+        assert!(validate_buffer_barrier_range(256, vk::WHOLE_SIZE, 1024));
+        assert!(!validate_buffer_barrier_range(1024, vk::WHOLE_SIZE, 1024));
+        assert!(!validate_buffer_barrier_range(u64::MAX - 2, 8, u64::MAX));
+        assert!(!validate_buffer_barrier_range(0, 0, 1024));
+
+        let valid_range = ImageBarrierSubresourceRange {
+            aspect: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 2,
+            mip_levels: 4,
+            base_array_layer: 0,
+            layer_count: 1,
+            array_layers: 1,
+        };
+        assert!(validate_image_barrier_range(
+            valid_range,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ));
+        assert!(!validate_image_barrier_range(
+            ImageBarrierSubresourceRange {
+                aspect: vk::ImageAspectFlags::empty(),
+                level_count: 1,
+                ..valid_range
+            },
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ));
+        assert!(!validate_image_barrier_range(
+            ImageBarrierSubresourceRange {
+                base_mip_level: 3,
+                level_count: 2,
+                ..valid_range
+            },
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ));
+        assert!(!validate_image_barrier_range(
+            valid_range,
+            vk::ImageLayout::UNDEFINED,
+        ));
+    }
+
+    #[test]
+    fn validates_dynamic_offset_alignment_and_effective_buffer_bounds() {
+        let requirement = DynamicOffsetRequirement {
+            binding: 0,
+            array_element: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+            base_offset: 256,
+            range: 256,
+            buffer_size: 1024,
+        };
+        assert!(validate_dynamic_offset_requirement(&requirement, 256, 256, 16).is_ok());
+        assert!(validate_dynamic_offset_requirement(&requirement, 128, 256, 16).is_err());
+        assert!(validate_dynamic_offset_requirement(&requirement, 768, 256, 16).is_err());
+        let overflow = DynamicOffsetRequirement {
+            base_offset: u64::MAX - 4,
+            range: 16,
+            ..requirement
+        };
+        assert!(validate_dynamic_offset_requirement(&overflow, 0, 1, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_null_semaphores_in_a_queue_submission() {
+        use ash::vk::Handle;
+        let first = vk::Semaphore::from_raw(1);
+        let second = vk::Semaphore::from_raw(2);
+        assert!(validate_semaphore_handle_sets(&[first], &[second]));
+        assert!(!validate_semaphore_handle_sets(&[first, first], &[]));
+        assert!(!validate_semaphore_handle_sets(&[first], &[first]));
+        assert!(!validate_semaphore_handle_sets(
+            &[],
+            &[vk::Semaphore::null()]
+        ));
+    }
+
+    #[test]
+    fn validates_push_constant_write_coverage_for_each_stage() {
+        let ranges = [
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .offset(0)
+                .size(16),
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(32),
+        ];
+        assert!(push_constant_range_covers(
+            &ranges,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            16,
+        ));
+        assert!(!push_constant_range_covers(
+            &ranges,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            24,
+        ));
+    }
+}
