@@ -3,9 +3,13 @@
 
 pub mod input;
 pub mod input_router;
+pub mod window_manager;
 
 pub use input::{InputState, ScrollDelta};
 pub use input_router::{InputRouter, InputRouterError, InputWindowId};
+pub use window_manager::{
+    WindowEventOutcome, WindowManager, WindowManagerError, WindowMetrics,
+};
 
 use thiserror::Error;
 use winit::{
