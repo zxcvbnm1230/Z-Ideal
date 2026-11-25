@@ -83,11 +83,15 @@ impl InputState {
 
     /// Whether the window currently has keyboard focus.
     #[must_use]
-    pub const fn focused(&self) -> bool { self.focused }
+    pub const fn focused(&self) -> bool {
+        self.focused
+    }
 
     /// Whether a physical keyboard key is currently held.
     #[must_use]
-    pub fn key_down(&self, key: KeyCode) -> bool { self.pressed_keys.contains(&key) }
+    pub fn key_down(&self, key: KeyCode) -> bool {
+        self.pressed_keys.contains(&key)
+    }
 
     /// Whether a physical keyboard key transitioned to pressed this frame.
     #[must_use]
@@ -121,11 +125,15 @@ impl InputState {
 
     /// Current cursor position in physical window pixels, if inside the window.
     #[must_use]
-    pub const fn cursor_position(&self) -> Option<(f64, f64)> { self.cursor_position }
+    pub const fn cursor_position(&self) -> Option<(f64, f64)> {
+        self.cursor_position
+    }
 
     /// Wheel movement accumulated since the last call to begin_frame.
     #[must_use]
-    pub const fn scroll_delta(&self) -> ScrollDelta { self.scroll }
+    pub const fn scroll_delta(&self) -> ScrollDelta {
+        self.scroll
+    }
 
     fn update_key(&mut self, key: KeyCode, state: ElementState) {
         match state {
@@ -159,7 +167,8 @@ impl InputState {
 
     fn release_all_inputs(&mut self) {
         self.just_released_keys.extend(self.pressed_keys.drain());
-        self.just_released_mouse_buttons.extend(self.pressed_mouse_buttons.drain());
+        self.just_released_mouse_buttons
+            .extend(self.pressed_mouse_buttons.drain());
     }
 }
 
