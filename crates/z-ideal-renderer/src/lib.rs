@@ -10,10 +10,12 @@ use ash::{Entry, vk};
 use thiserror::Error;
 use winit::window::Window;
 
+mod image;
 mod surface;
 mod swapchain;
 mod sync;
 
+pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
@@ -105,6 +107,39 @@ pub enum VulkanError {
     /// Image acquisition requires either a semaphore or fence.
     #[error("swapchain image acquisition requires a semaphore or fence")]
     MissingAcquireSynchronization,
+    /// An image extent contains a zero dimension or violates its dimensionality.
+    #[error("Vulkan image extent is invalid for the selected image type")]
+    InvalidImageExtent,
+    /// An image format must be explicitly selected.
+    #[error("Vulkan image format must not be UNDEFINED")]
+    InvalidImageFormat,
+    /// Image mip-level or array-layer counts are invalid.
+    #[error("Vulkan image mip-level and array-layer counts must be valid")]
+    InvalidImageSubresourceCount,
+    /// Image usage must include at least one usage flag.
+    #[error("Vulkan image usage must not be empty")]
+    InvalidImageUsage,
+    /// Image sample count must contain exactly one supported sample-count bit.
+    #[error("Vulkan image sample count must select exactly one sample count")]
+    InvalidImageSampleCount,
+    /// Image tiling must be linear or optimal.
+    #[error("Vulkan image tiling must be LINEAR or OPTIMAL")]
+    InvalidImageTiling,
+    /// Image type is not a supported Vulkan dimensionality.
+    #[error("Vulkan image type is invalid")]
+    InvalidImageType,
+    /// Requested mip count exceeds the maximum for the image extent.
+    #[error("Vulkan image mip-level count exceeds the extent's maximum")]
+    InvalidImageMipLevels,
+    /// No compatible memory type is available for the image.
+    #[error("no compatible Vulkan memory type is available for the image")]
+    NoCompatibleImageMemoryType,
+    /// Image-view subresource ranges are empty, overflowed, or out of bounds.
+    #[error("Vulkan image-view subresource range is invalid")]
+    InvalidImageViewRange,
+    /// Image and image-view dimensionalities or cube requirements do not match.
+    #[error("Vulkan image-view type is incompatible with the image")]
+    IncompatibleImageViewType,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {

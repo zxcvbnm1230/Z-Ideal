@@ -30,6 +30,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Swapchain image views with deterministic destruction ordering; acquisition and presentation expose suboptimal/out-of-date states to the caller.
 - Swapchain recreation waits for device idle and preserves the old swapchain for zero-size/minimized-window deferrals; failed nonzero recreation leaves a clear not-ready state that callers can retry.
 - Explicitly owned Vulkan fence and binary-semaphore wrappers with device-borrowed lifetimes, structured API errors, fence timeout reporting, and conservative device-idle waits before destruction.
+- Explicitly owned Vulkan images with dedicated compatible memory allocations, device-local memory preference, validated dimensionality/mip/layer/sample configuration, and image views whose Rust lifetimes are bounded by their parent images. Image layout transitions, barriers, queue ownership transfers, allocator pooling, and deferred retirement remain caller/future-scheduler responsibilities.
 - Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
