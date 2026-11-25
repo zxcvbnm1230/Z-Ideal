@@ -6,7 +6,7 @@ Z Ideal is a cross-platform 3D game engine targeting Windows, macOS, and Ubuntu 
 
 **Phase 1 — core, math, ECS and scenes: merged to main.** The engine now has documented math conventions and a validated Transform contract, generation-safe entities, registered sparse-set components, transform hierarchy, deterministic scheduling, deferred structural commands, versioned scene serialization with migrations, and prefab instantiation with entity-reference remapping and overrides.
 
-**Phase 2 — platform and Vulkan: in progress.** The current implementation adds a cross-platform native window/event-loop boundary and Vulkan loader, instance, validation-layer diagnostics, deterministic graphics-device selection, logical-device creation, and graphics queue ownership. Swapchains, presentation queues, GPU resource wrappers, shader compilation/reflection, and GPU-backed tests are not complete yet. No rendered frame is claimed.
+**Phase 2 — platform and Vulkan: in progress.** The current implementation adds a cross-platform native window/event-loop boundary, normalized per-window keyboard and mouse state, Vulkan loader and instance initialization, validation diagnostics, native window surfaces, deterministic graphics/presentation queue selection, and logical-device ownership. Swapchains, GPU resource wrappers, shader compilation/reflection, and GPU-backed tests are not complete yet. No rendered frame is claimed.
 
 ## Requirements
 
