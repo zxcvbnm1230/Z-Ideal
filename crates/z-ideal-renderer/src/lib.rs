@@ -580,6 +580,9 @@ impl VulkanContext {
     }
 
     /// Creates an instance, window surface, presentation-capable device and queues.
+    ///
+    /// The caller must keep window alive until this context and any future swapchains
+    /// created from its surface have been destroyed.
     pub fn new_for_window(config: &VulkanConfig, window: &Window) -> Result<Self, VulkanError> {
         let required_extensions = surface::required_instance_extensions(window)?;
         let instance = Arc::new(VulkanInstance::new_with_extensions(
