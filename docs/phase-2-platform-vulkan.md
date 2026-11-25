@@ -40,7 +40,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 ## Not implemented yet
 
 - Higher-level frame scheduling, including redraw, pause, minimized-window behavior, and reusable per-frame synchronization policy.
-- Graphics/compute pipeline wrappers remain outstanding. Buffer and image resources currently use dedicated allocations; allocator pooling and deferred resource retirement remain outstanding.
+- GLSL 450 compilation uses the pinned shaderc/glslang source build and emits Vulkan 1.0 / SPIR-V 1.0 with optimization disabled. The compiler reflects uniform/storage buffers, sampled/storage images, separate/combined samplers, descriptor-array counts, and push-constant sizes; unsupported descriptor forms fail explicitly. A Vulkan shader-module wrapper owns the compiled module and retains the reflected interface. Compute pipeline creation validates descriptor types/counts/stages and push-constant coverage against the pipeline layout, then retains both shader module and layout. Graphics pipeline creation, render passes/framebuffers, command-buffer recording, frame scheduling, and GPU-backed tests remain outstanding. Shaderc source builds require CMake 3.22.1 or newer and a C++17 compiler on each target platform. Buffer and image resources currently use dedicated allocations; allocator pooling and deferred resource retirement remain outstanding.
 
 - Shader compiler integration, reflection, and shader-to-pipeline-layout validation.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.

@@ -13,8 +13,10 @@ use winit::window::Window;
 mod buffer;
 mod descriptor;
 mod image;
+mod pipeline;
 mod pipeline_layout;
 mod sampler;
+mod shader;
 mod surface;
 mod swapchain;
 mod sync;
@@ -27,8 +29,13 @@ pub use descriptor::{
     VulkanDescriptorSetLayout,
 };
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
+pub use pipeline::VulkanComputePipeline;
 pub use pipeline_layout::VulkanPipelineLayout;
 pub use sampler::{SamplerConfig, VulkanSampler};
+pub use shader::{
+    CompiledShader, ShaderCompileConfig, ShaderDescriptorBinding, ShaderReflection, ShaderStage,
+    VulkanShaderModule, compile_glsl,
+};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
@@ -244,6 +251,33 @@ pub enum VulkanError {
     /// The physical device does not support the image format feature required by the descriptor.
     #[error("Vulkan image format does not support the descriptor's sampling or storage operation")]
     UnsupportedImageFormatFeature,
+    /// GLSL source could not be parsed into a shader module.
+    #[error("GLSL shader compilation failed: {0}")]
+    ShaderCompilation(String),
+    /// Shader uses a descriptor or resource form unsupported by renderer reflection.
+    #[error("shader uses an unsupported descriptor resource or descriptor array form")]
+    UnsupportedShaderResource,
+    /// Shader declares an invalid or unsupported push-constant block.
+    #[error("shader push-constant declaration is invalid or unsupported")]
+    InvalidShaderPushConstants,
+    /// SPIR-V binary header or instruction stream is malformed.
+    #[error("SPIR-V binary is malformed or structurally invalid")]
+    InvalidSpirv,
+    /// A Vulkan shader module was created from a different logical device.
+    #[error("Vulkan shader module belongs to a different logical device")]
+    ShaderModuleDeviceMismatch,
+    /// A shader stage is incompatible with the requested pipeline type.
+    #[error("Vulkan shader stage is incompatible with the requested pipeline")]
+    PipelineShaderStageMismatch,
+    /// Reflected shader descriptors or push constants are not covered by the pipeline layout.
+    #[error("Vulkan pipeline layout does not match the compiled shader interface")]
+    ShaderInterfaceMismatch,
+    /// A shader resource is missing an explicit descriptor set or binding.
+    #[error("shader descriptor resources must declare both set and binding")]
+    MissingShaderDescriptorBinding,
+    /// A shader declares the same descriptor set and binding more than once.
+    #[error("shader contains duplicate descriptor set and binding declarations")]
+    DuplicateShaderDescriptorBinding,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
