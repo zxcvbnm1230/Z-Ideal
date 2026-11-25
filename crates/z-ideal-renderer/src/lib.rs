@@ -607,7 +607,10 @@ impl Drop for VulkanDevice {
         // SAFETY: This wrapper uniquely owns the logical device. Waiting idle ensures
         // no submitted work can still reference resources owned by this device.
         if let Err(error) = unsafe { self.handle.device_wait_idle() } {
-            tracing::warn!(?error, "Vulkan device was not idle during device destruction");
+            tracing::warn!(
+                ?error,
+                "Vulkan device was not idle during device destruction"
+            );
         }
         // SAFETY: This wrapper uniquely owns the logical device.
         unsafe { self.handle.destroy_device(None) };
