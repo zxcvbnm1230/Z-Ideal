@@ -44,6 +44,7 @@ pub enum PresentResult {
 
 struct SwapchainResources<'a> {
     device: &'a ash::Device,
+    loader: ash::khr::swapchain::Device,
     handle: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
@@ -60,7 +61,7 @@ impl Drop for SwapchainResources<'_> {
             for view in self.image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
-            self.device.destroy_swapchain_resources_placeholder();
+            self.loader.destroy_swapchain(self.handle, None);
         }
     }
 }
@@ -339,6 +340,7 @@ fn create_resources<'a>(
 
     Ok(SwapchainResources {
         device: &device.handle,
+        loader: ash::khr::swapchain::Device::new(&device._instance.handle, &device.handle),
         handle,
         images,
         image_views,
