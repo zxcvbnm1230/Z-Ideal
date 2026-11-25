@@ -346,42 +346,83 @@ impl VulkanDevice {
                     .handle
                     .get_physical_device_queue_family_properties(physical_device)
             };
-            if let Some((queue_index, _)) = queue_families.iter().enumerate().find(|(_, family)| {
+            let Some((graphics_index, _)) = queue_families.iter().enumerate().find(|(_, family)| {
                 family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            }) {
-                // SAFETY: Vulkan provides a NUL-terminated device_name array.
-                let name = unsafe {
-                    CStr::from_ptr(properties.device_name.as_ptr())
-                        .to_string_lossy()
-                        .into_owned()
+            }) else {
+                continue;
+            };
+            let graphics_queue_family = graphics_index as u32;
+
+            let present_queue_family = if let Some(surface) = surface {
+                let mut present_index = None;
+                for (index, family) in queue_families.iter().enumerate() {
+                    if family.queue_count == 0 {
+                        continue;
+                    }
+                    if surface.supports_present(physical_device, index as u32)? {
+                        present_index = Some(index as u32);
+                        break;
+                    }
+                }
+                let Some(present_index) = present_index else {
+                    continue;
                 };
-                candidates.push((
-                    physical_device,
-                    queue_index as u32,
-                    PhysicalDeviceInfo {
-                        name,
-                        device_type: properties.device_type,
-                        vendor_id: properties.vendor_id,
-                        device_id: properties.device_id,
-                        api_version: properties.api_version,
-                    },
-                ));
-            }
+
+                // Presentation-capable devices must expose the swapchain extension.
+                // SAFETY: physical_device belongs to the retained instance.
+                let extensions = unsafe {
+                    instance
+                        .handle
+                        .enumerate_device_extension_properties(physical_device)
+                        .map_err(|error| api_error("enumerate device extensions", error))?
+                };
+                if !has_extension(&extensions, SWAPCHAIN_EXTENSION) {
+                    continue;
+                }
+                present_index
+            } else {
+                graphics_queue_family
+            };
+
+            // SAFETY: Vulkan provides a NUL-terminated device_name array.
+            let name = unsafe {
+                CStr::from_ptr(properties.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            candidates.push((
+                physical_device,
+                graphics_queue_family,
+                present_queue_family,
+                PhysicalDeviceInfo {
+                    name,
+                    device_type: properties.device_type,
+                    vendor_id: properties.vendor_id,
+                    device_id: properties.device_id,
+                    api_version: properties.api_version,
+                },
+            ));
         }
 
         // Prefer discrete, then integrated, virtual, CPU and other devices.
         // Ties are resolved by stable reported identity fields.
         candidates.sort_by(|left, right| {
-            device_rank(right.2.device_type)
-                .cmp(&device_rank(left.2.device_type))
-                .then_with(|| left.2.name.cmp(&right.2.name))
-                .then_with(|| left.2.vendor_id.cmp(&right.2.vendor_id))
-                .then_with(|| left.2.device_id.cmp(&right.2.device_id))
+            device_rank(right.3.device_type)
+                .cmp(&device_rank(left.3.device_type))
+                .then_with(|| left.3.name.cmp(&right.3.name))
+                .then_with(|| left.3.vendor_id.cmp(&right.3.vendor_id))
+                .then_with(|| left.3.device_id.cmp(&right.3.device_id))
         });
-        let (physical_device, graphics_queue_family, info) = candidates
+        let (physical_device, graphics_queue_family, present_queue_family, info) = candidates
             .into_iter()
             .next()
-            .ok_or(VulkanError::NoGraphicsDevice)?;
+            .ok_or_else(|| {
+                if surface.is_some() {
+                    VulkanError::NoPresentDevice
+                } else {
+                    VulkanError::NoGraphicsDevice
+                }
+            })?;
 
         // SAFETY: physical_device belongs to the retained instance.
         let available_extensions = unsafe {
