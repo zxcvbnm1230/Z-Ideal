@@ -57,7 +57,7 @@ impl InputRouter {
             .checked_add(1)
             .ok_or(InputRouterError::WindowIdExhausted)?;
         let window_id = InputWindowId(id);
-        self.windows.insert(window_id, InputState::default());
+        let _ = self.windows.insert(window_id, InputState::default());
         self.next_window_id = id;
         Ok(window_id)
     }
