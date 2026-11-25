@@ -28,7 +28,6 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 ## Not implemented yet
 
-- Central input event routing between multiple windows and the engine event bus.
 - Central input routing across multiple windows and the engine event bus.
 - Higher-level frame scheduling, automatic resize/minimize/restore event wiring, and synchronization-object wrappers. The current swapchain API exposes acquire/present status and accepts caller-owned semaphores/fences.
 - Swapchain creation, resize/minimize/restore, out-of-date/suboptimal handling, and recreation.
