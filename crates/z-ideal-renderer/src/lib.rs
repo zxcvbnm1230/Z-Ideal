@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use ash::{vk, Entry};
+use ash::{Entry, vk};
 use thiserror::Error;
 
 /// Stable package identifier.
@@ -43,7 +43,10 @@ pub enum VulkanError {
     Loader(#[from] ash::LoadingError),
     /// A Vulkan API operation failed.
     #[error("{operation} failed: {result:?}")]
-    Api { operation: &'static str, result: vk::Result },
+    Api {
+        operation: &'static str,
+        result: vk::Result,
+    },
     /// A supplied name contained an interior NUL byte.
     #[error("invalid Vulkan application name: {0}")]
     InvalidName(#[from] NulError),
@@ -93,12 +96,14 @@ impl VulkanInstance {
         let entry = unsafe { Entry::load()? };
         // SAFETY: These calls query loader-owned metadata and create no Vulkan objects.
         let available_extensions = unsafe {
-            entry.enumerate_instance_extension_properties(None)
+            entry
+                .enumerate_instance_extension_properties(None)
                 .map_err(|error| api_error("enumerate instance extensions", error))?
         };
         // SAFETY: This call queries loader-owned layer metadata.
         let available_layers = unsafe {
-            entry.enumerate_instance_layer_properties()
+            entry
+                .enumerate_instance_layer_properties()
                 .map_err(|error| api_error("enumerate instance layers", error))?
         };
 
@@ -125,14 +130,21 @@ impl VulkanInstance {
         }
 
         #[cfg(target_os = "macos")]
-        if !enabled_extensions.iter().any(|name| name.as_c_str() == PORTABILITY_ENUMERATION_EXTENSION) {
+        if !enabled_extensions
+            .iter()
+            .any(|name| name.as_c_str() == PORTABILITY_ENUMERATION_EXTENSION)
+        {
             return Err(VulkanError::MissingInstanceExtension(
-                PORTABILITY_ENUMERATION_EXTENSION.to_string_lossy().into_owned(),
+                PORTABILITY_ENUMERATION_EXTENSION
+                    .to_string_lossy()
+                    .into_owned(),
             ));
         }
 
-        let extension_pointers: Vec<*const i8> =
-            enabled_extensions.iter().map(|name| name.as_ptr()).collect();
+        let extension_pointers: Vec<*const i8> = enabled_extensions
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect();
         let layer_pointers: Vec<*const i8> = if config.enable_validation {
             vec![VALIDATION_LAYER.as_ptr()]
         } else {
@@ -158,7 +170,8 @@ impl VulkanInstance {
 
         // SAFETY: All create-info pointers refer to live, NUL-terminated values for this call.
         let handle = unsafe {
-            entry.create_instance(&create_info, None)
+            entry
+                .create_instance(&create_info, None)
                 .map_err(|error| api_error("create Vulkan instance", error))?
         };
 
@@ -186,7 +199,11 @@ impl VulkanInstance {
             None
         };
 
-        Ok(Self { _entry: entry, handle, debug_messenger })
+        Ok(Self {
+            _entry: entry,
+            handle,
+            debug_messenger,
+        })
     }
 
     /// Returns the raw Vulkan instance for renderer-internal integration.
@@ -219,7 +236,10 @@ struct DebugMessenger {
 impl Drop for DebugMessenger {
     fn drop(&mut self) {
         // SAFETY: This wrapper uniquely owns the messenger created by this loader.
-        unsafe { self.loader.destroy_debug_utils_messenger(self.messenger, None) };
+        unsafe {
+            self.loader
+                .destroy_debug_utils_messenger(self.messenger, None)
+        };
     }
 }
 
@@ -272,24 +292,34 @@ impl VulkanDevice {
     pub fn new(instance: Arc<VulkanInstance>) -> Result<Self, VulkanError> {
         // SAFETY: The instance is live and retained by this device.
         let physical_devices = unsafe {
-            instance.handle.enumerate_physical_devices()
+            instance
+                .handle
+                .enumerate_physical_devices()
                 .map_err(|error| api_error("enumerate physical devices", error))?
         };
         let mut candidates = Vec::new();
 
         for physical_device in physical_devices {
             // SAFETY: The handle was returned by this live instance.
-            let properties = unsafe { instance.handle.get_physical_device_properties(physical_device) };
+            let properties = unsafe {
+                instance
+                    .handle
+                    .get_physical_device_properties(physical_device)
+            };
             // SAFETY: The handle was returned by this live instance.
             let queue_families = unsafe {
-                instance.handle.get_physical_device_queue_family_properties(physical_device)
+                instance
+                    .handle
+                    .get_physical_device_queue_family_properties(physical_device)
             };
-            if let Some((queue_index, _)) = queue_families.iter().enumerate().find(
-                |(_, family)| family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            ) {
+            if let Some((queue_index, _)) = queue_families.iter().enumerate().find(|(_, family)| {
+                family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            }) {
                 // SAFETY: Vulkan provides a NUL-terminated device_name array.
                 let name = unsafe {
-                    CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy().into_owned()
+                    CStr::from_ptr(properties.device_name.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
                 };
                 candidates.push((
                     physical_device,
@@ -308,17 +338,22 @@ impl VulkanDevice {
         // Prefer discrete, then integrated, virtual, CPU and other devices.
         // Ties are resolved by stable reported identity fields.
         candidates.sort_by(|left, right| {
-            device_rank(right.2.device_type).cmp(&device_rank(left.2.device_type))
+            device_rank(right.2.device_type)
+                .cmp(&device_rank(left.2.device_type))
                 .then_with(|| left.2.name.cmp(&right.2.name))
                 .then_with(|| left.2.vendor_id.cmp(&right.2.vendor_id))
                 .then_with(|| left.2.device_id.cmp(&right.2.device_id))
         });
-        let (physical_device, graphics_queue_family, info) =
-            candidates.into_iter().next().ok_or(VulkanError::NoGraphicsDevice)?;
+        let (physical_device, graphics_queue_family, info) = candidates
+            .into_iter()
+            .next()
+            .ok_or(VulkanError::NoGraphicsDevice)?;
 
         // SAFETY: physical_device belongs to the retained instance.
         let available_extensions = unsafe {
-            instance.handle.enumerate_device_extension_properties(physical_device)
+            instance
+                .handle
+                .enumerate_device_extension_properties(physical_device)
                 .map_err(|error| api_error("enumerate device extensions", error))?
         };
         let mut enabled_extensions = Vec::<CString>::new();
@@ -345,7 +380,9 @@ impl VulkanDevice {
         // SAFETY: Queue and extension arrays remain alive for the call and the
         // selected physical device belongs to the retained instance.
         let handle = unsafe {
-            instance.handle.create_device(physical_device, &device_info, None)
+            instance
+                .handle
+                .create_device(physical_device, &device_info, None)
                 .map_err(|error| api_error("create Vulkan logical device", error))?
         };
         // SAFETY: This queue family and queue index were included in device creation.
@@ -439,7 +476,7 @@ const fn device_rank(device_type: vk::PhysicalDeviceType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_rank, VulkanConfig, CRATE_NAME};
+    use super::{CRATE_NAME, VulkanConfig, device_rank};
     use ash::vk;
 
     #[test]
@@ -449,14 +486,21 @@ mod tests {
 
     #[test]
     fn validation_default_matches_build_profile() {
-        assert_eq!(VulkanConfig::default().enable_validation, cfg!(debug_assertions));
+        assert_eq!(
+            VulkanConfig::default().enable_validation,
+            cfg!(debug_assertions)
+        );
     }
 
     #[test]
     fn physical_device_preference_is_ordered() {
-        assert!(device_rank(vk::PhysicalDeviceType::DISCRETE_GPU)
-            > device_rank(vk::PhysicalDeviceType::INTEGRATED_GPU));
-        assert!(device_rank(vk::PhysicalDeviceType::INTEGRATED_GPU)
-            > device_rank(vk::PhysicalDeviceType::CPU));
+        assert!(
+            device_rank(vk::PhysicalDeviceType::DISCRETE_GPU)
+                > device_rank(vk::PhysicalDeviceType::INTEGRATED_GPU)
+        );
+        assert!(
+            device_rank(vk::PhysicalDeviceType::INTEGRATED_GPU)
+                > device_rank(vk::PhysicalDeviceType::CPU)
+        );
     }
 }
