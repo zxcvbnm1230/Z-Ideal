@@ -13,6 +13,7 @@ use winit::window::Window;
 mod buffer;
 mod descriptor;
 mod image;
+mod pipeline_layout;
 mod sampler;
 mod surface;
 mod swapchain;
@@ -24,6 +25,7 @@ pub use descriptor::{
     VulkanDescriptorPool, VulkanDescriptorSet, VulkanDescriptorSetLayout,
 };
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
+pub use pipeline_layout::VulkanPipelineLayout;
 pub use sampler::{SamplerConfig, VulkanSampler};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
@@ -198,6 +200,15 @@ pub enum VulkanError {
     /// Descriptor pool and set layout belong to different logical devices.
     #[error("Vulkan descriptor pool and set layout belong to different devices")]
     DescriptorSetDeviceMismatch,
+    /// A pipeline layout references a descriptor-set layout from another device.
+    #[error("Vulkan pipeline layout and descriptor-set layouts belong to different devices")]
+    PipelineLayoutDeviceMismatch,
+    /// A push-constant range has an invalid stage mask, alignment, or size.
+    #[error("Vulkan push-constant range has invalid stages, alignment, or size")]
+    InvalidPushConstantRange,
+    /// Push-constant ranges overlap for at least one common shader stage.
+    #[error("Vulkan push-constant ranges overlap for a shared shader stage")]
+    OverlappingPushConstantRanges,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -449,6 +460,7 @@ pub struct VulkanDevice {
     sampler_anisotropy_enabled: bool,
     max_sampler_anisotropy: f32,
     max_sampler_lod_bias: f32,
+    max_push_constants_size: u32,
     info: PhysicalDeviceInfo,
 }
 
@@ -618,6 +630,7 @@ impl VulkanDevice {
         };
         let max_sampler_anisotropy = physical_device_properties.limits.max_sampler_anisotropy;
         let max_sampler_lod_bias = physical_device_properties.limits.max_sampler_lod_bias;
+        let max_push_constants_size = physical_device_properties.limits.max_push_constants_size;
         let priorities = [1.0_f32];
         let mut queue_family_indices = vec![graphics_queue_family];
         if present_queue_family != graphics_queue_family {
@@ -666,6 +679,7 @@ impl VulkanDevice {
             sampler_anisotropy_enabled,
             max_sampler_anisotropy,
             max_sampler_lod_bias,
+            max_push_constants_size,
             info,
         })
     }
@@ -674,6 +688,12 @@ impl VulkanDevice {
     #[must_use]
     pub fn handle(&self) -> &ash::Device {
         &self.handle
+    }
+
+    /// Returns the device limit for push-constant storage, in bytes.
+    #[must_use]
+    pub const fn max_push_constants_size(&self) -> u32 {
+        self.max_push_constants_size
     }
 
     /// Returns the selected physical device handle.

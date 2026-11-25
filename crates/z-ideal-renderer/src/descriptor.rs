@@ -25,7 +25,7 @@ pub struct DescriptorSetLayoutConfig {
 
 /// Owns a descriptor-set layout and borrows its creating logical device.
 pub struct VulkanDescriptorSetLayout<'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::DescriptorSetLayout,
     config: DescriptorSetLayoutConfig,
 }
