@@ -27,6 +27,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Native shader toolchain
+        run: cmake --version
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

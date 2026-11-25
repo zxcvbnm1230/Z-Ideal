@@ -12,9 +12,11 @@ use winit::window::Window;
 
 mod buffer;
 mod descriptor;
+mod graphics_pipeline;
 mod image;
 mod pipeline;
 mod pipeline_layout;
+mod render_pass;
 mod sampler;
 mod shader;
 mod surface;
@@ -28,13 +30,18 @@ pub use descriptor::{
     ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet,
     VulkanDescriptorSetLayout,
 };
+pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use pipeline::VulkanComputePipeline;
 pub use pipeline_layout::VulkanPipelineLayout;
+pub use render_pass::{
+    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
+    RenderPassDependency, RenderPassSubpassConfig, VulkanFramebuffer, VulkanRenderPass,
+};
 pub use sampler::{SamplerConfig, VulkanSampler};
 pub use shader::{
     CompiledShader, ShaderCompileConfig, ShaderDescriptorBinding, ShaderReflection, ShaderStage,
-    VulkanShaderModule, compile_glsl,
+    ShaderVertexInput, VulkanShaderModule, compile_glsl,
 };
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
@@ -272,6 +279,18 @@ pub enum VulkanError {
     /// Reflected shader descriptors or push constants are not covered by the pipeline layout.
     #[error("Vulkan pipeline layout does not match the compiled shader interface")]
     ShaderInterfaceMismatch,
+    /// Render-pass attachment or subpass references are invalid.
+    #[error("Vulkan render-pass attachment, subpass, or dependency configuration is invalid")]
+    InvalidRenderPassConfig,
+    /// Framebuffer extent, layer count, attachments, or compatibility is invalid.
+    #[error("Vulkan framebuffer extent, layers, or attachment configuration is invalid")]
+    InvalidFramebufferConfig,
+    /// A framebuffer attachment belongs to a different logical device.
+    #[error("Vulkan framebuffer attachments belong to a different logical device")]
+    FramebufferDeviceMismatch,
+    /// Graphics pipeline fixed-function state or render-pass compatibility is invalid.
+    #[error("Vulkan graphics pipeline fixed-function configuration is invalid")]
+    InvalidGraphicsPipelineConfig,
     /// A shader resource is missing an explicit descriptor set or binding.
     #[error("shader descriptor resources must declare both set and binding")]
     MissingShaderDescriptorBinding,
