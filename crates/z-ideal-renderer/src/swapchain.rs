@@ -78,6 +78,15 @@ pub struct VulkanSwapchain<'a> {
     resources: Option<SwapchainResources<'a>>,
 }
 
+impl Drop for VulkanSwapchain<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self._device.wait_idle() {
+            tracing::warn!(?error, "Vulkan device was not idle during swapchain destruction");
+        }
+        self.resources.take();
+    }
+}
+
 impl<'a> VulkanSwapchain<'a> {
     /// Creates a swapchain for the current drawable window extent.
     pub fn new(
@@ -90,6 +99,9 @@ impl<'a> VulkanSwapchain<'a> {
             return Err(VulkanError::Surface(
                 "swapchain device and surface must belong to the same Vulkan instance".to_owned(),
             ));
+        }
+        if !surface.supports_present(device.physical_device, device.present_queue_family)? {
+            return Err(VulkanError::NoPresentDevice);
         }
         let loader = ash::khr::swapchain::Device::new(&device._instance.handle, &device.handle);
         let resources = create_resources(device, surface, &loader, window_extent, config, vk::SwapchainKHR::null())?;
@@ -174,6 +186,9 @@ impl<'a> VulkanSwapchain<'a> {
         fence: vk::Fence,
     ) -> Result<AcquireResult, VulkanError> {
         let resources = self.resources.as_ref().ok_or(VulkanError::MissingSwapchain)?;
+        if semaphore == vk::Semaphore::null() && fence == vk::Fence::null() {
+            return Err(VulkanError::MissingAcquireSynchronization);
+        }
         // SAFETY: The swapchain is live and synchronization handles are owned by the caller.
         match unsafe {
             self.loader.acquire_next_image(resources.handle, timeout, semaphore, fence)
