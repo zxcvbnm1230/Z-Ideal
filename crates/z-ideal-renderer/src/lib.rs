@@ -23,7 +23,8 @@ pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use descriptor::{
     BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
     DescriptorResourceLease, DescriptorResourceWrite, DescriptorSetLayoutConfig,
-    ImageDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet, VulkanDescriptorSetLayout,
+    ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet,
+    VulkanDescriptorSetLayout,
 };
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use pipeline_layout::VulkanPipelineLayout;

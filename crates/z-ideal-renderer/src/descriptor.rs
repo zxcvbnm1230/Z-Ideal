@@ -54,6 +54,17 @@ pub struct ImageDescriptorWrite<'resource, 'image, 'device> {
     pub image_layout: vk::ImageLayout,
 }
 
+/// One sampler-only descriptor update.
+#[derive(Clone, Copy)]
+pub struct SamplerDescriptorWrite<'resource, 'device> {
+    /// Binding number in the descriptor-set layout.
+    pub binding: u32,
+    /// Array element within the binding.
+    pub array_element: u32,
+    /// Sampler retained by the returned resource lease.
+    pub sampler: &'resource VulkanSampler<'device>,
+}
+
 /// One resource write in a descriptor-set update batch.
 #[derive(Clone, Copy)]
 pub enum DescriptorResourceWrite<'resource, 'image, 'device> {
@@ -61,6 +72,8 @@ pub enum DescriptorResourceWrite<'resource, 'image, 'device> {
     Buffer(BufferDescriptorWrite<'resource, 'device>),
     /// Sampled, combined-image-sampler, or storage-image descriptor.
     Image(ImageDescriptorWrite<'resource, 'image, 'device>),
+    /// Sampler-only descriptor.
+    Sampler(SamplerDescriptorWrite<'resource, 'device>),
 }
 
 /// Owns a descriptor-set layout and borrows its creating logical device.
@@ -293,6 +306,7 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
             let (binding_number, array_element) = match write {
                 DescriptorResourceWrite::Buffer(write) => (write.binding, write.array_element),
                 DescriptorResourceWrite::Image(write) => (write.binding, write.array_element),
+                DescriptorResourceWrite::Sampler(write) => (write.binding, write.array_element),
             };
             validate_unique_descriptor_write(&mut seen, binding_number, array_element)?;
             let binding = self
@@ -381,6 +395,26 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
                     if let Some(sampler) = write.sampler {
                         retained_resources.push(RetainedDescriptorResource::Sampler(sampler));
                     }
+                }
+                DescriptorResourceWrite::Sampler(write) => {
+                    validate_sampler_descriptor_binding(binding)?;
+                    if !std::ptr::eq(self._pool.device, write.sampler.device) {
+                        return Err(VulkanError::DescriptorSetDeviceMismatch);
+                    }
+                    let index = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .sampler(write.sampler.handle())
+                            .image_view(vk::ImageView::null())
+                            .image_layout(vk::ImageLayout::UNDEFINED),
+                    );
+                    prepared.push(PreparedDescriptorWrite {
+                        binding: binding_number,
+                        array_element,
+                        descriptor_type: binding.descriptor_type,
+                        info: DescriptorInfoIndex::Image(index),
+                    });
+                    retained_resources.push(RetainedDescriptorResource::Sampler(write.sampler));
                 }
             }
         }
@@ -554,6 +588,7 @@ fn validate_complete_descriptor_write_set(
                 | vk::DescriptorType::SAMPLED_IMAGE
                 | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
                 | vk::DescriptorType::STORAGE_IMAGE
+                | vk::DescriptorType::SAMPLER
         ) {
             return Err(VulkanError::UnsupportedDescriptorType);
         }
@@ -570,6 +605,14 @@ fn validate_complete_descriptor_write_set(
         return Err(VulkanError::IncompleteDescriptorWrite);
     }
     Ok(())
+}
+
+fn validate_sampler_descriptor_binding(binding: &DescriptorBinding) -> Result<(), VulkanError> {
+    if binding.descriptor_type == vk::DescriptorType::SAMPLER {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedDescriptorType)
+    }
 }
 
 fn validate_image_descriptor_write(
@@ -783,7 +826,7 @@ mod tests {
         DescriptorPoolSize, DescriptorSetLayoutConfig, validate_buffer_descriptor_write,
         validate_complete_descriptor_write_set, validate_image_descriptor_metadata,
         validate_image_format_feature, validate_layout_config, validate_pool_config,
-        validate_unique_descriptor_write,
+        validate_sampler_descriptor_binding, validate_unique_descriptor_write,
     };
     use crate::VulkanError;
     use ash::vk;
@@ -1090,6 +1133,21 @@ mod tests {
                 vk::ImageAspectFlags::COLOR,
             ),
             Err(VulkanError::InvalidImageDescriptor)
+        ));
+    }
+
+    #[test]
+    fn validates_sampler_only_descriptor_bindings() {
+        let sampler = DescriptorBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::SAMPLER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        };
+        assert!(validate_sampler_descriptor_binding(&sampler).is_ok());
+        assert!(matches!(
+            validate_sampler_descriptor_binding(&uniform_binding()),
+            Err(VulkanError::UnsupportedDescriptorType)
         ));
     }
 
