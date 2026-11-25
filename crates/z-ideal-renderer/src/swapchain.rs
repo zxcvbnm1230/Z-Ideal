@@ -95,6 +95,9 @@ impl<'a> VulkanSwapchain<'a> {
         window_extent: [u32; 2],
         config: SwapchainConfig,
     ) -> Result<Self, VulkanError> {
+        if !device.presentation_enabled {
+            return Err(VulkanError::PresentationNotEnabled);
+        }
         if !std::sync::Arc::ptr_eq(&device._instance, &surface.instance) {
             return Err(VulkanError::Surface(
                 "swapchain device and surface must belong to the same Vulkan instance".to_owned(),
