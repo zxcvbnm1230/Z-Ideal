@@ -20,12 +20,17 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Owned window surfaces with surface capability, format, present-mode, and queue-support queries.
 - Physical-device selection requires both graphics and presentation support for a window surface and the swapchain device extension.
 - Separate graphics and presentation queues are created when a single queue family cannot serve both roles.
-- Explicit instance, debug-messenger, surface, and logical-device destruction ownership.
+- Explicit instance, debug-messenger, surface, swapchain, image-view, and logical-device destruction ownership.
+- Swapchain selection for supported formats, color spaces, extents, image counts, composite-alpha modes, and FIFO/mailbox/immediate presentation preferences.
+- Swapchain image views with deterministic destruction ordering; acquisition and presentation expose suboptimal/out-of-date states to the caller.
+- Swapchain recreation waits for device idle and preserves the old swapchain for zero-size/minimized-window deferrals; failed nonzero recreation leaves a clear not-ready state that callers can retry.
+- Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
 
 - Central input event routing between multiple windows and the engine event bus.
-- Swapchain creation, image views, acquire/present synchronization, resize/minimize/restore, out-of-date/suboptimal handling, and recreation.
+- Central input routing across multiple windows and the engine event bus.
+- Higher-level frame scheduling, automatic resize/minimize/restore event wiring, and synchronization-object wrappers. The current swapchain API exposes acquire/present status and accepts caller-owned semaphores/fences.
 - Swapchain creation, resize/minimize/restore, out-of-date/suboptimal handling, and recreation.
 - GPU buffer/image/view/sampler/descriptor/pipeline/synchronization wrappers.
 - Shader compiler integration, reflection, and pipeline-layout validation.
