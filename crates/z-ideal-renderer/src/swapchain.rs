@@ -233,7 +233,10 @@ impl<'a> VulkanSwapchain<'a> {
         image_index: u32,
         wait_semaphores: &[vk::Semaphore],
     ) -> Result<PresentResult, VulkanError> {
-        let resources = self.resources.as_ref().ok_or(VulkanError::MissingSwapchain)?;
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or(VulkanError::MissingSwapchain)?;
         if image_index as usize >= resources.images.len() {
             return Err(VulkanError::InvalidSwapchainImageIndex {
                 index: image_index,
