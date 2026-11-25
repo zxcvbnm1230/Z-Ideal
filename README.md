@@ -4,13 +4,18 @@ Z Ideal is a cross-platform 3D game engine targeting Windows, macOS, and Ubuntu 
 
 ## Project status
 
-**Phase 1 — core, math, ECS and scenes (ready for review).** The current Phase 1 branch implements the math conventions and Transform contract, generation-safe entities, registered sparse-set components, transform hierarchy, deterministic scheduling, deferred structural commands, versioned scene serialization with migrations, and prefab instantiation with entity-reference remapping and overrides. Phase 1 is not merged yet. Rendering, physics, Lua scripting, audio, editor workflows, and game export remain future phases.
+**Phase 1 — core, math, ECS and scenes: merged to main.** The engine now has documented math conventions and a validated Transform contract, generation-safe entities, registered sparse-set components, transform hierarchy, deterministic scheduling, deferred structural commands, versioned scene serialization with migrations, and prefab instantiation with entity-reference remapping and overrides.
+
+**Phase 2 — platform and Vulkan: in progress.** The current implementation adds a cross-platform native window/event-loop boundary and Vulkan loader, instance, validation-layer diagnostics, deterministic graphics-device selection, logical-device creation, and graphics queue ownership. Swapchains, presentation queues, GPU resource wrappers, shader compilation/reflection, and GPU-backed tests are not complete yet. No rendered frame is claimed.
 
 ## Requirements
 
-- Stable Rust (toolchain pinned to the stable channel; minimum version currently 1.85)
+- Stable Rust (workspace MSRV: 1.85)
 - Git
-- Platform-native Vulkan SDK/loader and portability support will be required for renderer development in Phase 2
+- A Vulkan loader and a Vulkan-capable driver at runtime
+- Khronos Vulkan SDK and validation layers recommended for development and validation
+
+On macOS, the Vulkan portability path is required. The available portability implementation depends on the target Mac and installed Vulkan SDK/driver; consult the current Vulkan SDK guidance before setting up a development machine.
 
 ## Workspace validation
 
@@ -18,11 +23,12 @@ Z Ideal is a cross-platform 3D game engine targeting Windows, macOS, and Ubuntu 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo doc --workspace --all-features --no-deps
 ```
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md), [docs/roadmap.md](docs/roadmap.md), and the architecture decision records in [docs/adr](docs/adr).
+See [docs/architecture.md](docs/architecture.md), [docs/roadmap.md](docs/roadmap.md), [docs/phase-2-platform-vulkan.md](docs/phase-2-platform-vulkan.md), and the architecture decision records in [docs/adr](docs/adr).
 
 ## Development
 
