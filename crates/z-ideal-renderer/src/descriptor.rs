@@ -595,6 +595,35 @@ mod tests {
     }
 
     #[test]
+    fn validates_storage_buffer_alignment_and_dynamic_descriptor_type() {
+        let binding = DescriptorBinding {
+            binding: 4,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+        };
+        assert!(
+            validate_buffer_descriptor_write(
+                &binding,
+                BufferDescriptorMetadata {
+                    array_element: 0,
+                    offset: 32,
+                    range: 128,
+                    buffer_size: 256,
+                    usage: vk::BufferUsageFlags::STORAGE_BUFFER,
+                },
+                BufferDescriptorLimits {
+                    uniform_alignment: 256,
+                    storage_alignment: 32,
+                    max_uniform_range: 65536,
+                    max_storage_range: 256,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn accepts_whole_size_when_the_remaining_buffer_range_is_valid() {
         assert!(
             validate_buffer_descriptor_write(
