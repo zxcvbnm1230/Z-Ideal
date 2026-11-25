@@ -366,9 +366,11 @@ impl VulkanDevice {
                     .handle
                     .get_physical_device_queue_family_properties(physical_device)
             };
-            let Some((graphics_index, _)) = queue_families.iter().enumerate().find(|(_, family)| {
-                family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            }) else {
+            let Some((graphics_index, _)) =
+                queue_families.iter().enumerate().find(|(_, family)| {
+                    family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
+            else {
                 continue;
             };
             let graphics_queue_family = graphics_index as u32;
@@ -433,10 +435,8 @@ impl VulkanDevice {
                 .then_with(|| left.3.vendor_id.cmp(&right.3.vendor_id))
                 .then_with(|| left.3.device_id.cmp(&right.3.device_id))
         });
-        let (physical_device, graphics_queue_family, present_queue_family, info) = candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
+        let (physical_device, graphics_queue_family, present_queue_family, info) =
+            candidates.into_iter().next().ok_or_else(|| {
                 if surface.is_some() {
                     VulkanError::NoPresentDevice
                 } else {
