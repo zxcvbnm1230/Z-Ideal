@@ -81,7 +81,10 @@ pub struct VulkanSwapchain<'a> {
 impl Drop for VulkanSwapchain<'_> {
     fn drop(&mut self) {
         if let Err(error) = self._device.wait_idle() {
-            tracing::warn!(?error, "Vulkan device was not idle during swapchain destruction");
+            tracing::warn!(
+                ?error,
+                "Vulkan device was not idle during swapchain destruction"
+            );
         }
         drop(self.resources.take());
     }
@@ -107,7 +110,14 @@ impl<'a> VulkanSwapchain<'a> {
             return Err(VulkanError::NoPresentDevice);
         }
         let loader = ash::khr::swapchain::Device::new(&device._instance.handle, &device.handle);
-        let resources = create_resources(device, surface, &loader, window_extent, config, vk::SwapchainKHR::null())?;
+        let resources = create_resources(
+            device,
+            surface,
+            &loader,
+            window_extent,
+            config,
+            vk::SwapchainKHR::null(),
+        )?;
         Ok(Self {
             _device: device,
             _surface: surface,
@@ -148,13 +158,17 @@ impl<'a> VulkanSwapchain<'a> {
     /// Returns swapchain images.
     #[must_use]
     pub fn images(&self) -> &[vk::Image] {
-        self.resources.as_ref().map_or(&[], |resources| &resources.images)
+        self.resources
+            .as_ref()
+            .map_or(&[], |resources| &resources.images)
     }
 
     /// Returns image views corresponding by index to images.
     #[must_use]
     pub fn image_views(&self) -> &[vk::ImageView] {
-        self.resources.as_ref().map_or(&[], |resources| &resources.image_views)
+        self.resources
+            .as_ref()
+            .map_or(&[], |resources| &resources.image_views)
     }
 
     /// Returns the selected swapchain image format.
@@ -166,7 +180,9 @@ impl<'a> VulkanSwapchain<'a> {
     /// Returns the selected surface color space.
     #[must_use]
     pub fn color_space(&self) -> Option<vk::ColorSpaceKHR> {
-        self.resources.as_ref().map(|resources| resources.color_space)
+        self.resources
+            .as_ref()
+            .map(|resources| resources.color_space)
     }
 
     /// Returns the selected swapchain extent.
@@ -178,7 +194,9 @@ impl<'a> VulkanSwapchain<'a> {
     /// Returns the selected presentation mode.
     #[must_use]
     pub fn present_mode(&self) -> Option<vk::PresentModeKHR> {
-        self.resources.as_ref().map(|resources| resources.present_mode)
+        self.resources
+            .as_ref()
+            .map(|resources| resources.present_mode)
     }
 
     /// Acquires the next image, signaling the caller-provided semaphore or fence.
@@ -188,13 +206,17 @@ impl<'a> VulkanSwapchain<'a> {
         semaphore: vk::Semaphore,
         fence: vk::Fence,
     ) -> Result<AcquireResult, VulkanError> {
-        let resources = self.resources.as_ref().ok_or(VulkanError::MissingSwapchain)?;
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or(VulkanError::MissingSwapchain)?;
         if semaphore == vk::Semaphore::null() && fence == vk::Fence::null() {
             return Err(VulkanError::MissingAcquireSynchronization);
         }
         // SAFETY: The swapchain is live and synchronization handles are owned by the caller.
         match unsafe {
-            self.loader.acquire_next_image(resources.handle, timeout, semaphore, fence)
+            self.loader
+                .acquire_next_image(resources.handle, timeout, semaphore, fence)
         } {
             Ok((image_index, suboptimal)) => Ok(AcquireResult::Acquired {
                 image_index,
@@ -256,8 +278,8 @@ fn create_resources<'a>(
     let formats = surface.formats(device.physical_device)?;
     let surface_format = choose_surface_format(&formats).ok_or(VulkanError::NoSurfaceFormats)?;
     let present_modes = surface.present_modes(device.physical_device)?;
-    let present_mode = choose_present_mode(&present_modes, config.vsync)
-        .ok_or(VulkanError::NoPresentModes)?;
+    let present_mode =
+        choose_present_mode(&present_modes, config.vsync).ok_or(VulkanError::NoPresentModes)?;
 
     let extent = if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
@@ -370,10 +392,7 @@ fn create_resources<'a>(
 }
 
 fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::SurfaceFormatKHR> {
-    let preferred = [
-        vk::Format::B8G8R8A8_SRGB,
-        vk::Format::R8G8B8A8_SRGB,
-    ];
+    let preferred = [vk::Format::B8G8R8A8_SRGB, vk::Format::R8G8B8A8_SRGB];
     formats
         .iter()
         .copied()
@@ -391,12 +410,11 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Surface
         })
 }
 
-fn choose_present_mode(
-    modes: &[vk::PresentModeKHR],
-    vsync: bool,
-) -> Option<vk::PresentModeKHR> {
+fn choose_present_mode(modes: &[vk::PresentModeKHR], vsync: bool) -> Option<vk::PresentModeKHR> {
     if vsync {
-        return modes.contains(&vk::PresentModeKHR::FIFO).then_some(vk::PresentModeKHR::FIFO);
+        return modes
+            .contains(&vk::PresentModeKHR::FIFO)
+            .then_some(vk::PresentModeKHR::FIFO);
     }
     [
         vk::PresentModeKHR::MAILBOX,
@@ -462,8 +480,8 @@ mod tests {
 
     #[test]
     fn composite_alpha_selects_first_supported_mode() {
-        let supported = vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
-            | vk::CompositeAlphaFlagsKHR::INHERIT;
+        let supported =
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED | vk::CompositeAlphaFlagsKHR::INHERIT;
         assert_eq!(
             choose_composite_alpha(supported),
             Some(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
