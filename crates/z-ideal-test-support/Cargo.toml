@@ -7,6 +7,3 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-z-ideal-core = { path = "../z-ideal-core" }
-z-ideal-scene = { path = "../z-ideal-scene" }
-z-ideal-assets = { path = "../z-ideal-assets" }
