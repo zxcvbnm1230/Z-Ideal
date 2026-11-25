@@ -91,6 +91,9 @@ pub enum VulkanError {
     /// No window surface is attached to this context.
     #[error("this Vulkan context has no presentation surface")]
     MissingSurface,
+    /// The logical device was created without presentation and swapchain support.
+    #[error("the Vulkan logical device was not created with presentation support")]
+    PresentationNotEnabled,
     /// No swapchain is currently available.
     #[error("no Vulkan swapchain is currently available")]
     MissingSwapchain,
@@ -347,6 +350,7 @@ pub struct VulkanDevice {
     graphics_queue_family: u32,
     present_queue: vk::Queue,
     present_queue_family: u32,
+    presentation_enabled: bool,
     info: PhysicalDeviceInfo,
 }
 
@@ -534,6 +538,7 @@ impl VulkanDevice {
             graphics_queue_family,
             present_queue,
             present_queue_family,
+            presentation_enabled: surface.is_some(),
             info,
         })
     }
@@ -560,6 +565,12 @@ impl VulkanDevice {
     #[must_use]
     pub const fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
+    }
+
+    /// Whether this device was created with presentation support and VK_KHR_swapchain.
+    #[must_use]
+    pub const fn presentation_enabled(&self) -> bool {
+        self.presentation_enabled
     }
 
     /// Returns the presentation queue.
