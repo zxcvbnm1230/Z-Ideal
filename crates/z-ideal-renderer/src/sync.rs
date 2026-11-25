@@ -111,7 +111,7 @@ impl Drop for VulkanFence<'_> {
 /// Retain and recycle semaphores in frame scheduling rather than creating them
 /// repeatedly during rendering.
 pub struct VulkanSemaphore<'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::Semaphore,
 }
 

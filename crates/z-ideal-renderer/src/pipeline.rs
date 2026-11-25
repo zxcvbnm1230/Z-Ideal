@@ -5,8 +5,9 @@ use crate::{VulkanError, VulkanPipelineLayout, VulkanShaderModule, api_error};
 
 /// Owns a compute pipeline and retains its pipeline layout and shader module.
 pub struct VulkanComputePipeline<'pipeline, 'layouts, 'device> {
-    device: &'device crate::VulkanDevice,
+    pub(super) device: &'device crate::VulkanDevice,
     handle: vk::Pipeline,
+    pub(super) layout_handle: vk::PipelineLayout,
     _layout: &'pipeline VulkanPipelineLayout<'layouts, 'device>,
     _shader: &'pipeline VulkanShaderModule<'device>,
 }
@@ -62,6 +63,7 @@ impl<'pipeline, 'layouts, 'device> VulkanComputePipeline<'pipeline, 'layouts, 'd
         Ok(Self {
             device: layout.device,
             handle,
+            layout_handle: layout.handle(),
             _layout: layout,
             _shader: shader,
         })

@@ -249,7 +249,13 @@ impl<'a> VulkanSwapchain<'a> {
             .wait_semaphores(wait_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
-        // SAFETY: The swapchain/image index are validated; synchronization is caller-owned.
+        let _queue_guard = self
+            ._device
+            .queue_submit_lock
+            .lock()
+            .map_err(|_| VulkanError::QueueSynchronizationPoisoned)?;
+        // SAFETY: The swapchain/image index are validated; queue host access is serialized
+        // and synchronization handles are caller-owned.
         match unsafe { self.loader.queue_present(self._device.present_queue, &info) } {
             Ok(suboptimal) => Ok(PresentResult::Presented { suboptimal }),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(PresentResult::OutOfDate),
