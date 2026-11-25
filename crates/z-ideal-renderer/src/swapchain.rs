@@ -83,7 +83,7 @@ impl Drop for VulkanSwapchain<'_> {
         if let Err(error) = self._device.wait_idle() {
             tracing::warn!(?error, "Vulkan device was not idle during swapchain destruction");
         }
-        self.resources.take();
+        drop(self.resources.take());
     }
 }
 
