@@ -10,6 +10,15 @@ pub struct FenceConfig {
     pub signaled: bool,
 }
 
+/// Result of waiting for a fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceWaitResult {
+    /// The fence became signaled before the timeout.
+    Signaled,
+    /// The timeout elapsed while the fence remained unsignaled.
+    Timeout,
+}
+
 /// Owns a Vulkan fence and borrows the logical device that created it.
 ///
 /// Dropping the owner waits for device idle before destroying the fence. This is
@@ -49,13 +58,16 @@ impl<'device> VulkanFence<'device> {
     }
 
     /// Waits until this fence is signaled or the timeout expires.
-    pub fn wait(&self, timeout_nanoseconds: u64) -> Result<(), VulkanError> {
+    pub fn wait(&self, timeout_nanoseconds: u64) -> Result<FenceWaitResult, VulkanError> {
         // SAFETY: The fence is live and belongs to the retained logical device.
-        unsafe {
+        match unsafe {
             self.device
                 .handle()
                 .wait_for_fences(&[self.handle], true, timeout_nanoseconds)
-                .map_err(|error| api_error("wait for Vulkan fence", error))
+        } {
+            Ok(()) => Ok(FenceWaitResult::Signaled),
+            Err(vk::Result::TIMEOUT) => Ok(FenceWaitResult::Timeout),
+            Err(error) => Err(api_error("wait for Vulkan fence", error)),
         }
     }
 
@@ -135,5 +147,20 @@ impl Drop for VulkanSemaphore<'_> {
                 .handle()
                 .destroy_semaphore(self.handle, None)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FenceConfig, FenceWaitResult};
+
+    #[test]
+    fn fence_defaults_to_unsignaled() {
+        assert!(!FenceConfig::default().signaled);
+    }
+
+    #[test]
+    fn fence_wait_result_distinguishes_timeout() {
+        assert_ne!(FenceWaitResult::Signaled, FenceWaitResult::Timeout);
     }
 }
