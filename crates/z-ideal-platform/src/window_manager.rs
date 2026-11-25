@@ -143,10 +143,7 @@ impl WindowManager {
     /// The returned input token is stable until the window is removed. Native
     /// `WindowId` values are used for event lookup; the separate input token
     /// prevents the platform API from exposing the router's internal map.
-    pub fn register_window(
-        &mut self,
-        window: Window,
-    ) -> Result<InputWindowId, WindowManagerError> {
+    pub fn register_window(&mut self, window: Window) -> Result<InputWindowId, WindowManagerError> {
         let native_id = window.id();
         if self.windows.contains_key(&native_id) {
             return Err(WindowManagerError::DuplicateWindow);
@@ -167,10 +164,7 @@ impl WindowManager {
     }
 
     /// Removes a native window and returns ownership to the caller.
-    pub fn remove_window(
-        &mut self,
-        native_id: WindowId,
-    ) -> Result<Window, WindowManagerError> {
+    pub fn remove_window(&mut self, native_id: WindowId) -> Result<Window, WindowManagerError> {
         let input_id = self
             .windows
             .get(&native_id)
@@ -194,8 +188,7 @@ impl WindowManager {
             .get_mut(&native_id)
             .ok_or(WindowManagerError::UnknownWindow)?;
 
-        self.input
-            .process_window_event(managed.input_id, event)?;
+        self.input.process_window_event(managed.input_id, event)?;
 
         let mut outcome = WindowEventOutcome::default();
         match event {
@@ -292,9 +285,11 @@ mod tests {
     #[test]
     fn zero_extent_marks_window_minimized_and_advances_generation() {
         let mut metrics = WindowMetrics::new(PhysicalSize::new(1280, 720), 1.0);
-        assert!(metrics
-            .update_surface(PhysicalSize::new(0, 0), 1.0)
-            .expect("surface metrics update"));
+        assert!(
+            metrics
+                .update_surface(PhysicalSize::new(0, 0), 1.0)
+                .expect("surface metrics update")
+        );
 
         assert!(metrics.minimized());
         assert_eq!(metrics.physical_size(), [0, 0]);
@@ -304,9 +299,11 @@ mod tests {
     #[test]
     fn nonzero_extent_restores_window_and_advances_generation() {
         let mut metrics = WindowMetrics::new(PhysicalSize::new(0, 0), 1.0);
-        assert!(metrics
-            .update_surface(PhysicalSize::new(1920, 1080), 1.0)
-            .expect("surface metrics update"));
+        assert!(
+            metrics
+                .update_surface(PhysicalSize::new(1920, 1080), 1.0)
+                .expect("surface metrics update")
+        );
 
         assert!(!metrics.minimized());
         assert_eq!(metrics.physical_size(), [1920, 1080]);
@@ -316,9 +313,11 @@ mod tests {
     #[test]
     fn unchanged_metrics_do_not_advance_generation() {
         let mut metrics = WindowMetrics::new(PhysicalSize::new(800, 600), 1.0);
-        assert!(!metrics
-            .update_surface(PhysicalSize::new(800, 600), 1.0)
-            .expect("unchanged surface metrics"));
+        assert!(
+            !metrics
+                .update_surface(PhysicalSize::new(800, 600), 1.0)
+                .expect("unchanged surface metrics")
+        );
 
         assert_eq!(metrics.surface_generation(), 0);
     }
@@ -326,9 +325,11 @@ mod tests {
     #[test]
     fn scale_factor_change_advances_surface_generation() {
         let mut metrics = WindowMetrics::new(PhysicalSize::new(800, 600), 1.0);
-        assert!(metrics
-            .update_surface(PhysicalSize::new(800, 600), 2.0)
-            .expect("scale factor update"));
+        assert!(
+            metrics
+                .update_surface(PhysicalSize::new(800, 600), 2.0)
+                .expect("scale factor update")
+        );
 
         assert_eq!(metrics.scale_factor(), 2.0);
         assert_eq!(metrics.surface_generation(), 1);
