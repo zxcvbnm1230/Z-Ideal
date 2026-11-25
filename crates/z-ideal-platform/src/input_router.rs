@@ -63,10 +63,7 @@ impl InputRouter {
     }
 
     /// Unregisters a window and discards its input state.
-    pub fn unregister_window(
-        &mut self,
-        window_id: InputWindowId,
-    ) -> Result<(), InputRouterError> {
+    pub fn unregister_window(&mut self, window_id: InputWindowId) -> Result<(), InputRouterError> {
         self.windows
             .remove(&window_id)
             .map(|_| ())
@@ -177,10 +174,7 @@ mod tests {
             .expect("registered window removal");
 
         assert_eq!(
-            router.process_window_event(
-                window,
-                &winit::event::WindowEvent::Focused(true)
-            ),
+            router.process_window_event(window, &winit::event::WindowEvent::Focused(true)),
             Err(InputRouterError::UnknownWindow(window.get()))
         );
     }
