@@ -296,12 +296,34 @@ pub struct VulkanDevice {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
+    present_queue: vk::Queue,
+    present_queue_family: u32,
     info: PhysicalDeviceInfo,
 }
 
 impl VulkanDevice {
     /// Selects a graphics-capable device and creates its logical device.
     pub fn new(instance: Arc<VulkanInstance>) -> Result<Self, VulkanError> {
+        Self::new_internal(instance, None)
+    }
+
+    /// Selects a device with graphics and presentation queues for a window surface.
+    pub fn new_for_surface(
+        instance: Arc<VulkanInstance>,
+        surface: &VulkanSurface,
+    ) -> Result<Self, VulkanError> {
+        if !Arc::ptr_eq(&instance, &surface.instance) {
+            return Err(VulkanError::Surface(
+                "surface and device must belong to the same Vulkan instance".to_owned(),
+            ));
+        }
+        Self::new_internal(instance, Some(surface))
+    }
+
+    fn new_internal(
+        instance: Arc<VulkanInstance>,
+        surface: Option<&VulkanSurface>,
+    ) -> Result<Self, VulkanError> {
         // SAFETY: The instance is live and retained by this device.
         let physical_devices = unsafe {
             instance
