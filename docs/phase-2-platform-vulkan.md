@@ -6,7 +6,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 ## Implemented in the current Phase 2 branch
 
-- Pinned workspace dependencies for ash 0.38.0, ash-window 0.13.0, raw-window-handle 0.6.2, and winit 0.30.13.
+- Pinned workspace dependencies for ash 0.38.0 and winit 0.30.13. Additional surface/window-handle dependencies will be introduced when surface ownership is implemented.
 - Platform-native event-loop ownership through winit's ApplicationHandler lifecycle.
 - Validated initial window configuration and a window-creation boundary that runs on the native event-loop thread.
 - Dynamic Vulkan loader discovery with actionable loader and API errors.
