@@ -119,13 +119,12 @@ pub struct WindowEventOutcome {
 /// removing a window returns ownership to the caller. Vulkan remains outside
 /// this crate: consumers observe `surface_generation` and decide when and how
 /// to recreate presentation resources.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WindowManager {
     windows: HashMap<WindowId, ManagedWindow>,
     input: InputRouter,
 }
 
-#[derive(Debug)]
 struct ManagedWindow {
     window: Window,
     input_id: InputWindowId,
