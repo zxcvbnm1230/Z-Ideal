@@ -1,11 +1,33 @@
 //! Vulkan window-surface ownership and presentation capability queries.
-use std::sync::Arc;
+use std::{ffi::{CStr, CString}, sync::Arc};
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 use crate::{VulkanError, VulkanInstance};
+
+pub(crate) fn required_instance_extensions(
+    window: &Window,
+) -> Result<Vec<CString>, VulkanError> {
+    let display_handle = window
+        .display_handle()
+        .map_err(|error| VulkanError::Surface(error.to_string()))?
+        .as_raw();
+    let required = ash_window::enumerate_required_extensions(display_handle).map_err(|error| {
+        VulkanError::Api {
+            operation: "enumerate required Vulkan window extensions",
+            result: error,
+        }
+    })?;
+    required
+        .iter()
+        .map(|pointer| {
+            // SAFETY: ash-window returns pointers to static, NUL-terminated extension names.
+            Ok(unsafe { CStr::from_ptr(*pointer) }.to_owned())
+        })
+        .collect()
+}
 
 /// Owns a Vulkan presentation surface tied to the instance that created it.
 ///
@@ -133,6 +155,5 @@ impl Drop for VulkanSurface {
         unsafe {
             self.loader.destroy_surface(self.handle, None);
         }
-        let _ = &self.instance;
     }
 }
