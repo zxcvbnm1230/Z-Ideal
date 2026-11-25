@@ -432,6 +432,9 @@ impl VulkanDevice {
                 .map_err(|error| api_error("enumerate device extensions", error))?
         };
         let mut enabled_extensions = Vec::<CString>::new();
+        if surface.is_some() {
+            enabled_extensions.push(SWAPCHAIN_EXTENSION.to_owned());
+        }
         if has_extension(&available_extensions, PORTABILITY_SUBSET_EXTENSION) {
             enabled_extensions.push(PORTABILITY_SUBSET_EXTENSION.to_owned());
         }
@@ -440,12 +443,19 @@ impl VulkanDevice {
             .map(|name| name.as_ptr())
             .collect();
         let priorities = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo {
-            queue_family_index: graphics_queue_family,
-            queue_count: 1,
-            p_queue_priorities: priorities.as_ptr(),
-            ..Default::default()
-        }];
+        let mut queue_family_indices = vec![graphics_queue_family];
+        if present_queue_family != graphics_queue_family {
+            queue_family_indices.push(present_queue_family);
+        }
+        let queue_info: Vec<_> = queue_family_indices
+            .iter()
+            .map(|&queue_family_index| vk::DeviceQueueCreateInfo {
+                queue_family_index,
+                queue_count: 1,
+                p_queue_priorities: priorities.as_ptr(),
+                ..Default::default()
+            })
+            .collect();
         let device_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_info.len() as u32,
             p_queue_create_infos: queue_info.as_ptr(),
@@ -464,6 +474,8 @@ impl VulkanDevice {
         };
         // SAFETY: This queue family and queue index were included in device creation.
         let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_family, 0) };
+        // SAFETY: This queue family was included in logical-device creation.
+        let present_queue = unsafe { handle.get_device_queue(present_queue_family, 0) };
 
         Ok(Self {
             _instance: instance,
@@ -471,6 +483,8 @@ impl VulkanDevice {
             physical_device,
             graphics_queue,
             graphics_queue_family,
+            present_queue,
+            present_queue_family,
             info,
         })
     }
@@ -497,6 +511,18 @@ impl VulkanDevice {
     #[must_use]
     pub const fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
+    }
+
+    /// Returns the presentation queue.
+    #[must_use]
+    pub const fn present_queue(&self) -> vk::Queue {
+        self.present_queue
+    }
+
+    /// Returns the presentation queue-family index.
+    #[must_use]
+    pub const fn present_queue_family(&self) -> u32 {
+        self.present_queue_family
     }
 
     /// Returns selected physical-device metadata.
