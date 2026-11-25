@@ -211,6 +211,9 @@ mod tests {
             height: 0,
             ..WindowConfig::default()
         };
-        assert!(matches!(config.validate(), Err(PlatformError::InvalidWindowConfig(_))));
+        assert!(matches!(
+            config.validate(),
+            Err(PlatformError::InvalidWindowConfig(_))
+        ));
     }
 }
