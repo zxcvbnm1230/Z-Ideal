@@ -42,7 +42,9 @@ impl WindowConfig {
     /// Rejects invalid dimensions and blank titles.
     pub fn validate(&self) -> Result<(), PlatformError> {
         if self.title.trim().is_empty() {
-            return Err(PlatformError::InvalidWindowConfig("title must not be empty".to_owned()));
+            return Err(PlatformError::InvalidWindowConfig(
+                "title must not be empty".to_owned(),
+            ));
         }
         if self.width == 0 || self.height == 0 {
             return Err(PlatformError::InvalidWindowConfig(
@@ -114,11 +116,7 @@ struct Runner<A> {
 }
 
 impl<A: PlatformApplication> Runner<A> {
-    fn finish_callback(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        result: Result<(), PlatformError>,
-    ) {
+    fn finish_callback(&mut self, event_loop: &ActiveEventLoop, result: Result<(), PlatformError>) {
         if let Err(error) = result {
             self.error = Some(error);
             event_loop.exit();
@@ -183,7 +181,7 @@ pub fn create_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{PlatformError, WindowConfig, CRATE_NAME};
+    use super::{CRATE_NAME, PlatformError, WindowConfig};
 
     #[test]
     fn crate_name_is_stable() {
@@ -201,7 +199,10 @@ mod tests {
             title: " ".to_owned(),
             ..WindowConfig::default()
         };
-        assert!(matches!(config.validate(), Err(PlatformError::InvalidWindowConfig(_))));
+        assert!(matches!(
+            config.validate(),
+            Err(PlatformError::InvalidWindowConfig(_))
+        ));
     }
 
     #[test]
