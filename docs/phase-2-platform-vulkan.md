@@ -30,13 +30,13 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Swapchain image views with deterministic destruction ordering; acquisition and presentation expose suboptimal/out-of-date states to the caller.
 - Swapchain recreation waits for device idle and preserves the old swapchain for zero-size/minimized-window deferrals; failed nonzero recreation leaves a clear not-ready state that callers can retry.
 - Explicitly owned Vulkan fence and binary-semaphore wrappers with device-borrowed lifetimes, structured API errors, fence timeout reporting, and conservative device-idle waits before destruction.
-- Explicitly owned Vulkan buffers with dedicated memory allocations, deterministic memory-type selection, device-local/upload/readback placement policies, bounds-checked host access, and non-coherent cache management.
+- Explicitly owned Vulkan buffers with one dedicated allocation per buffer, deterministic memory-type selection, required device-local or host-visible memory policies, upload/readback preference scoring, bounds-checked host access, and atom-aligned non-coherent cache maintenance. Host access does not implicitly wait for queues or insert memory barriers; callers own GPU/host synchronization, including synchronization for any atom-expanded cache range.
 - Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
 
 - Higher-level frame scheduling and automatic scheduling policy for redraw, pause, and minimized-window behavior.
-- General GPU image/view/sampler/descriptor/pipeline wrappers; buffer ownership and host-access foundations now exist, but allocator pooling and deferred resource retirement remain outstanding.
+- General GPU image/view/sampler/descriptor/pipeline wrappers; buffer ownership and host-access foundations now exist, but suballocation/allocator pooling and deferred resource retirement remain outstanding.
 - Higher-level frame scheduling and reusable per-frame synchronization policy.
 - Shader compiler integration, reflection, and pipeline-layout validation.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.
