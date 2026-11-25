@@ -16,7 +16,7 @@ mod sync;
 
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
-pub use sync::{FenceConfig, VulkanFence, VulkanSemaphore};
+pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";
