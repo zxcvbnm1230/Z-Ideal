@@ -48,7 +48,7 @@ impl InputState {
         match event {
             WindowEvent::Focused(focused) => {
                 self.focused = *focused;
-                if !focused {
+                if !*focused {
                     self.release_all_inputs();
                     self.cursor_position = None;
                 }
