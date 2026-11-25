@@ -8,6 +8,11 @@ use std::{
 
 use ash::{Entry, vk};
 use thiserror::Error;
+use winit::window::Window;
+
+mod surface;
+
+pub use surface::VulkanSurface;
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";
@@ -16,6 +21,7 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
 const PORTABILITY_ENUMERATION_EXTENSION: &CStr = c"VK_KHR_portability_enumeration";
 const PORTABILITY_SUBSET_EXTENSION: &CStr = c"VK_KHR_portability_subset";
+const SWAPCHAIN_EXTENSION: &CStr = ash::khr::swapchain::NAME;
 
 /// Vulkan instance and device creation options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +65,12 @@ pub enum VulkanError {
     /// No graphics-capable device is available.
     #[error("no Vulkan physical device exposes a graphics-capable queue family")]
     NoGraphicsDevice,
+    /// No graphics device can present to the selected window surface.
+    #[error("no Vulkan physical device supports both graphics and presentation for this surface")]
+    NoPresentDevice,
+    /// Native surface creation or compatibility failed.
+    #[error("Vulkan surface operation failed: {0}")]
+    Surface(String),
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
