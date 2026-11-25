@@ -2,8 +2,10 @@
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod input_router;
 
 pub use input::{InputState, ScrollDelta};
+pub use input_router::{InputRouter, InputRouterError, InputWindowId};
 
 use thiserror::Error;
 use winit::{
