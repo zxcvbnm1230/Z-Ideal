@@ -11,6 +11,10 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Validated initial window configuration and a window-creation boundary that runs on the native event-loop thread.
 - Normalized per-window keyboard and mouse state with held/pressed/released transitions, focus-loss release handling, cursor position, and accumulated wheel deltas.
 - Centralized multi-window input routing with explicit registration, independent state, monotonic non-reused input-window identities, frame-boundary updates, and stale-window rejection.
+- A reusable native-window manager that owns registered winit windows, maps native IDs to input identities, routes input events, and returns window ownership on removal.
+- Window metrics for physical drawable extent, scale factor, focus, and minimized state.
+- Surface-generation notifications on drawable-size and scale-factor changes, allowing renderer integrations to trigger swapchain recreation without a platform-to-renderer dependency.
+- Event outcomes for close requests, redraw requests, focus transitions, and surface changes.
 - Dynamic Vulkan loader discovery with actionable loader and API errors.
 - Instance-extension and validation-layer discovery before instance creation.
 - Optional Khronos validation layer and debug-utils callback; requested validation fails clearly if unavailable.
@@ -29,9 +33,8 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 ## Not implemented yet
 
-- Mapping native `winit::window::WindowId` values to router-owned `InputWindowId` tokens inside a reusable application/window manager; the current application owns that association explicitly.
-- Higher-level frame scheduling and automatic resize/minimize/restore event wiring.
-- Dedicated synchronization-object wrappers and general GPU buffer/image/view/sampler/descriptor/pipeline wrappers.
+- Higher-level frame scheduling and automatic scheduling policy for redraw, pause, and minimized-window behavior.
+- Dedicated Vulkan synchronization-object wrappers and general GPU buffer/image/view/sampler/descriptor/pipeline wrappers.
 - Shader compiler integration, reflection, and pipeline-layout validation.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.
 
