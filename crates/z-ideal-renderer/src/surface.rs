@@ -1,5 +1,8 @@
 //! Vulkan window-surface ownership and presentation capability queries.
-use std::{ffi::{CStr, CString}, sync::Arc};
+use std::{
+    ffi::{CStr, CString},
+    sync::Arc,
+};
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -7,9 +10,7 @@ use winit::window::Window;
 
 use crate::{VulkanError, VulkanInstance};
 
-pub(crate) fn required_instance_extensions(
-    window: &Window,
-) -> Result<Vec<CString>, VulkanError> {
+pub(crate) fn required_instance_extensions(window: &Window) -> Result<Vec<CString>, VulkanError> {
     let display_handle = window
         .display_handle()
         .map_err(|error| VulkanError::Surface(error.to_string()))?
@@ -40,10 +41,7 @@ pub struct VulkanSurface {
 
 impl VulkanSurface {
     /// Creates a Vulkan surface from a live winit window.
-    pub fn new(
-        instance: Arc<VulkanInstance>,
-        window: &Window,
-    ) -> Result<Self, VulkanError> {
+    pub fn new(instance: Arc<VulkanInstance>, window: &Window) -> Result<Self, VulkanError> {
         let display_handle = window
             .display_handle()
             .map_err(|error| VulkanError::Surface(error.to_string()))?
