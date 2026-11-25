@@ -63,7 +63,7 @@ impl Default for ImageViewConfig {
 /// compatible memory configurations. Layout transitions, access barriers,
 /// queue ownership transfers, and resource retirement remain caller responsibilities.
 pub struct VulkanImage<'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::Image,
     memory: vk::DeviceMemory,
     config: ImageConfig,

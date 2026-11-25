@@ -1,7 +1,8 @@
 //! Explicitly owned Vulkan descriptor layouts and pools.
 use ash::vk;
+use std::collections::HashSet;
 
-use crate::{VulkanBuffer, VulkanDevice, VulkanError, api_error};
+use crate::{VulkanBuffer, VulkanDevice, VulkanError, VulkanImageView, VulkanSampler, api_error};
 
 /// One binding in a descriptor-set layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,43 @@ pub struct BufferDescriptorWrite<'resource, 'device> {
     pub offset: vk::DeviceSize,
     /// Byte range; `vk::WHOLE_SIZE` selects the remaining buffer range.
     pub range: vk::DeviceSize,
+}
+
+/// One image or sampler descriptor update.
+#[derive(Clone, Copy)]
+pub struct ImageDescriptorWrite<'resource, 'image, 'device> {
+    /// Binding number in the descriptor-set layout.
+    pub binding: u32,
+    /// Array element within the binding.
+    pub array_element: u32,
+    /// Image view retained by the returned resource lease.
+    pub view: &'resource VulkanImageView<'image, 'device>,
+    /// Sampler for combined-image-sampler descriptors; must be absent otherwise.
+    pub sampler: Option<&'resource VulkanSampler<'device>>,
+    /// Layout the image will be in when accessed by the shader.
+    pub image_layout: vk::ImageLayout,
+}
+
+/// One sampler-only descriptor update.
+#[derive(Clone, Copy)]
+pub struct SamplerDescriptorWrite<'resource, 'device> {
+    /// Binding number in the descriptor-set layout.
+    pub binding: u32,
+    /// Array element within the binding.
+    pub array_element: u32,
+    /// Sampler retained by the returned resource lease.
+    pub sampler: &'resource VulkanSampler<'device>,
+}
+
+/// One resource write in a descriptor-set update batch.
+#[derive(Clone, Copy)]
+pub enum DescriptorResourceWrite<'resource, 'image, 'device> {
+    /// Uniform or storage buffer descriptor.
+    Buffer(BufferDescriptorWrite<'resource, 'device>),
+    /// Sampled, combined-image-sampler, or storage-image descriptor.
+    Image(ImageDescriptorWrite<'resource, 'image, 'device>),
+    /// Sampler-only descriptor.
+    Sampler(SamplerDescriptorWrite<'resource, 'device>),
 }
 
 /// Owns a descriptor-set layout and borrows its creating logical device.
@@ -176,9 +214,9 @@ impl<'device> VulkanDescriptorPool<'device> {
 
     /// Allocates one descriptor set that borrows both its pool and layout.
     ///
-    /// The descriptor set is automatically released with its pool. This initial
-    /// API intentionally exposes allocation only; resource writes are handled by
-    /// a later descriptor-update layer with explicit resource-lifetime contracts.
+    /// The descriptor set is automatically released with its pool. Resource writes
+    /// use [`VulkanDescriptorSet::write_descriptors`] and return a lease that retains
+    /// referenced GPU resources until submitted work has completed.
     pub fn allocate_set<'layout>(
         &self,
         layout: &'layout VulkanDescriptorSetLayout<'device>,
@@ -239,93 +277,171 @@ pub struct VulkanDescriptorSet<'pool, 'layout, 'device> {
 }
 
 impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
-    /// Updates uniform/storage buffer descriptors and returns a resource lease.
+    /// Updates buffer, sampled-image, combined-image-sampler, and storage-image descriptors.
     ///
-    /// The lease retains every referenced buffer and exclusively borrows this set,
-    /// preventing another update while the descriptors may be in use. This initial
-    /// buffer-only path requires every binding and every array element in the layout
-    /// to be a supported uniform/storage buffer descriptor and rewritten in this batch.
-    /// This avoids stale descriptor slots outliving the resources from a previous lease.
-    /// Keep the
-    /// lease alive through all submissions that use the set. Dropping the lease
-    /// waits for the device to become idle before releasing its buffer references.
-    /// Descriptor updates do not perform queue synchronization or buffer barriers;
-    /// callers must establish the required memory dependencies separately. For
-    /// dynamic buffer descriptor types, the eventual command-binding layer must
-    /// validate dynamic offsets and the final effective buffer range.
-    pub fn write_buffer_descriptors<'set, 'resource>(
+    /// Every binding array element in the layout must be written exactly once in the
+    /// batch. This initial complete-update contract prevents stale descriptor slots
+    /// from outliving resources retained by an earlier lease. The returned lease
+    /// retains all referenced resources and exclusively borrows this set, preventing
+    /// another update until the lease is dropped. Keep it alive through all submissions
+    /// that use the set. Dropping it waits for device idle before releasing resources.
+    /// Descriptor updates do not perform queue synchronization, image layout transitions,
+    /// or buffer memory barriers; callers must establish all required dependencies.
+    /// Dynamic buffer offsets and final effective ranges must be validated by the
+    /// command-binding layer before drawing or dispatching.
+    pub fn write_descriptors<'set, 'resource, 'image>(
         &'set mut self,
-        writes: &[BufferDescriptorWrite<'resource, 'device>],
-    ) -> Result<DescriptorResourceLease<'set, 'resource, 'pool, 'layout, 'device>, VulkanError>
-    {
-        let mut seen = Vec::with_capacity(writes.len());
+        writes: &[DescriptorResourceWrite<'resource, 'image, 'device>],
+    ) -> Result<
+        DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device>,
+        VulkanError,
+    > {
+        let mut seen = HashSet::with_capacity(writes.len());
         let mut buffer_infos = Vec::with_capacity(writes.len());
-        let mut descriptor_types = Vec::with_capacity(writes.len());
-        let mut retained_buffers = Vec::with_capacity(writes.len());
+        let mut image_infos = Vec::with_capacity(writes.len());
+        let mut prepared = Vec::with_capacity(writes.len());
+        let mut retained_resources = Vec::with_capacity(writes.len().saturating_mul(2));
 
         for write in writes {
-            validate_unique_descriptor_write(&mut seen, write.binding, write.array_element)?;
-
+            let (binding_number, array_element) = match write {
+                DescriptorResourceWrite::Buffer(write) => (write.binding, write.array_element),
+                DescriptorResourceWrite::Image(write) => (write.binding, write.array_element),
+                DescriptorResourceWrite::Sampler(write) => (write.binding, write.array_element),
+            };
+            validate_unique_descriptor_write(&mut seen, binding_number, array_element)?;
             let binding = self
                 .layout
                 .config
                 .bindings
                 .iter()
-                .find(|binding| binding.binding == write.binding)
+                .find(|binding| binding.binding == binding_number)
                 .ok_or(VulkanError::DescriptorBindingNotFound)?;
-            if !std::ptr::eq(self._pool.device, write.buffer.device) {
-                return Err(VulkanError::DescriptorSetDeviceMismatch);
+            if array_element >= binding.descriptor_count {
+                return Err(VulkanError::DescriptorArrayElementOutOfBounds);
             }
-            validate_buffer_descriptor_write(
-                binding,
-                BufferDescriptorMetadata {
-                    array_element: write.array_element,
-                    offset: write.offset,
-                    range: write.range,
-                    buffer_size: write.buffer.size(),
-                    usage: write.buffer.usage,
-                },
-                BufferDescriptorLimits {
-                    uniform_alignment: self._pool.device.min_uniform_buffer_offset_alignment,
-                    storage_alignment: self._pool.device.min_storage_buffer_offset_alignment,
-                    max_uniform_range: self._pool.device.max_uniform_buffer_range,
-                    max_storage_range: self._pool.device.max_storage_buffer_range,
-                },
-            )?;
 
-            let range = if write.range == vk::WHOLE_SIZE {
-                write.buffer.size() - write.offset
-            } else {
-                write.range
-            };
-            descriptor_types.push(binding.descriptor_type);
-            buffer_infos.push(
-                vk::DescriptorBufferInfo::default()
-                    .buffer(write.buffer.handle())
-                    .offset(write.offset)
-                    .range(range),
-            );
-            retained_buffers.push(write.buffer);
+            match write {
+                DescriptorResourceWrite::Buffer(write) => {
+                    if !std::ptr::eq(self._pool.device, write.buffer.device) {
+                        return Err(VulkanError::DescriptorSetDeviceMismatch);
+                    }
+                    validate_buffer_descriptor_write(
+                        binding,
+                        BufferDescriptorMetadata {
+                            array_element: write.array_element,
+                            offset: write.offset,
+                            range: write.range,
+                            buffer_size: write.buffer.size(),
+                            usage: write.buffer.usage,
+                        },
+                        BufferDescriptorLimits {
+                            uniform_alignment: self
+                                ._pool
+                                .device
+                                .min_uniform_buffer_offset_alignment,
+                            storage_alignment: self
+                                ._pool
+                                .device
+                                .min_storage_buffer_offset_alignment,
+                            max_uniform_range: self._pool.device.max_uniform_buffer_range,
+                            max_storage_range: self._pool.device.max_storage_buffer_range,
+                        },
+                    )?;
+                    let range = if write.range == vk::WHOLE_SIZE {
+                        write.buffer.size() - write.offset
+                    } else {
+                        write.range
+                    };
+                    let index = buffer_infos.len();
+                    buffer_infos.push(
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(write.buffer.handle())
+                            .offset(write.offset)
+                            .range(range),
+                    );
+                    prepared.push(PreparedDescriptorWrite {
+                        binding: binding_number,
+                        array_element,
+                        descriptor_type: binding.descriptor_type,
+                        info: DescriptorInfoIndex::Buffer(index),
+                    });
+                    retained_resources.push(RetainedDescriptorResource::Buffer(write.buffer));
+                }
+                DescriptorResourceWrite::Image(write) => {
+                    if !std::ptr::eq(self._pool.device, write.view.image().device) {
+                        return Err(VulkanError::DescriptorSetDeviceMismatch);
+                    }
+                    if write
+                        .sampler
+                        .is_some_and(|sampler| !std::ptr::eq(self._pool.device, sampler.device))
+                    {
+                        return Err(VulkanError::DescriptorSetDeviceMismatch);
+                    }
+                    validate_image_descriptor_write(self._pool.device, binding, write)?;
+                    let index = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .sampler(write.sampler.map_or(vk::Sampler::null(), |s| s.handle()))
+                            .image_view(write.view.handle())
+                            .image_layout(write.image_layout),
+                    );
+                    prepared.push(PreparedDescriptorWrite {
+                        binding: binding_number,
+                        array_element,
+                        descriptor_type: binding.descriptor_type,
+                        info: DescriptorInfoIndex::Image(index),
+                    });
+                    retained_resources.push(RetainedDescriptorResource::ImageView(write.view));
+                    if let Some(sampler) = write.sampler {
+                        retained_resources.push(RetainedDescriptorResource::Sampler(sampler));
+                    }
+                }
+                DescriptorResourceWrite::Sampler(write) => {
+                    validate_sampler_descriptor_binding(binding)?;
+                    if !std::ptr::eq(self._pool.device, write.sampler.device) {
+                        return Err(VulkanError::DescriptorSetDeviceMismatch);
+                    }
+                    let index = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .sampler(write.sampler.handle())
+                            .image_view(vk::ImageView::null())
+                            .image_layout(vk::ImageLayout::UNDEFINED),
+                    );
+                    prepared.push(PreparedDescriptorWrite {
+                        binding: binding_number,
+                        array_element,
+                        descriptor_type: binding.descriptor_type,
+                        info: DescriptorInfoIndex::Image(index),
+                    });
+                    retained_resources.push(RetainedDescriptorResource::Sampler(write.sampler));
+                }
+            }
         }
-        validate_complete_buffer_write_set(&self.layout.config, &seen)?;
+        validate_complete_descriptor_write_set(&self.layout.config, &seen)?;
 
-        let descriptor_writes: Vec<_> = writes
+        let descriptor_writes: Vec<_> = prepared
             .iter()
-            .zip(&buffer_infos)
-            .zip(&descriptor_types)
-            .map(|((write, info), descriptor_type)| {
-                vk::WriteDescriptorSet::default()
+            .map(|write| {
+                let base = vk::WriteDescriptorSet::default()
                     .dst_set(self.handle)
                     .dst_binding(write.binding)
                     .dst_array_element(write.array_element)
-                    .descriptor_type(*descriptor_type)
-                    .buffer_info(std::slice::from_ref(info))
+                    .descriptor_type(write.descriptor_type);
+                match write.info {
+                    DescriptorInfoIndex::Buffer(index) => {
+                        base.buffer_info(std::slice::from_ref(&buffer_infos[index]))
+                    }
+                    DescriptorInfoIndex::Image(index) => {
+                        base.image_info(std::slice::from_ref(&image_infos[index]))
+                    }
+                }
             })
             .collect();
 
-        // SAFETY: All descriptor types, binding indices, array elements, buffer
-        // ranges, usages, and device identities were validated above. The info
-        // vectors remain alive and unmoved for the duration of this call.
+        // SAFETY: Each descriptor slot is unique and complete. Resource device
+        // identities, descriptor types, usages, ranges, image layouts, and sampler
+        // requirements were validated above. Info arrays remain alive for the call.
         unsafe {
             self._pool
                 .device
@@ -335,8 +451,27 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
 
         Ok(DescriptorResourceLease {
             set: self,
-            retained_buffers,
+            retained_resources,
         })
+    }
+
+    /// Updates a descriptor set containing only uniform/storage buffer descriptors.
+    ///
+    /// This convenience wrapper uses the same complete-update and resource-lease
+    /// contract as [`Self::write_descriptors`].
+    pub fn write_buffer_descriptors<'set, 'resource>(
+        &'set mut self,
+        writes: &[BufferDescriptorWrite<'resource, 'device>],
+    ) -> Result<
+        DescriptorResourceLease<'set, 'resource, 'resource, 'pool, 'layout, 'device>,
+        VulkanError,
+    > {
+        let resources: Vec<_> = writes
+            .iter()
+            .copied()
+            .map(DescriptorResourceWrite::Buffer)
+            .collect();
+        self.write_descriptors(&resources)
     }
 
     /// Returns the layout used to allocate this descriptor set.
@@ -346,30 +481,88 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
     }
 }
 
-/// Keeps a descriptor set's referenced buffers alive while the set is in use.
+/// Keeps every resource referenced by a descriptor set alive while it is in use.
 ///
-/// This guard also prevents descriptor updates until it is dropped. Drop waits
-/// for the owning device to become idle before releasing retained buffers.
-pub struct DescriptorResourceLease<'set, 'resource, 'pool, 'layout, 'device> {
+/// This guard prevents descriptor updates until it is dropped. Drop waits for the
+/// owning device to become idle before releasing retained buffers, image views,
+/// and samplers.
+pub struct DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device> {
     set: &'set mut VulkanDescriptorSet<'pool, 'layout, 'device>,
-    retained_buffers: Vec<&'resource VulkanBuffer<'device>>,
+    retained_resources: Vec<RetainedDescriptorResource<'resource, 'image, 'device>>,
 }
 
-impl DescriptorResourceLease<'_, '_, '_, '_, '_> {
+enum RetainedDescriptorResource<'resource, 'image, 'device> {
+    Buffer(&'resource VulkanBuffer<'device>),
+    ImageView(&'resource VulkanImageView<'image, 'device>),
+    Sampler(&'resource VulkanSampler<'device>),
+}
+
+enum DescriptorInfoIndex {
+    Buffer(usize),
+    Image(usize),
+}
+
+struct PreparedDescriptorWrite {
+    binding: u32,
+    array_element: u32,
+    descriptor_type: vk::DescriptorType,
+    info: DescriptorInfoIndex,
+}
+
+impl DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {
     /// Returns the descriptor-set handle while its referenced resources are leased.
     #[must_use]
     pub const fn handle(&self) -> vk::DescriptorSet {
         self.set.handle
     }
 
-    /// Returns the number of buffer resources retained by this lease.
+    /// Returns the number of retained buffer resources.
     #[must_use]
     pub fn retained_buffer_count(&self) -> usize {
-        self.retained_buffers.len()
+        self.retained_resources
+            .iter()
+            .filter_map(|resource| match resource {
+                RetainedDescriptorResource::Buffer(buffer) => {
+                    let _ = buffer.handle();
+                    Some(())
+                }
+                _ => None,
+            })
+            .count()
+    }
+
+    /// Returns the number of retained image views.
+    #[must_use]
+    pub fn retained_image_view_count(&self) -> usize {
+        self.retained_resources
+            .iter()
+            .filter_map(|resource| match resource {
+                RetainedDescriptorResource::ImageView(view) => {
+                    let _ = view.handle();
+                    Some(())
+                }
+                _ => None,
+            })
+            .count()
+    }
+
+    /// Returns the number of retained samplers.
+    #[must_use]
+    pub fn retained_sampler_count(&self) -> usize {
+        self.retained_resources
+            .iter()
+            .filter_map(|resource| match resource {
+                RetainedDescriptorResource::Sampler(sampler) => {
+                    let _ = sampler.handle();
+                    Some(())
+                }
+                _ => None,
+            })
+            .count()
     }
 }
 
-impl Drop for DescriptorResourceLease<'_, '_, '_, '_, '_> {
+impl Drop for DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {
     fn drop(&mut self) {
         if let Err(error) = self.set._pool.device.wait_idle() {
             tracing::warn!(
@@ -380,9 +573,9 @@ impl Drop for DescriptorResourceLease<'_, '_, '_, '_, '_> {
     }
 }
 
-fn validate_complete_buffer_write_set(
+fn validate_complete_descriptor_write_set(
     layout: &DescriptorSetLayoutConfig,
-    seen: &[(u32, u32)],
+    seen: &HashSet<(u32, u32)>,
 ) -> Result<(), VulkanError> {
     let mut expected_count = 0_usize;
     for binding in &layout.bindings {
@@ -392,8 +585,12 @@ fn validate_complete_buffer_write_set(
                 | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
                 | vk::DescriptorType::STORAGE_BUFFER
                 | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                | vk::DescriptorType::SAMPLED_IMAGE
+                | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                | vk::DescriptorType::STORAGE_IMAGE
+                | vk::DescriptorType::SAMPLER
         ) {
-            return Err(VulkanError::UnsupportedBufferDescriptorType);
+            return Err(VulkanError::UnsupportedDescriptorType);
         }
         expected_count = expected_count
             .checked_add(binding.descriptor_count as usize)
@@ -410,16 +607,125 @@ fn validate_complete_buffer_write_set(
     Ok(())
 }
 
+fn validate_sampler_descriptor_binding(binding: &DescriptorBinding) -> Result<(), VulkanError> {
+    if binding.descriptor_type == vk::DescriptorType::SAMPLER {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedDescriptorType)
+    }
+}
+
+fn validate_image_descriptor_write(
+    device: &VulkanDevice,
+    binding: &DescriptorBinding,
+    write: &ImageDescriptorWrite<'_, '_, '_>,
+) -> Result<(), VulkanError> {
+    let image = write.view.image();
+    validate_image_descriptor_metadata(
+        binding,
+        write.sampler.is_some(),
+        image.config().usage,
+        write.image_layout,
+        write.view.config().aspect,
+    )?;
+
+    let required_feature = match binding.descriptor_type {
+        vk::DescriptorType::COMBINED_IMAGE_SAMPLER | vk::DescriptorType::SAMPLED_IMAGE => {
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+        }
+        vk::DescriptorType::STORAGE_IMAGE => vk::FormatFeatureFlags::STORAGE_IMAGE,
+        _ => return Err(VulkanError::UnsupportedDescriptorType),
+    };
+    // SAFETY: The physical device is owned by the instance retained by this live device.
+    let format_properties = unsafe {
+        device
+            ._instance
+            .handle
+            .get_physical_device_format_properties(device.physical_device, image.config().format)
+    };
+    let available_features = if image.config().tiling == vk::ImageTiling::LINEAR {
+        format_properties.linear_tiling_features
+    } else {
+        format_properties.optimal_tiling_features
+    };
+    validate_image_format_feature(required_feature, available_features)
+}
+
+fn validate_image_format_feature(
+    required: vk::FormatFeatureFlags,
+    available: vk::FormatFeatureFlags,
+) -> Result<(), VulkanError> {
+    if available.contains(required) {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedImageFormatFeature)
+    }
+}
+
+fn validate_image_descriptor_metadata(
+    binding: &DescriptorBinding,
+    has_sampler: bool,
+    usage: vk::ImageUsageFlags,
+    image_layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
+) -> Result<(), VulkanError> {
+    if image_layout == vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        && !aspect.intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+    {
+        return Err(VulkanError::InvalidImageDescriptor);
+    }
+    match binding.descriptor_type {
+        vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
+            if !has_sampler {
+                return Err(VulkanError::DescriptorSamplerRequired);
+            }
+            if !usage.contains(vk::ImageUsageFlags::SAMPLED)
+                || !matches!(
+                    image_layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::GENERAL
+                )
+            {
+                return Err(VulkanError::InvalidImageDescriptor);
+            }
+        }
+        vk::DescriptorType::SAMPLED_IMAGE => {
+            if has_sampler
+                || !usage.contains(vk::ImageUsageFlags::SAMPLED)
+                || !matches!(
+                    image_layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::GENERAL
+                )
+            {
+                return Err(VulkanError::InvalidImageDescriptor);
+            }
+        }
+        vk::DescriptorType::STORAGE_IMAGE => {
+            if has_sampler
+                || !usage.contains(vk::ImageUsageFlags::STORAGE)
+                || image_layout != vk::ImageLayout::GENERAL
+            {
+                return Err(VulkanError::InvalidImageDescriptor);
+            }
+        }
+        _ => return Err(VulkanError::UnsupportedDescriptorType),
+    }
+    Ok(())
+}
+
 fn validate_unique_descriptor_write(
-    seen: &mut Vec<(u32, u32)>,
+    seen: &mut HashSet<(u32, u32)>,
     binding: u32,
     array_element: u32,
 ) -> Result<(), VulkanError> {
-    if seen.contains(&(binding, array_element)) {
-        return Err(VulkanError::DuplicateDescriptorWrite);
+    if seen.insert((binding, array_element)) {
+        Ok(())
+    } else {
+        Err(VulkanError::DuplicateDescriptorWrite)
     }
-    seen.push((binding, array_element));
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -518,11 +824,13 @@ mod tests {
     use super::{
         BufferDescriptorLimits, BufferDescriptorMetadata, DescriptorBinding, DescriptorPoolConfig,
         DescriptorPoolSize, DescriptorSetLayoutConfig, validate_buffer_descriptor_write,
-        validate_complete_buffer_write_set, validate_layout_config, validate_pool_config,
-        validate_unique_descriptor_write,
+        validate_complete_descriptor_write_set, validate_image_descriptor_metadata,
+        validate_image_format_feature, validate_layout_config, validate_pool_config,
+        validate_sampler_descriptor_binding, validate_unique_descriptor_write,
     };
     use crate::VulkanError;
     use ash::vk;
+    use std::collections::HashSet;
 
     fn uniform_binding() -> DescriptorBinding {
         DescriptorBinding {
@@ -538,9 +846,12 @@ mod tests {
         let layout = DescriptorSetLayoutConfig {
             bindings: vec![uniform_binding()],
         };
-        assert!(validate_complete_buffer_write_set(&layout, &[(0, 0), (0, 1)]).is_ok());
+        assert!(
+            validate_complete_descriptor_write_set(&layout, &HashSet::from([(0, 0), (0, 1)]))
+                .is_ok()
+        );
         assert!(matches!(
-            validate_complete_buffer_write_set(&layout, &[(0, 0)]),
+            validate_complete_descriptor_write_set(&layout, &HashSet::from([(0, 0)])),
             Err(VulkanError::IncompleteDescriptorWrite)
         ));
         let mixed_layout = DescriptorSetLayoutConfig {
@@ -555,14 +866,21 @@ mod tests {
             ],
         };
         assert!(matches!(
-            validate_complete_buffer_write_set(&mixed_layout, &[(0, 0), (0, 1)]),
-            Err(VulkanError::UnsupportedBufferDescriptorType)
+            validate_complete_descriptor_write_set(&mixed_layout, &HashSet::from([(0, 0), (0, 1)]),),
+            Err(VulkanError::IncompleteDescriptorWrite)
         ));
+        assert!(
+            validate_complete_descriptor_write_set(
+                &mixed_layout,
+                &HashSet::from([(0, 0), (0, 1), (1, 0)]),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn rejects_duplicate_binding_array_element_updates() {
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         assert!(validate_unique_descriptor_write(&mut seen, 2, 0).is_ok());
         assert!(validate_unique_descriptor_write(&mut seen, 2, 1).is_ok());
         assert!(matches!(
@@ -724,6 +1042,131 @@ mod tests {
                 },
             ),
             Err(VulkanError::InvalidBufferDescriptorRange)
+        ));
+    }
+
+    #[test]
+    fn validates_combined_sampled_and_storage_image_descriptor_contracts() {
+        let combined = DescriptorBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        };
+        assert!(
+            validate_image_descriptor_metadata(
+                &combined,
+                true,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_image_descriptor_metadata(
+                &combined,
+                false,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Err(VulkanError::DescriptorSamplerRequired)
+        ));
+
+        let sampled = DescriptorBinding {
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            ..combined
+        };
+        assert!(
+            validate_image_descriptor_metadata(
+                &sampled,
+                false,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::GENERAL,
+                vk::ImageAspectFlags::COLOR,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_image_descriptor_metadata(
+                &sampled,
+                true,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::GENERAL,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Err(VulkanError::InvalidImageDescriptor)
+        ));
+
+        assert!(matches!(
+            validate_image_descriptor_metadata(
+                &sampled,
+                false,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Err(VulkanError::InvalidImageDescriptor)
+        ));
+
+        let storage = DescriptorBinding {
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            ..combined
+        };
+        assert!(
+            validate_image_descriptor_metadata(
+                &storage,
+                false,
+                vk::ImageUsageFlags::STORAGE,
+                vk::ImageLayout::GENERAL,
+                vk::ImageAspectFlags::COLOR,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_image_descriptor_metadata(
+                &storage,
+                false,
+                vk::ImageUsageFlags::SAMPLED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Err(VulkanError::InvalidImageDescriptor)
+        ));
+    }
+
+    #[test]
+    fn validates_sampler_only_descriptor_bindings() {
+        let sampler = DescriptorBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::SAMPLER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        };
+        assert!(validate_sampler_descriptor_binding(&sampler).is_ok());
+        assert!(matches!(
+            validate_sampler_descriptor_binding(&uniform_binding()),
+            Err(VulkanError::UnsupportedDescriptorType)
+        ));
+    }
+
+    #[test]
+    fn validates_physical_device_image_format_features() {
+        assert!(
+            validate_image_format_feature(
+                vk::FormatFeatureFlags::SAMPLED_IMAGE,
+                vk::FormatFeatureFlags::SAMPLED_IMAGE
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_image_format_feature(
+                vk::FormatFeatureFlags::STORAGE_IMAGE,
+                vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            ),
+            Err(VulkanError::UnsupportedImageFormatFeature)
         ));
     }
 

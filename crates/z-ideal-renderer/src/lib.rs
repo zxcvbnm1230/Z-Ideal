@@ -22,7 +22,8 @@ mod sync;
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use descriptor::{
     BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
-    DescriptorResourceLease, DescriptorSetLayoutConfig, VulkanDescriptorPool, VulkanDescriptorSet,
+    DescriptorResourceLease, DescriptorResourceWrite, DescriptorSetLayoutConfig,
+    ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet,
     VulkanDescriptorSetLayout,
 };
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
@@ -228,9 +229,21 @@ pub enum VulkanError {
     /// The descriptor buffer offset or range violates device limits or buffer bounds.
     #[error("Vulkan descriptor buffer offset or range is invalid")]
     InvalidBufferDescriptorRange,
-    /// A buffer-only descriptor update does not populate every layout slot.
-    #[error("Vulkan buffer descriptor update must populate every binding array element")]
+    /// A descriptor update does not populate every layout slot.
+    #[error("Vulkan descriptor update must populate every binding array element")]
     IncompleteDescriptorWrite,
+    /// The descriptor type is not supported by the current descriptor update API.
+    #[error("Vulkan descriptor type is not supported by the current update API")]
+    UnsupportedDescriptorType,
+    /// A combined image-sampler descriptor requires a sampler resource.
+    #[error("combined image-sampler descriptor requires a sampler")]
+    DescriptorSamplerRequired,
+    /// Image usage or layout does not match the descriptor declaration.
+    #[error("Vulkan image usage or layout is incompatible with its descriptor type")]
+    InvalidImageDescriptor,
+    /// The physical device does not support the image format feature required by the descriptor.
+    #[error("Vulkan image format does not support the descriptor's sampling or storage operation")]
+    UnsupportedImageFormatFeature,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {

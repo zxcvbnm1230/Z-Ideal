@@ -56,7 +56,7 @@ impl Default for SamplerConfig {
 /// The sampler does not own an image or image view. Descriptor bindings and
 /// resource synchronization remain the caller's responsibility.
 pub struct VulkanSampler<'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::Sampler,
     config: SamplerConfig,
 }
