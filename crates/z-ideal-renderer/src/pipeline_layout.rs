@@ -232,6 +232,7 @@ mod tests {
                 descriptor_count: 2,
                 stage: vk::ShaderStageFlags::VERTEX,
             }],
+            vertex_inputs: vec![],
             push_constant_size: Some(32),
         };
         let layouts = [&layout];
@@ -270,6 +271,7 @@ mod tests {
                 descriptor_count: 2,
                 stage: vk::ShaderStageFlags::VERTEX,
             }],
+            vertex_inputs: vec![],
             push_constant_size: None,
         };
         assert!(matches!(

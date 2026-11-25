@@ -74,6 +74,15 @@ pub struct ShaderDescriptorBinding {
     pub stage: vk::ShaderStageFlags,
 }
 
+/// Vertex-buffer input reflected from a vertex shader location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShaderVertexInput {
+    /// Shader input location.
+    pub location: u32,
+    /// Vulkan vertex format required by the shader declaration.
+    pub format: vk::Format,
+}
+
 /// Reflected resource interface for one shader entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaderReflection {
@@ -83,6 +92,8 @@ pub struct ShaderReflection {
     pub entry_point: String,
     /// Descriptor bindings sorted by set and binding.
     pub descriptors: Vec<ShaderDescriptorBinding>,
+    /// Vertex input locations and formats; empty for non-vertex stages.
+    pub vertex_inputs: Vec<ShaderVertexInput>,
     /// Push-constant block size in bytes, if declared.
     pub push_constant_size: Option<u32>,
 }
@@ -132,6 +143,10 @@ impl<'device> VulkanShaderModule<'device> {
     }
 
     /// Creates a Vulkan shader module from precompiled SPIR-V words and reflects them.
+    ///
+    /// The input must be a valid Vulkan 1.0 / SPIR-V 1.0 module. This path checks
+    /// the binary header and the resource/type structures needed for reflection;
+    /// it does not replace the full shaderc validation performed by [`compile_glsl`].
     pub fn from_spirv(
         device: &'device VulkanDevice,
         spirv: &[u32],
@@ -266,6 +281,8 @@ const OP_VARIABLE: u16 = 59;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 
+const DECORATION_BUILT_IN: u32 = 11;
+const DECORATION_LOCATION: u32 = 30;
 const DECORATION_BLOCK: u32 = 2;
 const DECORATION_BUFFER_BLOCK: u32 = 3;
 const DECORATION_ROW_MAJOR: u32 = 4;
@@ -276,6 +293,7 @@ const DECORATION_DESCRIPTOR_SET: u32 = 34;
 const DECORATION_OFFSET: u32 = 35;
 
 const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
+const STORAGE_CLASS_INPUT: u32 = 1;
 const STORAGE_CLASS_UNIFORM: u32 = 2;
 const STORAGE_CLASS_PUSH_CONSTANT: u32 = 9;
 const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
@@ -283,7 +301,7 @@ const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
 #[derive(Debug, Clone)]
 enum SpirvType {
     Bool,
-    Int { width: u32 },
+    Int { width: u32, signed: bool },
     Float { width: u32 },
     Vector { component: u32, count: u32 },
     Matrix { column: u32, count: u32 },
@@ -303,6 +321,8 @@ struct Decorations {
     block: bool,
     buffer_block: bool,
     array_stride: Option<u32>,
+    location: Option<u32>,
+    built_in: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -331,6 +351,7 @@ struct SpirvModule {
 fn reflect_spirv(words: &[u32], stage: ShaderStage) -> Result<ShaderReflection, VulkanError> {
     let module = parse_spirv(words)?;
     let mut descriptors = Vec::new();
+    let mut vertex_inputs = Vec::new();
     let mut push_constant_size = None;
 
     for variable in &module.variables {
@@ -347,6 +368,23 @@ fn reflect_spirv(words: &[u32], stage: ShaderStage) -> Result<ShaderReflection, 
         };
         if *storage_class != variable.storage_class {
             return Err(VulkanError::InvalidSpirv);
+        }
+
+        if variable.storage_class == STORAGE_CLASS_INPUT && stage == ShaderStage::Vertex {
+            let decorations = module
+                .decorations
+                .get(&variable.id)
+                .copied()
+                .unwrap_or_default();
+            if decorations.built_in {
+                continue;
+            }
+            let location = decorations
+                .location
+                .ok_or(VulkanError::UnsupportedShaderResource)?;
+            let format = module.vertex_input_format(*pointee)?;
+            vertex_inputs.push(ShaderVertexInput { location, format });
+            continue;
         }
 
         if variable.storage_class == STORAGE_CLASS_PUSH_CONSTANT {
@@ -388,6 +426,12 @@ fn reflect_spirv(words: &[u32], stage: ShaderStage) -> Result<ShaderReflection, 
     }
 
     descriptors.sort_unstable();
+    vertex_inputs.sort_unstable();
+    for pair in vertex_inputs.windows(2) {
+        if pair[0].location == pair[1].location {
+            return Err(VulkanError::UnsupportedShaderResource);
+        }
+    }
     for pair in descriptors.windows(2) {
         if pair[0].set == pair[1].set && pair[0].binding == pair[1].binding {
             return Err(VulkanError::DuplicateShaderDescriptorBinding);
@@ -398,6 +442,7 @@ fn reflect_spirv(words: &[u32], stage: ShaderStage) -> Result<ShaderReflection, 
         stage,
         entry_point: "main".to_owned(),
         descriptors,
+        vertex_inputs,
         push_constant_size,
     })
 }
@@ -430,9 +475,13 @@ fn parse_spirv(words: &[u32]) -> Result<SpirvModule, VulkanError> {
                 module.types.insert(operands[0], SpirvType::Bool);
             }
             OP_TYPE_INT if operands.len() >= 3 => {
-                module
-                    .types
-                    .insert(operands[0], SpirvType::Int { width: operands[1] });
+                module.types.insert(
+                    operands[0],
+                    SpirvType::Int {
+                        width: operands[1],
+                        signed: operands[2] != 0,
+                    },
+                );
             }
             OP_TYPE_FLOAT if operands.len() >= 2 => {
                 module
@@ -523,6 +572,10 @@ fn parse_spirv(words: &[u32]) -> Result<SpirvModule, VulkanError> {
                     DECORATION_BUFFER_BLOCK => decorations.buffer_block = true,
                     DECORATION_ARRAY_STRIDE if operands.len() >= 3 => {
                         decorations.array_stride = Some(operands[2]);
+                    }
+                    DECORATION_BUILT_IN => decorations.built_in = true,
+                    DECORATION_LOCATION if operands.len() >= 3 => {
+                        decorations.location = Some(operands[2]);
                     }
                     DECORATION_BINDING if operands.len() >= 3 => {
                         decorations.binding = Some(operands[2]);
@@ -621,6 +674,82 @@ impl SpirvModule {
         Ok((descriptor_type, count))
     }
 
+    fn vertex_input_format(&self, type_id: u32) -> Result<vk::Format, VulkanError> {
+        let (scalar_type, components) =
+            match self.types.get(&type_id).ok_or(VulkanError::InvalidSpirv)? {
+                SpirvType::Vector { component, count } => (*component, *count),
+                _ => (type_id, 1),
+            };
+        let scalar = self
+            .types
+            .get(&scalar_type)
+            .ok_or(VulkanError::InvalidSpirv)?;
+        let format = match (scalar, components) {
+            (SpirvType::Float { width: 32 }, 1) => vk::Format::R32_SFLOAT,
+            (SpirvType::Float { width: 32 }, 2) => vk::Format::R32G32_SFLOAT,
+            (SpirvType::Float { width: 32 }, 3) => vk::Format::R32G32B32_SFLOAT,
+            (SpirvType::Float { width: 32 }, 4) => vk::Format::R32G32B32A32_SFLOAT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: true,
+                },
+                1,
+            ) => vk::Format::R32_SINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: true,
+                },
+                2,
+            ) => vk::Format::R32G32_SINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: true,
+                },
+                3,
+            ) => vk::Format::R32G32B32_SINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: true,
+                },
+                4,
+            ) => vk::Format::R32G32B32A32_SINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: false,
+                },
+                1,
+            ) => vk::Format::R32_UINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: false,
+                },
+                2,
+            ) => vk::Format::R32G32_UINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: false,
+                },
+                3,
+            ) => vk::Format::R32G32B32_UINT,
+            (
+                SpirvType::Int {
+                    width: 32,
+                    signed: false,
+                },
+                4,
+            ) => vk::Format::R32G32B32A32_UINT,
+            _ => return Err(VulkanError::UnsupportedShaderResource),
+        };
+        Ok(format)
+    }
+
     fn type_size(
         &self,
         type_id: u32,
@@ -633,7 +762,7 @@ impl SpirvModule {
         }
         match self.types.get(&type_id).ok_or(VulkanError::InvalidSpirv)? {
             SpirvType::Bool => Ok(4),
-            SpirvType::Int { width } | SpirvType::Float { width }
+            SpirvType::Int { width, .. } | SpirvType::Float { width }
                 if *width > 0 && width % 8 == 0 =>
             {
                 Ok(width / 8)
@@ -712,7 +841,8 @@ impl SpirvModule {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShaderCompileConfig, ShaderDescriptorBinding, ShaderStage, compile_glsl, parse_spirv,
+        ShaderCompileConfig, ShaderDescriptorBinding, ShaderStage, ShaderVertexInput, compile_glsl,
+        parse_spirv,
     };
     use ash::vk;
 
@@ -814,6 +944,27 @@ void main() { gl_Position = push_data.transform * vec4(0.0, 0.0, 0.0, 1.0); }
         config.defines.insert("VALUE".to_owned(), "0.5".to_owned());
         let shader = compile_glsl(source, &config).expect("defined shader compiles");
         assert_eq!(shader.spirv[0], 0x0723_0203);
+    }
+
+    #[test]
+    fn reflects_vertex_input_locations_and_formats() {
+        let shader = compile_glsl(
+            "#version 450 core\nlayout(location = 0) in vec3 position;\nlayout(location = 1) in vec2 uv;\nvoid main() { gl_Position = vec4(position + vec3(uv, 0.0), 1.0); }",
+            &ShaderCompileConfig::new(ShaderStage::Vertex),
+        ).expect("vertex inputs compile");
+        assert_eq!(
+            shader.reflection.vertex_inputs,
+            vec![
+                ShaderVertexInput {
+                    location: 0,
+                    format: vk::Format::R32G32B32_SFLOAT
+                },
+                ShaderVertexInput {
+                    location: 1,
+                    format: vk::Format::R32G32_SFLOAT
+                },
+            ]
+        );
     }
 
     #[test]
