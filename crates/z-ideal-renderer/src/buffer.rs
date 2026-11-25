@@ -130,7 +130,7 @@ impl<'device> VulkanBuffer<'device> {
         self.validate_range(offset, bytes.len())?;
         if bytes.is_empty() { return Ok(()); }
         self.ensure_host_visible()?;
-        let pointer_offset = self.pointer_offset(offset)?;
+        let pointer_offset = self.pointer_offset(offset, bytes.len())?;
         // SAFETY: The allocation is live and not mapped elsewhere through this exclusive borrow.
         let mapped = unsafe {
             self.device.handle.map_memory(
@@ -152,7 +152,7 @@ impl<'device> VulkanBuffer<'device> {
         self.validate_range(offset, output.len())?;
         if output.is_empty() { return Ok(()); }
         self.ensure_host_visible()?;
-        let pointer_offset = self.pointer_offset(offset)?;
+        let pointer_offset = self.pointer_offset(offset, output.len())?;
         // SAFETY: The allocation is live and not mapped elsewhere through this exclusive borrow.
         let mapped = unsafe {
             self.device.handle.map_memory(
@@ -183,10 +183,13 @@ impl<'device> VulkanBuffer<'device> {
         Ok(())
     }
 
-    fn pointer_offset(&self, offset: u64) -> Result<usize, VulkanError> {
-        let value = usize::try_from(offset).map_err(|_| VulkanError::BufferOffsetTooLarge)?;
-        if value > isize::MAX as usize { return Err(VulkanError::BufferOffsetTooLarge); }
-        Ok(value)
+    fn pointer_offset(&self, offset: u64, length: usize) -> Result<usize, VulkanError> {
+        let end = offset.checked_add(length as u64)
+            .ok_or(VulkanError::BufferOffsetTooLarge)?;
+        if end > isize::MAX as u64 {
+            return Err(VulkanError::BufferOffsetTooLarge);
+        }
+        usize::try_from(offset).map_err(|_| VulkanError::BufferOffsetTooLarge)
     }
 
     fn ensure_host_visible(&self) -> Result<(), VulkanError> {
