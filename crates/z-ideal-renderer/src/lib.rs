@@ -10,10 +10,12 @@ use ash::{Entry, vk};
 use thiserror::Error;
 use winit::window::Window;
 
+mod buffer;
 mod surface;
 mod swapchain;
 mod sync;
 
+pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
@@ -105,6 +107,31 @@ pub enum VulkanError {
     /// Image acquisition requires either a semaphore or fence.
     #[error("swapchain image acquisition requires a semaphore or fence")]
     MissingAcquireSynchronization,
+    /// A Vulkan buffer must have a nonzero size.
+    #[error("Vulkan buffer size must be greater than zero")]
+    InvalidBufferSize,
+    /// A Vulkan buffer must declare at least one usage flag.
+    #[error("Vulkan buffer usage must not be empty")]
+    InvalidBufferUsage,
+    /// No compatible memory type satisfies the required properties.
+    #[error("no compatible Vulkan memory type satisfies required flags {required:?}")]
+    NoCompatibleMemoryType { required: vk::MemoryPropertyFlags },
+    /// A host read or write range is outside the logical buffer size.
+    #[error("buffer range offset {offset} length {length} exceeds buffer size {capacity}")]
+    BufferRangeOutOfBounds {
+        offset: vk::DeviceSize,
+        length: vk::DeviceSize,
+        capacity: vk::DeviceSize,
+    },
+    /// The selected buffer allocation is not host-visible.
+    #[error("Vulkan buffer memory is not host-visible")]
+    BufferNotHostVisible,
+    /// A host buffer offset cannot be represented as a Rust pointer offset.
+    #[error("Vulkan buffer offset exceeds the host addressable range")]
+    BufferOffsetTooLarge,
+    /// A non-coherent mapped-memory range could not be safely aligned.
+    #[error("Vulkan mapped-memory range alignment overflowed or exceeded its allocation")]
+    BufferMemoryRangeOverflow,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
