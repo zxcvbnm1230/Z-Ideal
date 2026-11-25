@@ -31,10 +31,7 @@ pub struct VulkanFence<'device> {
 
 impl<'device> VulkanFence<'device> {
     /// Creates a fence owned by the supplied logical device.
-    pub fn new(
-        device: &'device VulkanDevice,
-        config: FenceConfig,
-    ) -> Result<Self, VulkanError> {
+    pub fn new(device: &'device VulkanDevice, config: FenceConfig) -> Result<Self, VulkanError> {
         let flags = if config.signaled {
             vk::FenceCreateFlags::SIGNALED
         } else {
@@ -98,7 +95,10 @@ impl<'device> VulkanFence<'device> {
 impl Drop for VulkanFence<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(?error, "Vulkan device idle wait failed before fence destruction");
+            tracing::warn!(
+                ?error,
+                "Vulkan device idle wait failed before fence destruction"
+            );
         }
         // SAFETY: This owner uniquely owns the fence and retains its parent device.
         unsafe { self.device.handle().destroy_fence(self.handle, None) };
@@ -139,14 +139,13 @@ impl<'device> VulkanSemaphore<'device> {
 impl Drop for VulkanSemaphore<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(?error, "Vulkan device idle wait failed before semaphore destruction");
+            tracing::warn!(
+                ?error,
+                "Vulkan device idle wait failed before semaphore destruction"
+            );
         }
         // SAFETY: This owner uniquely owns the semaphore and retains its parent device.
-        unsafe {
-            self.device
-                .handle()
-                .destroy_semaphore(self.handle, None)
-        };
+        unsafe { self.device.handle().destroy_semaphore(self.handle, None) };
     }
 }
 
