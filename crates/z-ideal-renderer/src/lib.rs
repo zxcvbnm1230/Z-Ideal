@@ -11,6 +11,7 @@ use thiserror::Error;
 use winit::window::Window;
 
 mod buffer;
+mod descriptor;
 mod image;
 mod sampler;
 mod surface;
@@ -18,6 +19,10 @@ mod swapchain;
 mod sync;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
+pub use descriptor::{
+    DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize, DescriptorSetLayoutConfig,
+    VulkanDescriptorPool, VulkanDescriptorSet, VulkanDescriptorSetLayout,
+};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use sampler::{SamplerConfig, VulkanSampler};
 pub use surface::VulkanSurface;
@@ -184,6 +189,15 @@ pub enum VulkanError {
     /// Sampler anisotropy was requested but the logical-device feature is unavailable.
     #[error("Vulkan sampler anisotropy feature is not enabled on this device")]
     SamplerAnisotropyUnavailable,
+    /// Descriptor-set layout bindings are invalid or duplicated.
+    #[error("Vulkan descriptor-set layout contains an invalid or duplicate binding")]
+    InvalidDescriptorSetLayoutBinding,
+    /// Descriptor-pool capacities are empty, zero, or duplicated.
+    #[error("Vulkan descriptor-pool configuration is invalid")]
+    InvalidDescriptorPoolConfig,
+    /// Descriptor pool and set layout belong to different logical devices.
+    #[error("Vulkan descriptor pool and set layout belong to different devices")]
+    DescriptorSetDeviceMismatch,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {

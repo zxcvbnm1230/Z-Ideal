@@ -33,12 +33,13 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Explicitly owned Vulkan buffers with one dedicated allocation per buffer, deterministic memory-type selection, required device-local or host-visible memory policies, upload/readback preference scoring, bounds-checked host access, and atom-aligned non-coherent cache maintenance. Host access does not implicitly wait for queues or insert memory barriers; callers own GPU/host synchronization, including synchronization for any atom-expanded cache range.
 - Explicitly owned Vulkan images with dedicated compatible memory allocations, device-local memory preference, validated dimensionality/mip/layer/sample configuration, and image views whose Rust lifetimes are bounded by their parent images. Image layout transitions, barriers, queue ownership transfers, allocator pooling, and deferred retirement remain caller/future-scheduler responsibilities.
 - Explicitly owned Vulkan samplers with validated LOD ranges/bias, optional depth comparison, and device-limit-checked anisotropy. Logical-device creation enables sampler anisotropy only when supported; sampler ownership is device-borrowed and destruction waits for device idle.
+- Owned descriptor-set layouts and descriptor pools with validated bindings/capacities, device identity checks, and descriptor-set wrappers that borrow their pool and layout. Descriptor writes/resource retention and update synchronization are intentionally not exposed until their lifetime contract is implemented.
 - Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
 
 - Higher-level frame scheduling, including redraw, pause, minimized-window behavior, and reusable per-frame synchronization policy.
-- Descriptor-set layouts/pools/sets, pipeline layouts, and graphics/compute pipelines remain outstanding. Buffer and image resources currently use dedicated allocations; allocator pooling and deferred resource retirement remain outstanding.
+- Descriptor resource writes and updates, pipeline layouts, and graphics/compute pipelines remain outstanding. Buffer and image resources currently use dedicated allocations; allocator pooling and deferred resource retirement remain outstanding.
 
 - Shader compiler integration, reflection, and pipeline-layout validation.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.
