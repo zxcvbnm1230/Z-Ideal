@@ -101,6 +101,13 @@ pub struct VulkanInstance {
 impl VulkanInstance {
     /// Loads Vulkan and creates an instance after checking requested capabilities.
     pub fn new(config: &VulkanConfig) -> Result<Self, VulkanError> {
+        Self::new_with_extensions(config, &[])
+    }
+
+    fn new_with_extensions(
+        config: &VulkanConfig,
+        required_extensions: &[CString],
+    ) -> Result<Self, VulkanError> {
         let application_name = CString::new(config.application_name.as_str())?;
         let engine_name = CString::new("Z Ideal")?;
 
@@ -120,6 +127,19 @@ impl VulkanInstance {
         };
 
         let mut enabled_extensions = Vec::<CString>::new();
+        for required in required_extensions {
+            if !has_extension(&available_extensions, required.as_c_str()) {
+                return Err(VulkanError::MissingInstanceExtension(
+                    required.to_string_lossy().into_owned(),
+                ));
+            }
+            if !enabled_extensions
+                .iter()
+                .any(|enabled| enabled.as_c_str() == required.as_c_str())
+            {
+                enabled_extensions.push(required.clone());
+            }
+        }
         let mut flags = vk::InstanceCreateFlags::empty();
 
         if config.enable_validation {
@@ -561,7 +581,11 @@ impl VulkanContext {
 
     /// Creates an instance, window surface, presentation-capable device and queues.
     pub fn new_for_window(config: &VulkanConfig, window: &Window) -> Result<Self, VulkanError> {
-        let instance = Arc::new(VulkanInstance::new(config)?);
+        let required_extensions = surface::required_instance_extensions(window)?;
+        let instance = Arc::new(VulkanInstance::new_with_extensions(
+            config,
+            &required_extensions,
+        )?);
         let surface = VulkanSurface::new(Arc::clone(&instance), window)?;
         let device = VulkanDevice::new_for_surface(Arc::clone(&instance), &surface)?;
         Ok(Self {
