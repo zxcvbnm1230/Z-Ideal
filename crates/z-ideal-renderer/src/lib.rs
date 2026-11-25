@@ -543,6 +543,7 @@ impl Drop for VulkanDevice {
 /// Owns a Vulkan instance and logical device for one renderer session.
 pub struct VulkanContext {
     instance: Arc<VulkanInstance>,
+    surface: Option<VulkanSurface>,
     device: VulkanDevice,
 }
 
@@ -551,7 +552,29 @@ impl VulkanContext {
     pub fn new(config: &VulkanConfig) -> Result<Self, VulkanError> {
         let instance = Arc::new(VulkanInstance::new(config)?);
         let device = VulkanDevice::new(Arc::clone(&instance))?;
-        Ok(Self { instance, device })
+        Ok(Self {
+            instance,
+            surface: None,
+            device,
+        })
+    }
+
+    /// Creates an instance, window surface, presentation-capable device and queues.
+    pub fn new_for_window(config: &VulkanConfig, window: &Window) -> Result<Self, VulkanError> {
+        let instance = Arc::new(VulkanInstance::new(config)?);
+        let surface = VulkanSurface::new(Arc::clone(&instance), window)?;
+        let device = VulkanDevice::new_for_surface(Arc::clone(&instance), &surface)?;
+        Ok(Self {
+            instance,
+            surface: Some(surface),
+            device,
+        })
+    }
+
+    /// Returns the optional presentation surface.
+    #[must_use]
+    pub fn surface(&self) -> Option<&VulkanSurface> {
+        self.surface.as_ref()
     }
 
     /// Returns the instance owner.
