@@ -360,8 +360,10 @@ impl VulkanDevice {
         if has_extension(&available_extensions, PORTABILITY_SUBSET_EXTENSION) {
             enabled_extensions.push(PORTABILITY_SUBSET_EXTENSION.to_owned());
         }
-        let extension_pointers: Vec<*const i8> =
-            enabled_extensions.iter().map(|name| name.as_ptr()).collect();
+        let extension_pointers: Vec<*const i8> = enabled_extensions
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect();
         let priorities = [1.0_f32];
         let queue_info = [vk::DeviceQueueCreateInfo {
             queue_family_index: graphics_queue_family,
