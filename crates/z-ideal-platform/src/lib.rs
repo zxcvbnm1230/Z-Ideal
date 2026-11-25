@@ -1,6 +1,10 @@
 //! Cross-platform native window and event-loop integration.
 #![forbid(unsafe_code)]
 
+pub mod input;
+
+pub use input::{InputState, ScrollDelta};
+
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,

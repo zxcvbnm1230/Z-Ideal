@@ -8,6 +8,13 @@ use std::{
 
 use ash::{Entry, vk};
 use thiserror::Error;
+use winit::window::Window;
+
+mod surface;
+mod swapchain;
+
+pub use surface::VulkanSurface;
+pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";
@@ -16,6 +23,7 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION: &CStr = c"VK_EXT_debug_utils";
 const PORTABILITY_ENUMERATION_EXTENSION: &CStr = c"VK_KHR_portability_enumeration";
 const PORTABILITY_SUBSET_EXTENSION: &CStr = c"VK_KHR_portability_subset";
+const SWAPCHAIN_EXTENSION: &CStr = ash::khr::swapchain::NAME;
 
 /// Vulkan instance and device creation options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +67,42 @@ pub enum VulkanError {
     /// No graphics-capable device is available.
     #[error("no Vulkan physical device exposes a graphics-capable queue family")]
     NoGraphicsDevice,
+    /// No graphics device can present to the selected window surface.
+    #[error("no Vulkan physical device supports both graphics and presentation for this surface")]
+    NoPresentDevice,
+    /// Native surface creation or compatibility failed.
+    #[error("Vulkan surface operation failed: {0}")]
+    Surface(String),
+    /// No surface format is available.
+    #[error("the Vulkan surface exposes no image formats")]
+    NoSurfaceFormats,
+    /// No presentation mode is available.
+    #[error("the Vulkan surface exposes no presentation modes")]
+    NoPresentModes,
+    /// The selected surface cannot be used as a color attachment.
+    #[error("the Vulkan surface does not support color-attachment swapchain images")]
+    UnsupportedSurfaceUsage,
+    /// No supported composite-alpha mode is available.
+    #[error("the Vulkan surface exposes no supported composite-alpha mode")]
+    NoCompositeAlphaMode,
+    /// The requested swapchain extent is zero, typically because the window is minimized.
+    #[error("the window has a zero drawable extent; swapchain creation is deferred")]
+    ZeroExtent,
+    /// No window surface is attached to this context.
+    #[error("this Vulkan context has no presentation surface")]
+    MissingSurface,
+    /// The logical device was created without presentation and swapchain support.
+    #[error("the Vulkan logical device was not created with presentation support")]
+    PresentationNotEnabled,
+    /// No swapchain is currently available.
+    #[error("no Vulkan swapchain is currently available")]
+    MissingSwapchain,
+    /// An image index is outside the current swapchain image range.
+    #[error("swapchain image index {index} is out of range for {image_count} images")]
+    InvalidSwapchainImageIndex { index: u32, image_count: usize },
+    /// Image acquisition requires either a semaphore or fence.
+    #[error("swapchain image acquisition requires a semaphore or fence")]
+    MissingAcquireSynchronization,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -89,6 +133,13 @@ pub struct VulkanInstance {
 impl VulkanInstance {
     /// Loads Vulkan and creates an instance after checking requested capabilities.
     pub fn new(config: &VulkanConfig) -> Result<Self, VulkanError> {
+        Self::new_with_extensions(config, &[])
+    }
+
+    fn new_with_extensions(
+        config: &VulkanConfig,
+        required_extensions: &[CString],
+    ) -> Result<Self, VulkanError> {
         let application_name = CString::new(config.application_name.as_str())?;
         let engine_name = CString::new("Z Ideal")?;
 
@@ -108,6 +159,19 @@ impl VulkanInstance {
         };
 
         let mut enabled_extensions = Vec::<CString>::new();
+        for required in required_extensions {
+            if !has_extension(&available_extensions, required.as_c_str()) {
+                return Err(VulkanError::MissingInstanceExtension(
+                    required.to_string_lossy().into_owned(),
+                ));
+            }
+            if !enabled_extensions
+                .iter()
+                .any(|enabled| enabled.as_c_str() == required.as_c_str())
+            {
+                enabled_extensions.push(required.clone());
+            }
+        }
         let mut flags = vk::InstanceCreateFlags::empty();
 
         if config.enable_validation {
@@ -284,12 +348,35 @@ pub struct VulkanDevice {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
+    present_queue: vk::Queue,
+    present_queue_family: u32,
+    presentation_enabled: bool,
     info: PhysicalDeviceInfo,
 }
 
 impl VulkanDevice {
     /// Selects a graphics-capable device and creates its logical device.
     pub fn new(instance: Arc<VulkanInstance>) -> Result<Self, VulkanError> {
+        Self::new_internal(instance, None)
+    }
+
+    /// Selects a device with graphics and presentation queues for a window surface.
+    pub fn new_for_surface(
+        instance: Arc<VulkanInstance>,
+        surface: &VulkanSurface,
+    ) -> Result<Self, VulkanError> {
+        if !Arc::ptr_eq(&instance, &surface.instance) {
+            return Err(VulkanError::Surface(
+                "surface and device must belong to the same Vulkan instance".to_owned(),
+            ));
+        }
+        Self::new_internal(instance, Some(surface))
+    }
+
+    fn new_internal(
+        instance: Arc<VulkanInstance>,
+        surface: Option<&VulkanSurface>,
+    ) -> Result<Self, VulkanError> {
         // SAFETY: The instance is live and retained by this device.
         let physical_devices = unsafe {
             instance
@@ -312,42 +399,83 @@ impl VulkanDevice {
                     .handle
                     .get_physical_device_queue_family_properties(physical_device)
             };
-            if let Some((queue_index, _)) = queue_families.iter().enumerate().find(|(_, family)| {
-                family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            }) {
-                // SAFETY: Vulkan provides a NUL-terminated device_name array.
-                let name = unsafe {
-                    CStr::from_ptr(properties.device_name.as_ptr())
-                        .to_string_lossy()
-                        .into_owned()
+            let Some((graphics_index, _)) =
+                queue_families.iter().enumerate().find(|(_, family)| {
+                    family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
+            else {
+                continue;
+            };
+            let graphics_queue_family = graphics_index as u32;
+
+            let present_queue_family = if let Some(surface) = surface {
+                let mut present_index = None;
+                for (index, family) in queue_families.iter().enumerate() {
+                    if family.queue_count == 0 {
+                        continue;
+                    }
+                    if surface.supports_present(physical_device, index as u32)? {
+                        present_index = Some(index as u32);
+                        break;
+                    }
+                }
+                let Some(present_index) = present_index else {
+                    continue;
                 };
-                candidates.push((
-                    physical_device,
-                    queue_index as u32,
-                    PhysicalDeviceInfo {
-                        name,
-                        device_type: properties.device_type,
-                        vendor_id: properties.vendor_id,
-                        device_id: properties.device_id,
-                        api_version: properties.api_version,
-                    },
-                ));
-            }
+
+                // Presentation-capable devices must expose the swapchain extension.
+                // SAFETY: physical_device belongs to the retained instance.
+                let extensions = unsafe {
+                    instance
+                        .handle
+                        .enumerate_device_extension_properties(physical_device)
+                        .map_err(|error| api_error("enumerate device extensions", error))?
+                };
+                if !has_extension(&extensions, SWAPCHAIN_EXTENSION) {
+                    continue;
+                }
+                present_index
+            } else {
+                graphics_queue_family
+            };
+
+            // SAFETY: Vulkan provides a NUL-terminated device_name array.
+            let name = unsafe {
+                CStr::from_ptr(properties.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            candidates.push((
+                physical_device,
+                graphics_queue_family,
+                present_queue_family,
+                PhysicalDeviceInfo {
+                    name,
+                    device_type: properties.device_type,
+                    vendor_id: properties.vendor_id,
+                    device_id: properties.device_id,
+                    api_version: properties.api_version,
+                },
+            ));
         }
 
         // Prefer discrete, then integrated, virtual, CPU and other devices.
         // Ties are resolved by stable reported identity fields.
         candidates.sort_by(|left, right| {
-            device_rank(right.2.device_type)
-                .cmp(&device_rank(left.2.device_type))
-                .then_with(|| left.2.name.cmp(&right.2.name))
-                .then_with(|| left.2.vendor_id.cmp(&right.2.vendor_id))
-                .then_with(|| left.2.device_id.cmp(&right.2.device_id))
+            device_rank(right.3.device_type)
+                .cmp(&device_rank(left.3.device_type))
+                .then_with(|| left.3.name.cmp(&right.3.name))
+                .then_with(|| left.3.vendor_id.cmp(&right.3.vendor_id))
+                .then_with(|| left.3.device_id.cmp(&right.3.device_id))
         });
-        let (physical_device, graphics_queue_family, info) = candidates
-            .into_iter()
-            .next()
-            .ok_or(VulkanError::NoGraphicsDevice)?;
+        let (physical_device, graphics_queue_family, present_queue_family, info) =
+            candidates.into_iter().next().ok_or_else(|| {
+                if surface.is_some() {
+                    VulkanError::NoPresentDevice
+                } else {
+                    VulkanError::NoGraphicsDevice
+                }
+            })?;
 
         // SAFETY: physical_device belongs to the retained instance.
         let available_extensions = unsafe {
@@ -357,6 +485,9 @@ impl VulkanDevice {
                 .map_err(|error| api_error("enumerate device extensions", error))?
         };
         let mut enabled_extensions = Vec::<CString>::new();
+        if surface.is_some() {
+            enabled_extensions.push(SWAPCHAIN_EXTENSION.to_owned());
+        }
         if has_extension(&available_extensions, PORTABILITY_SUBSET_EXTENSION) {
             enabled_extensions.push(PORTABILITY_SUBSET_EXTENSION.to_owned());
         }
@@ -365,12 +496,19 @@ impl VulkanDevice {
             .map(|name| name.as_ptr())
             .collect();
         let priorities = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo {
-            queue_family_index: graphics_queue_family,
-            queue_count: 1,
-            p_queue_priorities: priorities.as_ptr(),
-            ..Default::default()
-        }];
+        let mut queue_family_indices = vec![graphics_queue_family];
+        if present_queue_family != graphics_queue_family {
+            queue_family_indices.push(present_queue_family);
+        }
+        let queue_info: Vec<_> = queue_family_indices
+            .iter()
+            .map(|&queue_family_index| vk::DeviceQueueCreateInfo {
+                queue_family_index,
+                queue_count: 1,
+                p_queue_priorities: priorities.as_ptr(),
+                ..Default::default()
+            })
+            .collect();
         let device_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_info.len() as u32,
             p_queue_create_infos: queue_info.as_ptr(),
@@ -389,6 +527,8 @@ impl VulkanDevice {
         };
         // SAFETY: This queue family and queue index were included in device creation.
         let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_family, 0) };
+        // SAFETY: This queue family was included in logical-device creation.
+        let present_queue = unsafe { handle.get_device_queue(present_queue_family, 0) };
 
         Ok(Self {
             _instance: instance,
@@ -396,6 +536,9 @@ impl VulkanDevice {
             physical_device,
             graphics_queue,
             graphics_queue_family,
+            present_queue,
+            present_queue_family,
+            presentation_enabled: surface.is_some(),
             info,
         })
     }
@@ -424,6 +567,34 @@ impl VulkanDevice {
         self.graphics_queue_family
     }
 
+    /// Whether this device was created with presentation support and VK_KHR_swapchain.
+    #[must_use]
+    pub const fn presentation_enabled(&self) -> bool {
+        self.presentation_enabled
+    }
+
+    /// Returns the presentation queue.
+    #[must_use]
+    pub const fn present_queue(&self) -> vk::Queue {
+        self.present_queue
+    }
+
+    /// Returns the presentation queue-family index.
+    #[must_use]
+    pub const fn present_queue_family(&self) -> u32 {
+        self.present_queue_family
+    }
+
+    /// Waits for all work submitted to this logical device to complete.
+    pub fn wait_idle(&self) -> Result<(), VulkanError> {
+        // SAFETY: The logical device is live and uniquely owned by this wrapper.
+        unsafe {
+            self.handle
+                .device_wait_idle()
+                .map_err(|error| api_error("wait for Vulkan device idle", error))
+        }
+    }
+
     /// Returns selected physical-device metadata.
     #[must_use]
     pub const fn info(&self) -> &PhysicalDeviceInfo {
@@ -433,8 +604,15 @@ impl VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
-        // SAFETY: This wrapper uniquely owns the logical device. Submitted work
-        // must be complete before the owner is dropped.
+        // SAFETY: This wrapper uniquely owns the logical device. Waiting idle ensures
+        // no submitted work can still reference resources owned by this device.
+        if let Err(error) = unsafe { self.handle.device_wait_idle() } {
+            tracing::warn!(
+                ?error,
+                "Vulkan device was not idle during device destruction"
+            );
+        }
+        // SAFETY: This wrapper uniquely owns the logical device.
         unsafe { self.handle.destroy_device(None) };
     }
 }
@@ -442,6 +620,7 @@ impl Drop for VulkanDevice {
 /// Owns a Vulkan instance and logical device for one renderer session.
 pub struct VulkanContext {
     instance: Arc<VulkanInstance>,
+    surface: Option<VulkanSurface>,
     device: VulkanDevice,
 }
 
@@ -450,7 +629,36 @@ impl VulkanContext {
     pub fn new(config: &VulkanConfig) -> Result<Self, VulkanError> {
         let instance = Arc::new(VulkanInstance::new(config)?);
         let device = VulkanDevice::new(Arc::clone(&instance))?;
-        Ok(Self { instance, device })
+        Ok(Self {
+            instance,
+            surface: None,
+            device,
+        })
+    }
+
+    /// Creates an instance, window surface, presentation-capable device and queues.
+    ///
+    /// The caller must keep window alive until this context and any future swapchains
+    /// created from its surface have been destroyed.
+    pub fn new_for_window(config: &VulkanConfig, window: &Window) -> Result<Self, VulkanError> {
+        let required_extensions = surface::required_instance_extensions(window)?;
+        let instance = Arc::new(VulkanInstance::new_with_extensions(
+            config,
+            &required_extensions,
+        )?);
+        let surface = VulkanSurface::new(Arc::clone(&instance), window)?;
+        let device = VulkanDevice::new_for_surface(Arc::clone(&instance), &surface)?;
+        Ok(Self {
+            instance,
+            surface: Some(surface),
+            device,
+        })
+    }
+
+    /// Returns the optional presentation surface.
+    #[must_use]
+    pub fn surface(&self) -> Option<&VulkanSurface> {
+        self.surface.as_ref()
     }
 
     /// Returns the instance owner.
@@ -463,6 +671,16 @@ impl VulkanContext {
     #[must_use]
     pub const fn device(&self) -> &VulkanDevice {
         &self.device
+    }
+
+    /// Creates a swapchain for the attached window surface.
+    pub fn create_swapchain(
+        &self,
+        window_extent: [u32; 2],
+        config: SwapchainConfig,
+    ) -> Result<VulkanSwapchain<'_>, VulkanError> {
+        let surface = self.surface.as_ref().ok_or(VulkanError::MissingSurface)?;
+        VulkanSwapchain::new(&self.device, surface, window_extent, config)
     }
 }
 

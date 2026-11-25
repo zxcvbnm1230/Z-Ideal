@@ -6,21 +6,30 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 ## Implemented in the current Phase 2 branch
 
-- Pinned workspace dependencies for ash 0.38.0 and winit 0.30.13. Additional surface/window-handle dependencies will be introduced when surface ownership is implemented.
+- Pinned workspace dependencies for ash 0.38.0, ash-window 0.13.0, raw-window-handle 0.6.2, and winit 0.30.13.
 - Platform-native event-loop ownership through winit's ApplicationHandler lifecycle.
 - Validated initial window configuration and a window-creation boundary that runs on the native event-loop thread.
+- Normalized per-window keyboard and mouse state with held/pressed/released transitions, focus-loss release handling, cursor position, and accumulated wheel deltas.
 - Dynamic Vulkan loader discovery with actionable loader and API errors.
 - Instance-extension and validation-layer discovery before instance creation.
 - Optional Khronos validation layer and debug-utils callback; requested validation fails clearly if unavailable.
 - Vulkan portability enumeration is enabled when advertised; macOS initialization fails clearly if that extension is absent.
 - Deterministic physical-device preference and graphics-queue-family selection.
 - Portability-subset device extension enabled when advertised.
-- Explicit instance, debug-messenger, and logical-device destruction ownership.
+- Platform-required Vulkan instance extensions enumerated from the native display handle and validated before instance creation.
+- Owned window surfaces with surface capability, format, present-mode, and queue-support queries.
+- Physical-device selection requires both graphics and presentation support for a window surface and the swapchain device extension.
+- Separate graphics and presentation queues are created when a single queue family cannot serve both roles.
+- Explicit instance, debug-messenger, surface, swapchain, image-view, and logical-device destruction ownership.
+- Swapchain selection for supported formats, color spaces, extents, image counts, composite-alpha modes, and FIFO/mailbox/immediate presentation preferences.
+- Swapchain image views with deterministic destruction ordering; acquisition and presentation expose suboptimal/out-of-date states to the caller.
+- Swapchain recreation waits for device idle and preserves the old swapchain for zero-size/minimized-window deferrals; failed nonzero recreation leaves a clear not-ready state that callers can retry.
+- Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Not implemented yet
 
-- Normalized input state and event routing contract beyond the native window-event callback.
-- Vulkan surface creation and present-queue selection.
+- Central input routing across multiple windows and the engine event bus.
+- Higher-level frame scheduling, automatic resize/minimize/restore event wiring, and synchronization-object wrappers. The current swapchain API exposes acquire/present status and accepts caller-owned semaphores/fences.
 - Swapchain creation, resize/minimize/restore, out-of-date/suboptimal handling, and recreation.
 - GPU buffer/image/view/sampler/descriptor/pipeline/synchronization wrappers.
 - Shader compiler integration, reflection, and pipeline-layout validation.
