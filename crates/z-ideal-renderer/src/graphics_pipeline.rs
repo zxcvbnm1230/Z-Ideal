@@ -56,8 +56,11 @@ impl Default for GraphicsPipelineConfig {
 
 /// Owns a graphics pipeline and retains its layout, shader modules, and render pass.
 pub struct VulkanGraphicsPipeline<'pipeline, 'layouts, 'device> {
-    device: &'device VulkanDevice,
+    pub(super) device: &'device VulkanDevice,
     handle: vk::Pipeline,
+    pub(super) layout_handle: vk::PipelineLayout,
+    pub(super) render_pass: vk::RenderPass,
+    pub(super) subpass: u32,
     _layout: &'pipeline VulkanPipelineLayout<'layouts, 'device>,
     _vertex_shader: &'pipeline VulkanShaderModule<'device>,
     _fragment_shader: &'pipeline VulkanShaderModule<'device>,
@@ -189,6 +192,9 @@ impl<'pipeline, 'layouts, 'device> VulkanGraphicsPipeline<'pipeline, 'layouts, '
         Ok(Self {
             device: layout.device,
             handle,
+            layout_handle: layout.handle(),
+            render_pass: render_pass.handle(),
+            subpass: config.subpass,
             _layout: layout,
             _vertex_shader: vertex_shader,
             _fragment_shader: fragment_shader,

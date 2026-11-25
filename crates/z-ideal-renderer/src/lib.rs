@@ -3,7 +3,7 @@
 
 use std::{
     ffi::{CStr, CString, NulError},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use ash::{Entry, vk};
@@ -11,6 +11,7 @@ use thiserror::Error;
 use winit::window::Window;
 
 mod buffer;
+mod command;
 mod descriptor;
 mod graphics_pipeline;
 mod image;
@@ -24,11 +25,15 @@ mod swapchain;
 mod sync;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
+pub use command::{
+    BufferBarrier, CommandBufferRecording, CommandPoolConfig, ExecutableCommandBuffer,
+    ImageBarrier, VulkanCommandBuffer, VulkanCommandPool, VulkanQueue, VulkanSubmission,
+};
 pub use descriptor::{
     BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
     DescriptorResourceLease, DescriptorResourceWrite, DescriptorSetLayoutConfig,
-    ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool, VulkanDescriptorSet,
-    VulkanDescriptorSetLayout,
+    DescriptorSetLeaseRef, ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool,
+    VulkanDescriptorSet, VulkanDescriptorSetLayout,
 };
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
@@ -291,6 +296,24 @@ pub enum VulkanError {
     /// Graphics pipeline fixed-function state or render-pass compatibility is invalid.
     #[error("Vulkan graphics pipeline fixed-function configuration is invalid")]
     InvalidGraphicsPipelineConfig,
+    /// Command-pool flags or selected queue family are invalid.
+    #[error("Vulkan command-pool configuration or queue family is invalid")]
+    InvalidCommandPoolConfig,
+    /// Command-buffer recording, render-pass, or pipeline state is invalid.
+    #[error("Vulkan command-buffer operation is invalid for its current state")]
+    InvalidCommandBufferState,
+    /// Queue submission parameters or command-buffer state are invalid.
+    #[error("Vulkan queue submission parameters or command-buffer state are invalid")]
+    InvalidQueueSubmission,
+    /// Dynamic descriptor offsets violate count, alignment, or buffer bounds.
+    #[error("Vulkan dynamic descriptor offsets are invalid")]
+    InvalidDynamicDescriptorOffset,
+    /// Push-constant write is not covered by the pipeline layout.
+    #[error("Vulkan push-constant write is invalid or not covered by the pipeline layout")]
+    InvalidPushConstantWrite,
+    /// Host synchronization for queue submission was poisoned.
+    #[error("Vulkan queue submission synchronization lock was poisoned")]
+    QueueSynchronizationPoisoned,
     /// A shader resource is missing an explicit descriptor set or binding.
     #[error("shader descriptor resources must declare both set and binding")]
     MissingShaderDescriptorBinding,
@@ -542,6 +565,7 @@ pub struct VulkanDevice {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
+    queue_submit_lock: Mutex<()>,
     present_queue: vk::Queue,
     present_queue_family: u32,
     presentation_enabled: bool,
@@ -777,6 +801,7 @@ impl VulkanDevice {
             physical_device,
             graphics_queue,
             graphics_queue_family,
+            queue_submit_lock: Mutex::new(()),
             present_queue,
             present_queue_family,
             presentation_enabled: surface.is_some(),
@@ -860,7 +885,11 @@ impl VulkanDevice {
 
     /// Waits for all work submitted to this logical device to complete.
     pub fn wait_idle(&self) -> Result<(), VulkanError> {
-        // SAFETY: The logical device is live and uniquely owned by this wrapper.
+        let _queue_guard = self
+            .queue_submit_lock
+            .lock()
+            .map_err(|_| VulkanError::QueueSynchronizationPoisoned)?;
+        // SAFETY: The logical device is live and queue host access is serialized by the lock.
         unsafe {
             self.handle
                 .device_wait_idle()
