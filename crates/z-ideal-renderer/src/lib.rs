@@ -11,8 +11,10 @@ use thiserror::Error;
 use winit::window::Window;
 
 mod surface;
+mod swapchain;
 
 pub use surface::VulkanSurface;
+pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";
@@ -71,6 +73,33 @@ pub enum VulkanError {
     /// Native surface creation or compatibility failed.
     #[error("Vulkan surface operation failed: {0}")]
     Surface(String),
+    /// No surface format is available.
+    #[error("the Vulkan surface exposes no image formats")]
+    NoSurfaceFormats,
+    /// No presentation mode is available.
+    #[error("the Vulkan surface exposes no presentation modes")]
+    NoPresentModes,
+    /// The selected surface cannot be used as a color attachment.
+    #[error("the Vulkan surface does not support color-attachment swapchain images")]
+    UnsupportedSurfaceUsage,
+    /// No supported composite-alpha mode is available.
+    #[error("the Vulkan surface exposes no supported composite-alpha mode")]
+    NoCompositeAlphaMode,
+    /// The requested swapchain extent is zero, typically because the window is minimized.
+    #[error("the window has a zero drawable extent; swapchain creation is deferred")]
+    ZeroExtent,
+    /// No window surface is attached to this context.
+    #[error("this Vulkan context has no presentation surface")]
+    MissingSurface,
+    /// No swapchain is currently available.
+    #[error("no Vulkan swapchain is currently available")]
+    MissingSwapchain,
+    /// An image index is outside the current swapchain image range.
+    #[error("swapchain image index {index} is out of range for {image_count} images")]
+    InvalidSwapchainImageIndex { index: u32, image_count: usize },
+    /// Image acquisition requires either a semaphore or fence.
+    #[error("swapchain image acquisition requires a semaphore or fence")]
+    MissingAcquireSynchronization,
 }
 
 fn api_error(operation: &'static str, result: vk::Result) -> VulkanError {
@@ -545,6 +574,16 @@ impl VulkanDevice {
         self.present_queue_family
     }
 
+    /// Waits for all work submitted to this logical device to complete.
+    pub fn wait_idle(&self) -> Result<(), VulkanError> {
+        // SAFETY: The logical device is live and uniquely owned by this wrapper.
+        unsafe {
+            self.handle
+                .device_wait_idle()
+                .map_err(|error| api_error("wait for Vulkan device idle", error))
+        }
+    }
+
     /// Returns selected physical-device metadata.
     #[must_use]
     pub const fn info(&self) -> &PhysicalDeviceInfo {
@@ -614,6 +653,16 @@ impl VulkanContext {
     #[must_use]
     pub const fn device(&self) -> &VulkanDevice {
         &self.device
+    }
+
+    /// Creates a swapchain for the attached window surface.
+    pub fn create_swapchain(
+        &self,
+        window_extent: [u32; 2],
+        config: SwapchainConfig,
+    ) -> Result<VulkanSwapchain<'_>, VulkanError> {
+        let surface = self.surface.as_ref().ok_or(VulkanError::MissingSurface)?;
+        VulkanSwapchain::new(&self.device, surface, window_extent, config)
     }
 }
 
