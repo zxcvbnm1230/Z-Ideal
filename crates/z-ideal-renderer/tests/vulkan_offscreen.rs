@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ash::vk;
 use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferMemoryLocation, BufferOwnershipTransfer, CommandPoolConfig,
-    FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig,
+    FenceWaitResult, GraphicsPipelineConfig, ImageBarrier, ImageConfig, ImageViewConfig,
     RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
     RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanBuffer,
     VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline,
@@ -525,6 +525,251 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(command_pool);
     drop(device);
 
+    let validation_errors: Vec<_> = instance
+        .validation_messages()
+        .expect("read validation diagnostics")
+        .into_iter()
+        .filter(|message| {
+            message
+                .severity
+                .contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+        })
+        .collect();
+    assert!(
+        validation_errors.is_empty(),
+        "Vulkan validation reported errors: {validation_errors:#?}"
+    );
+}
+
+fn round_trip_buffer_image_copy(
+    device: &VulkanDevice,
+    queue: &VulkanQueue<'_>,
+    command_pool: &VulkanCommandPool<'_>,
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+    payload: &[u8],
+) {
+    let extent = vk::Extent3D {
+        width: 4,
+        height: 4,
+        depth: 1,
+    };
+    let mut upload = VulkanBuffer::new(
+        device,
+        BufferConfig {
+            size: payload.len() as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_SRC,
+            memory: BufferMemoryLocation::Upload,
+        },
+    )
+    .expect("create format-test upload buffer");
+    upload.write(0, payload).expect("write format-test payload");
+    let mut readback = VulkanBuffer::new(
+        device,
+        BufferConfig {
+            size: payload.len() as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_DST,
+            memory: BufferMemoryLocation::Readback,
+        },
+    )
+    .expect("create format-test readback buffer");
+    let image = VulkanImage::new(
+        device,
+        ImageConfig {
+            image_type: vk::ImageType::TYPE_2D,
+            extent,
+            format,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+            flags: vk::ImageCreateFlags::empty(),
+        },
+    )
+    .expect("create format-test image");
+
+    let region = [vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: extent,
+    }];
+    let mut command_buffer = command_pool
+        .allocate_primary()
+        .expect("allocate format-test command buffer");
+    let mut recording = command_buffer
+        .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+        .expect("begin format-test recording");
+    recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::TOP_OF_PIPE | vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[BufferBarrier {
+                buffer: &upload,
+                source_access: vk::AccessFlags::HOST_WRITE,
+                destination_access: vk::AccessFlags::TRANSFER_READ,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            }],
+            &[ImageBarrier {
+                image: &image,
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                source_access: vk::AccessFlags::empty(),
+                destination_access: vk::AccessFlags::TRANSFER_WRITE,
+                aspect,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+        .expect("transition format-test image for upload");
+    recording
+        .copy_buffer_to_image(
+            &upload,
+            &image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        )
+        .expect("upload format-test image data");
+    recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[ImageBarrier {
+                image: &image,
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                source_access: vk::AccessFlags::TRANSFER_WRITE,
+                destination_access: vk::AccessFlags::TRANSFER_READ,
+                aspect,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+        .expect("transition format-test image for readback");
+    recording
+        .copy_image_to_buffer(
+            &image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            &readback,
+            &region,
+        )
+        .expect("copy format-test image to readback buffer");
+    recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[BufferBarrier {
+                buffer: &readback,
+                source_access: vk::AccessFlags::TRANSFER_WRITE,
+                destination_access: vk::AccessFlags::HOST_READ,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            }],
+            &[],
+        )
+        .expect("make format-test readback visible to host");
+    let executable = recording.end().expect("finish format-test command buffer");
+    let mut submission = queue
+        .submit(executable, &[], &[], &[])
+        .expect("submit format-test copy");
+    assert_eq!(
+        submission
+            .wait(u64::MAX)
+            .expect("wait for format-test copy"),
+        FenceWaitResult::Signaled
+    );
+    drop(submission);
+
+    let mut actual = vec![0_u8; payload.len()];
+    readback
+        .read(0, &mut actual)
+        .expect("read format-test bytes");
+    assert_eq!(
+        actual, payload,
+        "format {format:?} round trip changed bytes"
+    );
+}
+
+/// Exercises compressed and depth buffer-image copies on formats supported by lavapipe.
+#[test]
+#[ignore = "requires a Vulkan ICD and Khronos validation layer; run in the dedicated Vulkan CI job"]
+fn compressed_and_depth_buffer_image_copies_round_trip_without_validation_errors() {
+    let instance = Arc::new(
+        VulkanInstance::new(&VulkanConfig {
+            application_name: "Z Ideal Vulkan format transfer validation".to_owned(),
+            enable_validation: true,
+        })
+        .expect("create Vulkan instance with validation enabled"),
+    );
+    let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan graphics device");
+    let queue = VulkanQueue::graphics(&device);
+    let command_pool = VulkanCommandPool::new(&device, CommandPoolConfig::default())
+        .expect("create format-test command pool");
+    let required_usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    let cases = [
+        (
+            vk::Format::BC1_RGBA_UNORM_BLOCK,
+            vk::ImageAspectFlags::COLOR,
+            vec![0x13, 0x37, 0x42, 0xA5, 0x5A, 0xC3, 0x7E, 0x91],
+        ),
+        (
+            vk::Format::D32_SFLOAT,
+            vk::ImageAspectFlags::DEPTH,
+            (0..16)
+                .flat_map(|index| (index as f32 / 16.0).to_ne_bytes())
+                .collect(),
+        ),
+    ];
+    let mut exercised = 0;
+    for (format, aspect, payload) in cases {
+        // SAFETY: The physical device belongs to this live Vulkan instance.
+        let support = unsafe {
+            instance
+                .handle()
+                .get_physical_device_image_format_properties(
+                    device.physical_device(),
+                    format,
+                    vk::ImageType::TYPE_2D,
+                    vk::ImageTiling::OPTIMAL,
+                    required_usage,
+                    vk::ImageCreateFlags::empty(),
+                )
+        };
+        match support {
+            Ok(_) => {}
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
+                eprintln!("Skipping unsupported optimal transfer format {format:?}");
+                continue;
+            }
+            Err(error) => panic!("query image format support for {format:?}: {error:?}"),
+        }
+        round_trip_buffer_image_copy(&device, &queue, &command_pool, format, aspect, &payload);
+        exercised += 1;
+    }
+    assert!(
+        exercised > 0,
+        "lavapipe exposes no supported compressed/depth transfer format"
+    );
+
+    drop(command_pool);
+    drop(device);
     let validation_errors: Vec<_> = instance
         .validation_messages()
         .expect("read validation diagnostics")
