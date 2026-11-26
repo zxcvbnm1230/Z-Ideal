@@ -59,7 +59,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Higher-level application frame policy: redraw throttling, pause/resume behavior, and integration of minimized-window events with the scheduler. The low-level scheduler reports zero-extent and out-of-date conditions but does not own the platform event loop.
 - Swapchain-backed framebuffer helpers for depth attachments, multisample color/depth targets, and multi-attachment render passes.
 - Compressed and depth/stencil buffer-image copy metadata, explicit queue-family ownership transfers, and deferred resource retirement.
-- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, image copy/readback, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
+- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, two same-type pooled readback buffers, image copy/readback comparison, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
 
 ## Platform notes
 
