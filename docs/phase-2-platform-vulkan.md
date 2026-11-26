@@ -59,7 +59,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 - Higher-level application frame policy: redraw throttling, pause/resume behavior, and integration of minimized-window events with the scheduler. The low-level scheduler reports zero-extent and out-of-date conditions but does not own the platform event loop.
 - Queue-family ownership transfer runtime coverage on hardware exposing a separate transfer family. Buffer-image copy metadata covers the supported compressed and depth/stencil formats. Resource retirement through the safe command API is fence-scoped; raw Vulkan submissions remain the caller's synchronization responsibility.
-- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, two same-type pooled readback buffers, image copy/readback comparison, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
+- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, pooled readback comparison, graphics-to-transfer queue copies (including release/acquire barriers when separate families exist), plus compressed BC1 and D32 depth buffer-image round trips when supported by the ICD. It asserts exact pixel/byte results and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
 
 ## Platform notes
 
