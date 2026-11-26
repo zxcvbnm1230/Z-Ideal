@@ -169,13 +169,8 @@ impl<'device> VulkanCommandPool<'device> {
 
 impl Drop for VulkanCommandPool<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before command-pool destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the pool; Vulkan frees its command buffers with it.
+        // SAFETY: Every allocated command-buffer wrapper borrows this pool, and submitted
+        // command buffers remain borrowed by their fence-backed completion guards.
         unsafe {
             self.device.handle.destroy_command_pool(self.handle, None);
         }
@@ -1489,7 +1484,18 @@ impl Drop for VulkanSubmission<'_, '_, '_> {
             match self.fence.wait(u64::MAX) {
                 Ok(FenceWaitResult::Signaled) => self.mark_completed(),
                 Ok(FenceWaitResult::Timeout) => {
-                    tracing::error!("infinite Vulkan submission-fence wait unexpectedly timed out")
+                    let idle_result = self
+                        .executable
+                        .as_ref()
+                        .map(|executable| executable.command_buffer.pool.device.wait_idle());
+                    if matches!(idle_result, Some(Ok(()))) {
+                        self.mark_completed();
+                    } else {
+                        tracing::error!(
+                            ?idle_result,
+                            "infinite Vulkan submission-fence wait timed out and device-idle fallback failed"
+                        );
+                    }
                 }
                 Err(error) => {
                     let idle_result = self

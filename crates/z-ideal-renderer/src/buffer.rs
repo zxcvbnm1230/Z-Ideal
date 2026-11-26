@@ -35,9 +35,9 @@ pub struct BufferConfig {
 /// Read and write operations do not synchronize queues or insert memory barriers;
 /// callers must establish the required GPU/host dependencies. For non-coherent
 /// memory, synchronization must account for the atom-aligned cache-maintenance range,
-/// which can extend beyond the requested byte range. Drop waits for device idle
-/// before destroying the buffer and returning its suballocation to the pool; this is
-/// deliberately conservative until deferred resource retirement exists.
+/// which can extend beyond the requested byte range. Safe command recording retains
+/// the buffer through its submission fence; dropping the final borrow destroys the
+/// handle and returns its suballocation without stalling unrelated device queues.
 pub struct VulkanBuffer<'device> {
     pub(super) device: &'device VulkanDevice,
     handle: vk::Buffer,
@@ -346,14 +346,9 @@ impl<'device> VulkanBuffer<'device> {
 
 impl Drop for VulkanBuffer<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before buffer destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the buffer. Its suballocation is
-        // returned to the pool only after the Vulkan buffer has been destroyed.
+        // SAFETY: Engine-recorded command buffers borrow this buffer and submissions
+        // retain those borrows until their fence completes. Raw Vulkan users must
+        // provide equivalent external synchronization before dropping the buffer.
         unsafe { self.device.handle.destroy_buffer(self.handle, None) };
     }
 }

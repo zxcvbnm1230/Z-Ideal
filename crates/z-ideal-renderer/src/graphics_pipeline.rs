@@ -211,13 +211,8 @@ impl<'pipeline, 'layouts, 'device> VulkanGraphicsPipeline<'pipeline, 'layouts, '
 
 impl Drop for VulkanGraphicsPipeline<'_, '_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before graphics-pipeline destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the pipeline and retains its device.
+        // SAFETY: Recorded command buffers retain this pipeline until their submission fence
+        // completes; raw Vulkan users synchronize manually.
         unsafe {
             self.device.handle.destroy_pipeline(self.handle, None);
         }

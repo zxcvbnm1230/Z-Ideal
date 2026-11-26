@@ -195,13 +195,8 @@ impl<'device> VulkanShaderModule<'device> {
 
 impl Drop for VulkanShaderModule<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before shader-module destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the shader module and retains its device.
+        // SAFETY: Pipeline wrappers borrow this shader module, and submitted command buffers
+        // retain those pipelines until their fences complete.
         unsafe {
             self.device.handle.destroy_shader_module(self.handle, None);
         }

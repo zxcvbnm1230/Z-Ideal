@@ -924,7 +924,11 @@ impl VulkanDevice {
         })
     }
 
-    /// Returns the raw logical device for renderer-internal integration.
+    /// Returns the raw logical device for renderer-internal or unsafe integration.
+    ///
+    /// Raw Vulkan submissions bypass the engine's fence-scoped resource retention.
+    /// Callers using raw handles must keep every referenced object alive until the
+    /// corresponding GPU work completes and must synchronize before destroying it.
     #[must_use]
     pub fn handle(&self) -> &ash::Device {
         &self.handle
