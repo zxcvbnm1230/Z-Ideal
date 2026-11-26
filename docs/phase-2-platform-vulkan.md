@@ -58,8 +58,8 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 ## Not implemented yet
 
-- Queue-family ownership transfer runtime coverage on hardware exposing a separate transfer family. Buffer-image copy metadata covers the supported compressed and depth/stencil formats. Resource retirement through the safe command API is fence-scoped; raw Vulkan submissions remain the caller's synchronization responsibility.
-- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, two same-type pooled readback buffers, image copy/readback comparison, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
+- Queue-family ownership transfer runtime coverage on hardware exposing a separate transfer family. The lavapipe CI log reports graphics family 0 and transfer family 0, so its conditional integration test does not exercise cross-family release/acquire; the hardware procedure identifies how to verify that path on a device with distinct families. Buffer-image copy metadata covers the supported compressed and depth/stencil formats. Resource retirement through the safe command API is fence-scoped; raw Vulkan submissions remain the caller's synchronization responsibility.
+- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, pooled readback, image copy/pixel comparison, and an Xvfb-backed X11 swapchain frame with a depth attachment; both tests fail on Vulkan validation errors. Software Vulkan is not a substitute for physical-GPU testing.
 
 ## Platform notes
 
@@ -67,4 +67,4 @@ The engine targets Vulkan portability, not a hard-coded macOS translation layer.
 
 ## Validation
 
-The normal CI matrix must run formatting, Clippy with warnings denied, workspace tests, and documentation on Ubuntu 24.04, Windows, and macOS. Runtime Vulkan initialization and GPU-backed tests require runners with a working Vulkan loader, suitable driver, and validation layers; compile-only CI does not prove those runtime capabilities.
+The normal CI matrix must run formatting, Clippy with warnings denied, workspace tests, and documentation on Ubuntu 24.04, Windows, and macOS. Runtime Vulkan initialization and GPU-backed tests require runners with a working Vulkan loader, suitable driver, and validation layers; compile-only CI does not prove those runtime capabilities. See [the Vulkan hardware validation procedure](phase-2-vulkan-hardware-validation.md) for the physical-GPU smoke-test commands and required report metadata.
