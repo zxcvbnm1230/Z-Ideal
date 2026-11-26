@@ -59,7 +59,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 ## Not implemented yet
 
 - Queue-family ownership transfer runtime coverage on hardware exposing a separate transfer family. Buffer-image copy metadata covers the supported compressed and depth/stencil formats. Resource retirement through the safe command API is fence-scoped; raw Vulkan submissions remain the caller's synchronization responsibility.
-- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, two same-type pooled readback buffers, image copy/readback comparison, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
+- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, pooled readback, image copy/pixel comparison, and an Xvfb-backed X11 swapchain frame with a depth attachment; both tests fail on Vulkan validation errors. Software Vulkan is not a substitute for physical-GPU testing.
 
 ## Platform notes
 

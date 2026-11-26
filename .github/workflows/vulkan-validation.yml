@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   lavapipe-offscreen:
-    name: Mesa lavapipe offscreen rendering
+    name: Mesa lavapipe offscreen and X11 presentation
     runs-on: ubuntu-24.04
     env:
       RUST_BACKTRACE: 1
@@ -28,7 +28,7 @@ jobs:
       - name: Install software Vulkan driver and validation layer
         run: |
           sudo apt-get update
-          sudo apt-get install --yes mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          sudo apt-get install --yes mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb xauth
       - name: Discover and verify lavapipe and validation layer
         run: |
           echo "Installed Vulkan ICD manifests:"
@@ -50,3 +50,6 @@ jobs:
           grep -Eiq 'llvmpipe|lavapipe' /tmp/vulkan-summary.txt
       - name: Run offscreen rendering and readback validation
         run: cargo test -p z-ideal-renderer --all-features --test vulkan_offscreen -- --ignored --nocapture
+
+      - name: Run X11 swapchain presentation and depth-attachment validation
+        run: xvfb-run -a cargo test -p z-ideal-renderer --all-features --test vulkan_swapchain -- --ignored --nocapture
