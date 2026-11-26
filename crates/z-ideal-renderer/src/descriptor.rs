@@ -133,13 +133,8 @@ impl<'device> VulkanDescriptorSetLayout<'device> {
 
 impl Drop for VulkanDescriptorSetLayout<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before descriptor-set-layout destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the layout and its device is still borrowed.
+        // SAFETY: Descriptor sets and pipeline layouts borrow this layout; recorded command
+        // buffers retain their users until submission completion.
         unsafe {
             self.device
                 .handle
@@ -251,12 +246,6 @@ impl<'device> VulkanDescriptorPool<'device> {
 
 impl Drop for VulkanDescriptorPool<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before descriptor-pool destruction"
-            );
-        }
         // SAFETY: This wrapper uniquely owns the pool; destroying it releases all sets.
         unsafe {
             self.device
@@ -284,7 +273,7 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
     /// from outliving resources retained by an earlier lease. The returned lease
     /// retains all referenced resources and exclusively borrows this set, preventing
     /// another update until the lease is dropped. Keep it alive through all submissions
-    /// that use the set. Dropping it waits for device idle before releasing resources.
+    /// that use the set. Command submissions retain the lease until their fence signals.
     /// Descriptor updates do not perform queue synchronization, image layout transitions,
     /// or buffer memory barriers; callers must establish all required dependencies.
     /// Dynamic buffer offsets and final effective ranges must be validated by the
@@ -501,9 +490,9 @@ impl<'pool, 'layout, 'device> VulkanDescriptorSet<'pool, 'layout, 'device> {
 
 /// Keeps every resource referenced by a descriptor set alive while it is in use.
 ///
-/// This guard prevents descriptor updates until it is dropped. Drop waits for the
-/// owning device to become idle before releasing retained buffers, image views,
-/// and samplers.
+/// This guard prevents descriptor updates and retains referenced resources. Safe
+/// command buffers retain the guard through submission completion, so dropping the
+/// final lease does not require a device-wide idle wait.
 pub struct DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device> {
     set: &'set mut VulkanDescriptorSet<'pool, 'layout, 'device>,
     retained_resources: Vec<RetainedDescriptorResource<'resource, 'image, 'device>>,
@@ -617,14 +606,7 @@ impl DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {
 }
 
 impl Drop for DescriptorResourceLease<'_, '_, '_, '_, '_, '_> {
-    fn drop(&mut self) {
-        if let Err(error) = self.set._pool.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before descriptor resource lease release"
-            );
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 fn validate_complete_descriptor_write_set(

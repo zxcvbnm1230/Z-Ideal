@@ -1,4 +1,5 @@
 //! Explicitly owned Vulkan buffer and backing-memory resources.
+use crate::memory::{MemoryAllocation, checked_least_common_multiple};
 use crate::{VulkanDevice, VulkanError, api_error};
 use ash::vk;
 use std::ptr;
@@ -25,7 +26,7 @@ pub struct BufferConfig {
     pub memory: BufferMemoryLocation,
 }
 
-/// Owns a Vulkan buffer and its dedicated memory allocation.
+/// Owns a Vulkan buffer and its suballocation from the device memory pool.
 ///
 /// Host access is bounds checked and handles non-coherent cache maintenance.
 /// Device-local allocations are not guaranteed to be host-visible. Upload and
@@ -34,23 +35,22 @@ pub struct BufferConfig {
 /// Read and write operations do not synchronize queues or insert memory barriers;
 /// callers must establish the required GPU/host dependencies. For non-coherent
 /// memory, synchronization must account for the atom-aligned cache-maintenance range,
-/// which can extend beyond the requested byte range. Drop waits for device idle
-/// before destroying the buffer and memory; this is deliberately conservative until
-/// deferred resource retirement exists.
+/// which can extend beyond the requested byte range. Safe command recording retains
+/// the buffer through its submission fence; dropping the final borrow destroys the
+/// handle and returns its suballocation without stalling unrelated device queues.
 pub struct VulkanBuffer<'device> {
     pub(super) device: &'device VulkanDevice,
     handle: vk::Buffer,
-    memory: vk::DeviceMemory,
+    allocation: MemoryAllocation,
     size: vk::DeviceSize,
     pub(super) usage: vk::BufferUsageFlags,
-    allocation_size: vk::DeviceSize,
     memory_flags: vk::MemoryPropertyFlags,
     atom_size: vk::DeviceSize,
     location: BufferMemoryLocation,
 }
 
 impl<'device> VulkanBuffer<'device> {
-    /// Creates a buffer and dedicated allocation on the supplied device.
+    /// Creates a buffer and compatible suballocation on the supplied device.
     pub fn new(device: &'device VulkanDevice, config: BufferConfig) -> Result<Self, VulkanError> {
         if config.size == 0 {
             return Err(VulkanError::InvalidBufferSize);
@@ -71,14 +71,7 @@ impl<'device> VulkanBuffer<'device> {
         };
         // SAFETY: The buffer belongs to this live device.
         let requirements = unsafe { device.handle.get_buffer_memory_requirements(handle) };
-        // SAFETY: These physical-device metadata queries use the retained instance/device.
-        let properties = unsafe {
-            device
-                ._instance
-                .handle
-                .get_physical_device_memory_properties(device.physical_device)
-        };
-        // SAFETY: These physical-device metadata queries use the retained instance/device.
+        // SAFETY: Physical-device properties belong to the instance retained by the device.
         let limits = unsafe {
             device
                 ._instance
@@ -88,8 +81,9 @@ impl<'device> VulkanBuffer<'device> {
         .limits;
 
         let (required, preferred) = memory_preferences(config.memory);
+        let properties = device.memory_allocator.memory_properties();
         let Some(memory_type_index) = select_memory_type(
-            &properties,
+            properties,
             requirements.memory_type_bits,
             required,
             preferred,
@@ -99,34 +93,49 @@ impl<'device> VulkanBuffer<'device> {
             return Err(VulkanError::NoCompatibleMemoryType { required });
         };
         let memory_flags = properties.memory_types[memory_type_index as usize].property_flags;
-        let allocation_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        // SAFETY: Allocation size and memory type come from this buffer's requirements.
-        let memory = match unsafe { device.handle.allocate_memory(&allocation_info, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                // SAFETY: The buffer has no bound memory.
+        let mut allocation_requirements = requirements;
+        if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && !memory_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        {
+            let Some(alignment) = checked_least_common_multiple(
+                requirements.alignment,
+                limits.non_coherent_atom_size.max(1),
+            ) else {
+                // SAFETY: The buffer is not bound to memory and is uniquely owned here.
                 unsafe { device.handle.destroy_buffer(handle, None) };
-                return Err(api_error("allocate Vulkan buffer memory", error));
+                return Err(VulkanError::InvalidMemoryRequirements);
+            };
+            allocation_requirements.alignment = alignment;
+        }
+        let allocation = match device
+            .memory_allocator
+            .allocate(allocation_requirements, memory_type_index)
+        {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: The buffer has no bound memory when allocation fails.
+                unsafe { device.handle.destroy_buffer(handle, None) };
+                return Err(error);
             }
         };
-        // SAFETY: The selected memory type satisfies the buffer's memory requirements.
-        if let Err(error) = unsafe { device.handle.bind_buffer_memory(handle, memory, 0) } {
-            // SAFETY: Binding failed; neither object is in use by submitted work.
-            unsafe {
-                device.handle.free_memory(memory, None);
-                device.handle.destroy_buffer(handle, None);
-            }
+        // SAFETY: The selected suballocation satisfies the buffer's memory requirements.
+        if let Err(error) = unsafe {
+            device
+                .handle
+                .bind_buffer_memory(handle, allocation.memory(), allocation.offset())
+        } {
+            // SAFETY: Binding failed; the buffer is not in use by submitted work.
+            unsafe { device.handle.destroy_buffer(handle, None) };
+            drop(allocation);
             return Err(api_error("bind Vulkan buffer memory", error));
         }
+        let memory_flags = allocation.property_flags();
         Ok(Self {
             device,
             handle,
-            memory,
+            allocation,
             size: config.size,
             usage: config.usage,
-            allocation_size: requirements.size,
             memory_flags,
             atom_size: limits.non_coherent_atom_size.max(1),
             location: config.memory,
@@ -173,11 +182,17 @@ impl<'device> VulkanBuffer<'device> {
         let pointer_offset = self.pointer_offset(offset, bytes.len())?;
         let byte_length =
             u64::try_from(bytes.len()).map_err(|_| VulkanError::BufferOffsetTooLarge)?;
-        // SAFETY: The allocation is live and not mapped elsewhere through this exclusive borrow.
+        let _mapping_guard = self.allocation.lock_mapping()?;
+        // SAFETY: The shared memory block is exclusively mapped under its mapping lock.
         let mapped = unsafe {
             self.device
                 .handle
-                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_memory(
+                    self.allocation.memory(),
+                    0,
+                    vk::WHOLE_SIZE,
+                    vk::MemoryMapFlags::empty(),
+                )
                 .map_err(|error| api_error("map Vulkan buffer memory for writing", error))?
         };
         // SAFETY: The byte range was bounds checked and the full allocation is mapped.
@@ -190,7 +205,7 @@ impl<'device> VulkanBuffer<'device> {
         }
         let result = self.cache_operation(offset, byte_length, true);
         // SAFETY: This allocation was successfully mapped above.
-        unsafe { self.device.handle.unmap_memory(self.memory) };
+        unsafe { self.device.handle.unmap_memory(self.allocation.memory()) };
         result
     }
 
@@ -209,16 +224,22 @@ impl<'device> VulkanBuffer<'device> {
         let pointer_offset = self.pointer_offset(offset, output.len())?;
         let byte_length =
             u64::try_from(output.len()).map_err(|_| VulkanError::BufferOffsetTooLarge)?;
-        // SAFETY: The allocation is live and not mapped elsewhere through this exclusive borrow.
+        let _mapping_guard = self.allocation.lock_mapping()?;
+        // SAFETY: The shared memory block is exclusively mapped under its mapping lock.
         let mapped = unsafe {
             self.device
                 .handle
-                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_memory(
+                    self.allocation.memory(),
+                    0,
+                    vk::WHOLE_SIZE,
+                    vk::MemoryMapFlags::empty(),
+                )
                 .map_err(|error| api_error("map Vulkan buffer memory for reading", error))?
         };
         if let Err(error) = self.cache_operation(offset, byte_length, false) {
             // SAFETY: This allocation was successfully mapped above.
-            unsafe { self.device.handle.unmap_memory(self.memory) };
+            unsafe { self.device.handle.unmap_memory(self.allocation.memory()) };
             return Err(error);
         }
         // SAFETY: The range was bounds checked and invalidated if memory is non-coherent.
@@ -230,7 +251,7 @@ impl<'device> VulkanBuffer<'device> {
             );
         }
         // SAFETY: This allocation was successfully mapped above.
-        unsafe { self.device.handle.unmap_memory(self.memory) };
+        unsafe { self.device.handle.unmap_memory(self.allocation.memory()) };
         Ok(())
     }
 
@@ -254,7 +275,18 @@ impl<'device> VulkanBuffer<'device> {
         if end > isize::MAX as u64 {
             return Err(VulkanError::BufferOffsetTooLarge);
         }
-        usize::try_from(offset).map_err(|_| VulkanError::BufferOffsetTooLarge)
+        let absolute_offset = self
+            .allocation
+            .offset()
+            .checked_add(offset)
+            .ok_or(VulkanError::BufferOffsetTooLarge)?;
+        let absolute_end = absolute_offset
+            .checked_add(length)
+            .ok_or(VulkanError::BufferOffsetTooLarge)?;
+        if absolute_end > isize::MAX as u64 {
+            return Err(VulkanError::BufferOffsetTooLarge);
+        }
+        usize::try_from(absolute_offset).map_err(|_| VulkanError::BufferOffsetTooLarge)
     }
 
     fn ensure_host_visible(&self) -> Result<(), VulkanError> {
@@ -275,11 +307,20 @@ impl<'device> VulkanBuffer<'device> {
         {
             return Ok(());
         }
-        let (range_offset, range_size) =
-            mapped_memory_range(offset, length, self.allocation_size, self.atom_size)
-                .ok_or(VulkanError::BufferMemoryRangeOverflow)?;
+        let absolute_offset = self
+            .allocation
+            .offset()
+            .checked_add(offset)
+            .ok_or(VulkanError::BufferMemoryRangeOverflow)?;
+        let (range_offset, range_size) = mapped_memory_range(
+            absolute_offset,
+            length,
+            self.allocation.block_size(),
+            self.atom_size,
+        )
+        .ok_or(VulkanError::BufferMemoryRangeOverflow)?;
         let ranges = [vk::MappedMemoryRange::default()
-            .memory(self.memory)
+            .memory(self.allocation.memory())
             .offset(range_offset)
             .size(range_size)];
         // SAFETY: Memory is mapped; range is atom-aligned and within the allocation.
@@ -305,18 +346,10 @@ impl<'device> VulkanBuffer<'device> {
 
 impl Drop for VulkanBuffer<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before buffer destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns both objects; the buffer is destroyed
-        // before the memory bound to it is freed.
-        unsafe {
-            self.device.handle.destroy_buffer(self.handle, None);
-            self.device.handle.free_memory(self.memory, None);
-        }
+        // SAFETY: Engine-recorded command buffers borrow this buffer and submissions
+        // retain those borrows until their fence completes. Raw Vulkan users must
+        // provide equivalent external synchronization before dropping the buffer.
+        unsafe { self.device.handle.destroy_buffer(self.handle, None) };
     }
 }
 

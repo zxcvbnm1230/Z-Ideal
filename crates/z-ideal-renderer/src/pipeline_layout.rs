@@ -9,8 +9,9 @@ use crate::{
 /// Owns a Vulkan pipeline layout and borrows all descriptor-set layouts it uses.
 ///
 /// The Rust lifetime prevents a referenced descriptor-set layout from being
-/// destroyed before this pipeline layout. Destruction waits for device idle so
-/// submitted work cannot continue using the Vulkan pipeline-layout handle.
+/// destroyed before this pipeline layout. Recorded command buffers retain pipelines
+/// and layouts through their submission fences, so ordinary destruction does not
+/// require a device-wide idle wait.
 pub struct VulkanPipelineLayout<'layouts, 'device> {
     pub(super) device: &'device VulkanDevice,
     handle: vk::PipelineLayout,
@@ -89,13 +90,8 @@ impl<'layouts, 'device> VulkanPipelineLayout<'layouts, 'device> {
 
 impl Drop for VulkanPipelineLayout<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before pipeline-layout destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the pipeline layout and retains its device.
+        // SAFETY: Pipeline wrappers and recorded command buffers borrow this layout until
+        // submission completion; raw Vulkan users synchronize manually.
         unsafe {
             self.device
                 .handle

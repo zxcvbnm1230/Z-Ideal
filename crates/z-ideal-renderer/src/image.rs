@@ -1,6 +1,7 @@
 //! Explicitly owned Vulkan images, allocations, and image views.
 use ash::vk;
 
+use crate::memory::MemoryAllocation;
 use crate::{VulkanDevice, VulkanError, api_error};
 
 /// Options for creating an owned Vulkan image.
@@ -56,7 +57,7 @@ impl Default for ImageViewConfig {
     }
 }
 
-/// Owns a Vulkan image and its dedicated device-memory allocation.
+/// Owns a Vulkan image and its suballocation from the device memory pool.
 ///
 /// Image memory prefers the device-local property. The selected memory type is
 /// retained for inspection because Vulkan implementations may expose different
@@ -65,13 +66,13 @@ impl Default for ImageViewConfig {
 pub struct VulkanImage<'device> {
     pub(super) device: &'device VulkanDevice,
     handle: vk::Image,
-    memory: vk::DeviceMemory,
+    _allocation: MemoryAllocation,
     config: ImageConfig,
     memory_flags: vk::MemoryPropertyFlags,
 }
 
 impl<'device> VulkanImage<'device> {
-    /// Creates an image and a dedicated compatible memory allocation.
+    /// Creates an image and a compatible suballocation from the device memory pool.
     pub fn new(device: &'device VulkanDevice, config: ImageConfig) -> Result<Self, VulkanError> {
         validate_image_config(config)?;
         let info = vk::ImageCreateInfo::default()
@@ -94,49 +95,44 @@ impl<'device> VulkanImage<'device> {
                 .create_image(&info, None)
                 .map_err(|error| api_error("create Vulkan image", error))?
         };
-        // SAFETY: The image belongs to this live logical device.
+        // SAFETY: The image belongs to this live device.
         let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
-        // SAFETY: The physical device belongs to the instance retained by the logical device.
-        let properties = unsafe {
-            device
-                ._instance
-                .handle
-                .get_physical_device_memory_properties(device.physical_device)
-        };
+        let properties = device.memory_allocator.memory_properties();
         let Some(memory_type_index) =
-            select_image_memory_type(&properties, requirements.memory_type_bits)
+            select_image_memory_type(properties, requirements.memory_type_bits)
         else {
             // SAFETY: The image has not been bound to memory and is uniquely owned here.
             unsafe { device.handle.destroy_image(handle, None) };
             return Err(VulkanError::NoCompatibleImageMemoryType);
         };
-        let memory_flags = properties.memory_types[memory_type_index as usize].property_flags;
-        let allocation_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        // SAFETY: Allocation requirements and memory type come from this image/device pair.
-        let memory = match unsafe { device.handle.allocate_memory(&allocation_info, None) } {
-            Ok(memory) => memory,
+        let allocation = match device
+            .memory_allocator
+            .allocate(requirements, memory_type_index)
+        {
+            Ok(allocation) => allocation,
             Err(error) => {
-                // SAFETY: The image has no bound memory.
+                // SAFETY: The image has no bound memory when allocation fails.
                 unsafe { device.handle.destroy_image(handle, None) };
-                return Err(api_error("allocate Vulkan image memory", error));
+                return Err(error);
             }
         };
-        // SAFETY: The selected memory type satisfies the image's memory requirements.
-        if let Err(error) = unsafe { device.handle.bind_image_memory(handle, memory, 0) } {
+        // SAFETY: The selected suballocation satisfies the image's memory requirements.
+        if let Err(error) = unsafe {
+            device
+                .handle
+                .bind_image_memory(handle, allocation.memory(), allocation.offset())
+        } {
             // SAFETY: Binding failed; neither object is in use by submitted work.
-            unsafe {
-                device.handle.free_memory(memory, None);
-                device.handle.destroy_image(handle, None);
-            }
+            unsafe { device.handle.destroy_image(handle, None) };
+            drop(allocation);
             return Err(api_error("bind Vulkan image memory", error));
         }
 
+        let memory_flags = allocation.property_flags();
         Ok(Self {
             device,
             handle,
-            memory,
+            _allocation: allocation,
             config,
             memory_flags,
         })
@@ -198,18 +194,10 @@ impl<'device> VulkanImage<'device> {
 
 impl Drop for VulkanImage<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before image destruction"
-            );
-        }
-        // SAFETY: This owner uniquely owns both objects; the image must be destroyed
-        // before the memory bound to it is released.
-        unsafe {
-            self.device.handle.destroy_image(self.handle, None);
-            self.device.handle.free_memory(self.memory, None);
-        }
+        // SAFETY: Engine-recorded command buffers and borrowed image views retain
+        // this image until submission fences complete. Raw Vulkan users must provide
+        // equivalent external synchronization before dropping the image.
+        unsafe { self.device.handle.destroy_image(self.handle, None) };
     }
 }
 
@@ -242,13 +230,8 @@ impl<'image, 'device> VulkanImageView<'image, 'device> {
 
 impl Drop for VulkanImageView<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.image.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before image-view destruction"
-            );
-        }
-        // SAFETY: This owner uniquely owns the view and borrows its live parent image.
+        // SAFETY: Framebuffers and descriptor leases borrow this view through command
+        // submission completion. The parent image remains borrowed for this view's life.
         unsafe {
             self.image
                 .device

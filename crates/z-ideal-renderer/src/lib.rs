@@ -16,6 +16,7 @@ mod descriptor;
 mod frame;
 mod graphics_pipeline;
 mod image;
+mod memory;
 mod pipeline;
 mod pipeline_layout;
 mod render_pass;
@@ -154,6 +155,24 @@ pub enum VulkanError {
     /// Image acquisition requires either a semaphore or fence.
     #[error("swapchain image acquisition requires a semaphore or fence")]
     MissingAcquireSynchronization,
+    /// Vulkan memory requirements are empty or invalid.
+    #[error("Vulkan resource returned invalid memory requirements")]
+    InvalidMemoryRequirements,
+    /// A selected memory type index is outside the physical-device memory table.
+    #[error("selected Vulkan memory type index is invalid")]
+    InvalidMemoryTypeIndex,
+    /// The Vulkan memory allocation count limit was reached.
+    #[error("Vulkan memory allocation count limit ({limit}) was reached")]
+    MemoryAllocationLimitReached { limit: u32 },
+    /// A Vulkan memory pool synchronization primitive was poisoned.
+    #[error("Vulkan memory pool synchronization was poisoned")]
+    MemoryPoolPoisoned,
+    /// A Vulkan memory suballocation could not be satisfied.
+    #[error("Vulkan memory suballocation could not be satisfied")]
+    MemorySuballocationFailed,
+    /// A Vulkan memory mapping lock was poisoned.
+    #[error("Vulkan memory mapping synchronization was poisoned")]
+    MemoryMapLockPoisoned,
     /// A Vulkan buffer must have a nonzero size.
     #[error("Vulkan buffer size must be greater than zero")]
     InvalidBufferSize,
@@ -653,6 +672,7 @@ pub struct VulkanDevice {
     max_uniform_buffer_range: vk::DeviceSize,
     max_storage_buffer_range: vk::DeviceSize,
     info: PhysicalDeviceInfo,
+    memory_allocator: memory::MemoryAllocator,
 }
 
 impl VulkanDevice {
@@ -834,6 +854,15 @@ impl VulkanDevice {
             u64::from(physical_device_properties.limits.max_uniform_buffer_range);
         let max_storage_buffer_range =
             u64::from(physical_device_properties.limits.max_storage_buffer_range);
+        // SAFETY: The physical device belongs to the instance retained by this logical device.
+        let memory_properties = unsafe {
+            instance
+                .handle
+                .get_physical_device_memory_properties(physical_device)
+        };
+        let max_memory_allocation_count = physical_device_properties
+            .limits
+            .max_memory_allocation_count;
         let priorities = [1.0_f32];
         let mut queue_family_indices = vec![graphics_queue_family];
         if present_queue_family != graphics_queue_family {
@@ -869,6 +898,8 @@ impl VulkanDevice {
         let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_family, 0) };
         // SAFETY: This queue family was included in logical-device creation.
         let present_queue = unsafe { handle.get_device_queue(present_queue_family, 0) };
+        let memory_allocator =
+            memory::MemoryAllocator::new(&handle, memory_properties, max_memory_allocation_count);
 
         Ok(Self {
             _instance: instance,
@@ -889,10 +920,15 @@ impl VulkanDevice {
             max_uniform_buffer_range,
             max_storage_buffer_range,
             info,
+            memory_allocator,
         })
     }
 
-    /// Returns the raw logical device for renderer-internal integration.
+    /// Returns the raw logical device for renderer-internal or unsafe integration.
+    ///
+    /// Raw Vulkan submissions bypass the engine's fence-scoped resource retention.
+    /// Callers using raw handles must keep every referenced object alive until the
+    /// corresponding GPU work completes and must synchronize before destroying it.
     #[must_use]
     pub fn handle(&self) -> &ash::Device {
         &self.handle
@@ -989,6 +1025,9 @@ impl Drop for VulkanDevice {
                 "Vulkan device was not idle during device destruction"
             );
         }
+        // SAFETY: All resource wrappers borrow this device, so no suballocations
+        // remain live. Clear the shared blocks before destroying the VkDevice.
+        self.memory_allocator.clear();
         // SAFETY: This wrapper uniquely owns the logical device.
         unsafe { self.handle.destroy_device(None) };
     }

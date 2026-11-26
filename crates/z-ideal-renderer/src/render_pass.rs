@@ -237,13 +237,8 @@ impl<'device> VulkanRenderPass<'device> {
 
 impl Drop for VulkanRenderPass<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before render-pass destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the render pass and retains its device.
+        // SAFETY: Framebuffers and pipelines borrow this render pass, and recorded command
+        // buffers retain those wrappers until their submission fences complete.
         unsafe {
             self.device.handle.destroy_render_pass(self.handle, None);
         }
@@ -397,12 +392,6 @@ impl<'render_pass, 'views, 'image, 'device>
 
 impl Drop for VulkanFramebuffer<'_, '_, '_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before framebuffer destruction"
-            );
-        }
         // SAFETY: This wrapper uniquely owns the framebuffer and retains all attachments.
         unsafe {
             self.device.handle.destroy_framebuffer(self.handle, None);
@@ -518,12 +507,6 @@ impl<'render_pass, 'swapchain, 'device>
 
 impl Drop for VulkanSwapchainFramebuffer<'_, '_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before swapchain framebuffer destruction"
-            );
-        }
         // SAFETY: This wrapper uniquely owns the framebuffer and retains its render pass/swapchain.
         unsafe { self.device.handle.destroy_framebuffer(self.handle, None) };
     }
