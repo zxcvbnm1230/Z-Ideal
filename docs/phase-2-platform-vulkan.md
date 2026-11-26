@@ -67,4 +67,4 @@ The engine targets Vulkan portability, not a hard-coded macOS translation layer.
 
 ## Validation
 
-The normal CI matrix must run formatting, Clippy with warnings denied, workspace tests, and documentation on Ubuntu 24.04, Windows, and macOS. Runtime Vulkan initialization and GPU-backed tests require runners with a working Vulkan loader, suitable driver, and validation layers; compile-only CI does not prove those runtime capabilities.
+The normal CI matrix must run formatting, Clippy with warnings denied, workspace tests, and documentation on Ubuntu 24.04, Windows, and macOS. Runtime Vulkan initialization and GPU-backed tests require runners with a working Vulkan loader, suitable driver, and validation layers; compile-only CI does not prove those runtime capabilities. See [the Vulkan hardware validation procedure](phase-2-vulkan-hardware-validation.md) for the physical-GPU smoke-test commands and required report metadata.
