@@ -62,7 +62,8 @@ impl Default for ImageViewConfig {
 /// Image memory prefers the device-local property. The selected memory type is
 /// retained for inspection because Vulkan implementations may expose different
 /// compatible memory configurations. Layout transitions, access barriers,
-/// queue ownership transfers, and resource retirement remain caller responsibilities.
+/// queue ownership and image-layout transitions remain explicit caller responsibilities
+/// through the validated barrier and release/acquire APIs.
 pub struct VulkanImage<'device> {
     pub(super) device: &'device VulkanDevice,
     handle: vk::Image,

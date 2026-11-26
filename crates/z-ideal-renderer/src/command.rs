@@ -129,7 +129,7 @@ impl Default for CommandPoolConfig {
     }
 }
 
-/// Owns a command pool for one enabled graphics or transfer-capable queue family.
+/// Owns a command pool for one enabled graphics, compute-capable, or transfer-capable queue family.
 pub struct VulkanCommandPool<'device> {
     device: &'device VulkanDevice,
     handle: vk::CommandPool,
@@ -1596,6 +1596,24 @@ impl<'device> VulkanQueue<'device> {
             handle: device.graphics_queue,
             family: device.graphics_queue_family,
             flags: device.graphics_queue_flags,
+        }
+    }
+
+    /// Creates a queue wrapper for a selected compute-capable family, if available.
+    #[must_use]
+    pub const fn compute(device: &'device VulkanDevice) -> Option<Self> {
+        if device
+            .graphics_queue_flags
+            .contains(vk::QueueFlags::COMPUTE)
+        {
+            Some(Self::graphics(device))
+        } else if device
+            .transfer_queue_flags
+            .contains(vk::QueueFlags::COMPUTE)
+        {
+            Some(Self::transfer(device))
+        } else {
+            None
         }
     }
 
