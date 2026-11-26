@@ -18,7 +18,7 @@ This procedure supplements the automated Ubuntu 24.04 Mesa lavapipe job. Lavapip
    cargo test -p z-ideal-renderer --all-features --test vulkan_offscreen -- --ignored --nocapture
    ```
 
-   It compiles/reflects shaders, creates a graphics pipeline, draws a triangle, copies the image to host-visible memory, checks pixels, and fails on Vulkan validation errors. Its output reports the selected graphics and transfer queue-family indices. When they differ, the test performs a release/semaphore/acquire ownership transfer; when they match, it tests transfer-queue submission without a family ownership change.
+   It compiles/reflects shaders, creates a graphics pipeline, draws a triangle, copies the image to host-visible memory, checks pixels, and fails on Vulkan validation errors. Its output reports the selected graphics and transfer queue-family indices. When they differ, the test performs a release/semaphore/acquire ownership transfer; when they match, it tests transfer-queue submission without a family ownership change. A cross-family ownership result requires a device where those family indices differ; the current lavapipe runner reports both as family 0.
 4. Run the native X11 presentation test on an X11 desktop, Xwayland, or Xvfb:
 
    ```sh
