@@ -1,4 +1,6 @@
 //! Owned Vulkan swapchain resources and acquire/present operations.
+use std::sync::Arc;
+
 use ash::vk;
 
 use crate::{VulkanDevice, VulkanError, VulkanSurface, api_error};
@@ -28,6 +30,8 @@ pub enum AcquireResult {
     },
     /// The swapchain must be recreated before another image can be acquired.
     OutOfDate,
+    /// No image became available before the acquire timeout elapsed.
+    Timeout,
 }
 
 /// Result of submitting a swapchain image for presentation.
@@ -75,6 +79,8 @@ pub struct VulkanSwapchain<'a> {
     _surface: &'a VulkanSurface,
     loader: ash::khr::swapchain::Device,
     config: SwapchainConfig,
+    identity_token: Arc<()>,
+    generation: u64,
     resources: Option<SwapchainResources<'a>>,
 }
 
@@ -123,6 +129,8 @@ impl<'a> VulkanSwapchain<'a> {
             _surface: surface,
             loader,
             config,
+            identity_token: Arc::new(()),
+            generation: 0,
             resources: Some(resources),
         })
     }
@@ -135,18 +143,68 @@ impl<'a> VulkanSwapchain<'a> {
         if window_extent[0] == 0 || window_extent[1] == 0 {
             return Err(VulkanError::ZeroExtent);
         }
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(VulkanError::SwapchainGenerationOverflow)?;
         self._device.wait_idle()?;
-        self.resources.take();
-        let resources = create_resources(
+        let old_swapchain = self
+            .resources
+            .as_ref()
+            .map_or(vk::SwapchainKHR::null(), |resources| resources.handle);
+        match create_resources(
             self._device,
             self._surface,
             &self.loader,
             window_extent,
             self.config,
-            vk::SwapchainKHR::null(),
-        )?;
-        self.resources = Some(resources);
-        Ok(())
+            old_swapchain,
+        ) {
+            Ok(resources) => {
+                let previous = self.resources.replace(resources);
+                self.generation = next_generation;
+                drop(previous);
+                Ok(())
+            }
+            Err(error) => {
+                // vkCreateSwapchainKHR may retire oldSwapchain before a later image/view
+                // operation fails. Discard it on every failure rather than expose a possibly
+                // retired handle as a ready swapchain.
+                self.resources.take();
+                self.generation = next_generation;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn belongs_to(&self, device: &crate::VulkanDevice) -> bool {
+        std::ptr::eq(self._device, device)
+    }
+
+    pub(crate) fn image_count(&self) -> usize {
+        self.resources
+            .as_ref()
+            .map_or(0, |resources| resources.images.len())
+    }
+
+    pub(crate) fn identity(&self) -> Result<(Arc<()>, u64), VulkanError> {
+        self.resources
+            .as_ref()
+            .map(|_| (Arc::clone(&self.identity_token), self.generation))
+            .ok_or(VulkanError::MissingSwapchain)
+    }
+
+    pub(crate) fn image_view(&self, index: u32) -> Result<vk::ImageView, VulkanError> {
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or(VulkanError::MissingSwapchain)?;
+        resources.image_views.get(index as usize).copied().ok_or(
+            VulkanError::InvalidSwapchainImageIndex {
+                index,
+                image_count: resources.image_views.len(),
+            },
+        )
     }
 
     /// Whether this owner currently has a usable swapchain.
@@ -222,8 +280,10 @@ impl<'a> VulkanSwapchain<'a> {
                 image_index,
                 suboptimal,
             }),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(AcquireResult::OutOfDate),
-            Err(error) => Err(api_error("acquire Vulkan swapchain image", error)),
+            Err(error) => match classify_acquire_error(error) {
+                Some(result) => Ok(result),
+                None => Err(api_error("acquire Vulkan swapchain image", error)),
+            },
         }
     }
 
@@ -400,6 +460,14 @@ fn create_resources<'a>(
     })
 }
 
+fn classify_acquire_error(error: vk::Result) -> Option<AcquireResult> {
+    match error {
+        vk::Result::ERROR_OUT_OF_DATE_KHR => Some(AcquireResult::OutOfDate),
+        vk::Result::TIMEOUT | vk::Result::NOT_READY => Some(AcquireResult::Timeout),
+        _ => None,
+    }
+}
+
 fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::SurfaceFormatKHR> {
     let preferred = [vk::Format::B8G8R8A8_SRGB, vk::Format::R8G8B8A8_SRGB];
     formats
@@ -449,7 +517,10 @@ fn choose_composite_alpha(
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_composite_alpha, choose_present_mode, choose_surface_format};
+    use super::{
+        AcquireResult, choose_composite_alpha, choose_present_mode, choose_surface_format,
+        classify_acquire_error,
+    };
     use ash::vk;
 
     #[test]
@@ -485,6 +556,23 @@ mod tests {
             choose_present_mode(&modes, false),
             Some(vk::PresentModeKHR::MAILBOX)
         );
+    }
+
+    #[test]
+    fn acquire_timeout_and_out_of_date_are_nonfatal_results() {
+        assert_eq!(
+            classify_acquire_error(vk::Result::TIMEOUT),
+            Some(AcquireResult::Timeout)
+        );
+        assert_eq!(
+            classify_acquire_error(vk::Result::NOT_READY),
+            Some(AcquireResult::Timeout)
+        );
+        assert_eq!(
+            classify_acquire_error(vk::Result::ERROR_OUT_OF_DATE_KHR),
+            Some(AcquireResult::OutOfDate)
+        );
+        assert_eq!(classify_acquire_error(vk::Result::ERROR_DEVICE_LOST), None);
     }
 
     #[test]
