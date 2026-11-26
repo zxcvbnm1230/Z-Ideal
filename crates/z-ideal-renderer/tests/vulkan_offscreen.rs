@@ -167,6 +167,15 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         },
     )
     .expect("create host-visible readback buffer");
+    let mut second_readback = VulkanBuffer::new(
+        &device,
+        BufferConfig {
+            size: BYTE_COUNT as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_DST,
+            memory: BufferMemoryLocation::Readback,
+        },
+    )
+    .expect("create second host-visible readback buffer sharing the memory pool");
     let command_pool = VulkanCommandPool::new(&device, CommandPoolConfig::default())
         .expect("create graphics command pool");
     let mut command_buffer = command_pool
@@ -240,17 +249,34 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         )
         .expect("copy rendered image to readback buffer");
     recording
+        .copy_image_to_buffer(
+            &image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            &second_readback,
+            &region,
+        )
+        .expect("copy rendered image to second readback buffer");
+    recording
         .pipeline_barrier(
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
-            &[BufferBarrier {
-                buffer: &readback,
-                source_access: vk::AccessFlags::TRANSFER_WRITE,
-                destination_access: vk::AccessFlags::HOST_READ,
-                offset: 0,
-                size: vk::WHOLE_SIZE,
-            }],
+            &[
+                BufferBarrier {
+                    buffer: &readback,
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::HOST_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+                BufferBarrier {
+                    buffer: &second_readback,
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::HOST_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+            ],
             &[],
         )
         .expect("make transfer writes visible to the host");
@@ -270,6 +296,11 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     readback
         .read(0, &mut pixels)
         .expect("read back rendered pixels");
+    let mut second_pixels = vec![0_u8; BYTE_COUNT];
+    second_readback
+        .read(0, &mut second_pixels)
+        .expect("read back pixels from the second pooled buffer");
+    assert_eq!(pixels, second_pixels, "pooled readback buffers disagree");
     let center = &pixels[((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize..][..4];
     assert!(center[0] > 20, "triangle red channel too small: {center:?}");
     assert!(
@@ -295,6 +326,7 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(framebuffer);
     drop(render_pass);
     drop(image_view);
+    drop(second_readback);
     drop(readback);
     drop(vertex_buffer);
     drop(image);
