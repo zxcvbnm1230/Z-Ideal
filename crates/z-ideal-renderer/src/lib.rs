@@ -82,6 +82,15 @@ impl Default for VulkanConfig {
     }
 }
 
+/// One message emitted by the Khronos Vulkan validation layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationMessage {
+    /// Validation message severity flags.
+    pub severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    /// Human-readable validation message.
+    pub message: String,
+}
+
 /// Vulkan initialization and device-selection failures.
 #[derive(Debug, Error)]
 pub enum VulkanError {
@@ -103,6 +112,9 @@ pub enum VulkanError {
     /// The requested validation layer is missing.
     #[error("requested Vulkan validation layer is unavailable: {0}")]
     MissingValidationLayer(String),
+    /// The validation diagnostic log mutex was poisoned.
+    #[error("Vulkan validation diagnostic log was poisoned")]
+    ValidationLogPoisoned,
     /// No graphics-capable device is available.
     #[error("no Vulkan physical device exposes a graphics-capable queue family")]
     NoGraphicsDevice,
@@ -375,6 +387,7 @@ pub struct VulkanInstance {
     _entry: Entry,
     handle: ash::Instance,
     debug_messenger: Option<DebugMessenger>,
+    validation_messages: Arc<Mutex<Vec<ValidationMessage>>>,
 }
 
 impl VulkanInstance {
@@ -486,8 +499,10 @@ impl VulkanInstance {
                 .map_err(|error| api_error("create Vulkan instance", error))?
         };
 
+        let validation_messages = Arc::new(Mutex::new(Vec::new()));
         let debug_messenger = if config.enable_validation {
             let loader = ash::ext::debug_utils::Instance::new(&entry, &handle);
+            let user_data = Arc::as_ptr(&validation_messages) as *mut std::ffi::c_void;
             let info = vk::DebugUtilsMessengerCreateInfoEXT {
                 message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
                     | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
@@ -495,11 +510,16 @@ impl VulkanInstance {
                     | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 pfn_user_callback: Some(validation_callback),
+                p_user_data: user_data,
                 ..Default::default()
             };
             // SAFETY: The callback is static; the instance and loader outlive this messenger.
             match unsafe { loader.create_debug_utils_messenger(&info, None) } {
-                Ok(messenger) => Some(DebugMessenger { loader, messenger }),
+                Ok(messenger) => Some(DebugMessenger {
+                    loader,
+                    messenger,
+                    _validation_messages: Arc::clone(&validation_messages),
+                }),
                 Err(error) => {
                     // SAFETY: No child objects were created after the instance.
                     unsafe { handle.destroy_instance(None) };
@@ -514,6 +534,7 @@ impl VulkanInstance {
             _entry: entry,
             handle,
             debug_messenger,
+            validation_messages,
         })
     }
 
@@ -521,6 +542,14 @@ impl VulkanInstance {
     #[must_use]
     pub fn handle(&self) -> &ash::Instance {
         &self.handle
+    }
+
+    /// Returns a snapshot of validation-layer messages received so far.
+    pub fn validation_messages(&self) -> Result<Vec<ValidationMessage>, VulkanError> {
+        self.validation_messages
+            .lock()
+            .map(|messages| messages.clone())
+            .map_err(|_| VulkanError::ValidationLogPoisoned)
     }
 
     /// Returns whether validation diagnostics are enabled.
@@ -542,6 +571,7 @@ impl Drop for VulkanInstance {
 struct DebugMessenger {
     loader: ash::ext::debug_utils::Instance,
     messenger: vk::DebugUtilsMessengerEXT,
+    _validation_messages: Arc<Mutex<Vec<ValidationMessage>>>,
 }
 
 impl Drop for DebugMessenger {
@@ -558,17 +588,32 @@ unsafe extern "system" fn validation_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
     if !callback_data.is_null() {
-        // SAFETY: Vulkan guarantees callback_data and p_message are valid during this callback.
-        let message = unsafe { CStr::from_ptr((*callback_data).p_message) };
+        // SAFETY: Vulkan guarantees callback_data is valid during this callback.
+        let message_pointer = unsafe { (*callback_data).p_message };
+        if message_pointer.is_null() {
+            return vk::FALSE;
+        }
+        // SAFETY: Vulkan guarantees p_message is a valid NUL-terminated string during the callback.
+        let message = unsafe { CStr::from_ptr(message_pointer) }
+            .to_string_lossy()
+            .into_owned();
         tracing::warn!(
             target: "z_ideal::vulkan_validation",
             ?severity,
-            message = %message.to_string_lossy(),
+            message = %message,
             "Vulkan validation message"
         );
+        if !user_data.is_null() {
+            // SAFETY: user_data points to the Mutex allocation owned by the Arc retained
+            // in both VulkanInstance and DebugMessenger, so it remains valid throughout callbacks.
+            let messages = unsafe { &*user_data.cast::<Mutex<Vec<ValidationMessage>>>() };
+            if let Ok(mut messages) = messages.lock() {
+                messages.push(ValidationMessage { severity, message });
+            }
+        }
     }
     vk::FALSE
 }
