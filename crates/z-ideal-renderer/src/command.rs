@@ -60,6 +60,60 @@ pub struct ImageBarrier<'image, 'device> {
     pub layer_count: u32,
 }
 
+/// Buffer ownership transfer between two queue families enabled on the device.
+///
+/// Record the release on `source_queue_family` and the acquire on
+/// `destination_queue_family`. Submit the release first, signal a semaphore, and
+/// wait on that semaphore when submitting the acquire.
+pub struct BufferOwnershipTransfer<'buffer, 'device> {
+    /// Buffer whose queue-family ownership is transferred.
+    pub buffer: &'buffer VulkanBuffer<'device>,
+    /// Queue family that currently owns the buffer.
+    pub source_queue_family: u32,
+    /// Queue family that receives ownership.
+    pub destination_queue_family: u32,
+    /// Accesses to make available on the source queue.
+    pub source_access: vk::AccessFlags,
+    /// Accesses to make visible on the destination queue.
+    pub destination_access: vk::AccessFlags,
+    /// Byte offset in the buffer.
+    pub offset: vk::DeviceSize,
+    /// Byte range; `vk::WHOLE_SIZE` selects the remaining buffer.
+    pub size: vk::DeviceSize,
+}
+
+/// Image ownership and layout transfer between two enabled queue families.
+///
+/// The release and acquire barriers must use matching queue-family indices,
+/// layouts, and subresource ranges. Submit the release with a signal semaphore
+/// and make the acquire submission wait on it.
+pub struct ImageOwnershipTransfer<'image, 'device> {
+    /// Image whose queue-family ownership is transferred.
+    pub image: &'image VulkanImage<'device>,
+    /// Queue family that currently owns the image.
+    pub source_queue_family: u32,
+    /// Queue family that receives ownership.
+    pub destination_queue_family: u32,
+    /// Previous image layout.
+    pub old_layout: vk::ImageLayout,
+    /// Layout after ownership transfer.
+    pub new_layout: vk::ImageLayout,
+    /// Accesses to make available on the source queue.
+    pub source_access: vk::AccessFlags,
+    /// Accesses to make visible on the destination queue.
+    pub destination_access: vk::AccessFlags,
+    /// Image aspect mask.
+    pub aspect: vk::ImageAspectFlags,
+    /// First mip level covered by the transfer.
+    pub base_mip_level: u32,
+    /// Number of mip levels covered by the transfer.
+    pub level_count: u32,
+    /// First array layer covered by the transfer.
+    pub base_array_layer: u32,
+    /// Number of array layers covered by the transfer.
+    pub layer_count: u32,
+}
+
 /// Command-pool creation options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandPoolConfig {
@@ -75,7 +129,7 @@ impl Default for CommandPoolConfig {
     }
 }
 
-/// Owns a command pool for the device's graphics queue family.
+/// Owns a command pool for one enabled graphics or transfer-capable queue family.
 pub struct VulkanCommandPool<'device> {
     device: &'device VulkanDevice,
     handle: vk::CommandPool,
@@ -89,7 +143,23 @@ impl<'device> VulkanCommandPool<'device> {
         device: &'device VulkanDevice,
         config: CommandPoolConfig,
     ) -> Result<Self, VulkanError> {
-        if !validate_command_pool_flags(config.flags) {
+        let queue = VulkanQueue::graphics(device);
+        Self::new_for_queue(device, &queue, config)
+    }
+
+    /// Creates a command pool for a queue selected from this device.
+    ///
+    /// Use a transfer queue for copy-only command buffers when a dedicated family
+    /// is available. Graphics and compute commands are rejected on unsupported queues.
+    pub fn new_for_queue(
+        device: &'device VulkanDevice,
+        queue: &VulkanQueue<'device>,
+        config: CommandPoolConfig,
+    ) -> Result<Self, VulkanError> {
+        if !validate_command_pool_flags(config.flags)
+            || !queue.belongs_to(device)
+            || !device.supports_command_queue_family(queue.family)
+        {
             return Err(VulkanError::InvalidCommandPoolConfig);
         }
         // SAFETY: Physical-device metadata belongs to the instance retained by the device.
@@ -100,14 +170,18 @@ impl<'device> VulkanCommandPool<'device> {
                 .get_physical_device_queue_family_properties(device.physical_device)
         };
         let family = queue_families
-            .get(device.graphics_queue_family as usize)
+            .get(queue.family as usize)
             .ok_or(VulkanError::InvalidCommandPoolConfig)?;
-        if family.queue_count == 0 || !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+        if family.queue_count == 0
+            || !family.queue_flags.intersects(
+                vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+            )
+        {
             return Err(VulkanError::InvalidCommandPoolConfig);
         }
         let info = vk::CommandPoolCreateInfo::default()
             .flags(config.flags)
-            .queue_family_index(device.graphics_queue_family);
+            .queue_family_index(queue.family);
         // SAFETY: The queue family belongs to the retained physical device and is enabled.
         let handle = unsafe {
             device
@@ -118,7 +192,7 @@ impl<'device> VulkanCommandPool<'device> {
         Ok(Self {
             device,
             handle,
-            queue_family: device.graphics_queue_family,
+            queue_family: queue.family,
             queue_flags: family.queue_flags,
         })
     }
@@ -364,7 +438,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         clear_values: &[vk::ClearValue],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(self.buffer_mut().pool.device, render_pass.device)
             || !std::ptr::eq(
                 self.buffer_mut().pool.device,
@@ -411,7 +486,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         clear_values: &[vk::ClearValue],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(self.buffer_mut().pool.device, render_pass.device)
             || !std::ptr::eq(
                 self.buffer_mut().pool.device,
@@ -518,7 +594,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         pipeline: &'recording VulkanGraphicsPipeline<'_, '_, 'device>,
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if !std::ptr::eq(self.buffer_mut().pool.device, pipeline.device)
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || !std::ptr::eq(self.buffer_mut().pool.device, pipeline.device)
             || self.buffer_mut().current_render_pass != Some(pipeline.render_pass)
             || self.buffer_mut().current_subpass != pipeline.subpass
         {
@@ -549,13 +626,9 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         pipeline: &'recording VulkanComputePipeline<'_, '_, 'device>,
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_compute(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(self.buffer_mut().pool.device, pipeline.device)
-            || !self
-                .buffer_mut()
-                .pool
-                .queue_flags
-                .contains(vk::QueueFlags::COMPUTE)
         {
             return Err(VulkanError::PipelineShaderStageMismatch);
         }
@@ -575,7 +648,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
     /// Sets the dynamic viewport required by the initial graphics pipeline configuration.
     pub fn set_viewport(&mut self, viewport: vk::Viewport) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if !viewport.x.is_finite()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || !viewport.x.is_finite()
             || !viewport.y.is_finite()
             || !viewport.width.is_finite()
             || !viewport.height.is_finite()
@@ -604,7 +678,10 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
     /// Sets the dynamic scissor required by the initial graphics pipeline configuration.
     pub fn set_scissor(&mut self, scissor: vk::Rect2D) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if scissor.extent.width == 0 || scissor.extent.height == 0 {
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || scissor.extent.width == 0
+            || scissor.extent.height == 0
+        {
             return Err(VulkanError::InvalidCommandBufferState);
         }
         // SAFETY: The command buffer is recording and scissor extent is nonzero.
@@ -629,7 +706,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         self.buffer_mut().require_recording()?;
         let binding_count =
             u32::try_from(buffers.len()).map_err(|_| VulkanError::InvalidCommandBufferState)?;
-        if buffers.is_empty()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || buffers.is_empty()
             || buffers.len() != offsets.len()
             || first_binding.checked_add(binding_count).is_none()
         {
@@ -670,7 +748,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         index_type: vk::IndexType,
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if !std::ptr::eq(self.buffer_mut().pool.device, buffer.device)
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || !std::ptr::eq(self.buffer_mut().pool.device, buffer.device)
             || !buffer.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
             || offset >= buffer.size()
             || !matches!(index_type, vk::IndexType::UINT16 | vk::IndexType::UINT32)
@@ -705,7 +784,17 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         self.buffer_mut().require_recording()?;
         let lease_count =
             u32::try_from(leases.len()).map_err(|_| VulkanError::InvalidCommandBufferState)?;
-        if !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
+        let queue_supports_bind_point = match bind_point {
+            vk::PipelineBindPoint::GRAPHICS => {
+                queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            }
+            vk::PipelineBindPoint::COMPUTE => {
+                queue_supports_compute(self.buffer_mut().pool.queue_flags)
+            }
+            _ => false,
+        };
+        if !queue_supports_bind_point
+            || !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
             || leases.is_empty()
             || first_set
                 .checked_add(lease_count)
@@ -832,7 +921,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         regions: &[vk::BufferCopy],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_transfer(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
             || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
             || source.handle() == destination.handle()
@@ -869,10 +959,11 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
-    /// Copies buffer data into a color image in `TRANSFER_DST_OPTIMAL` or `GENERAL` layout.
+    /// Copies buffer data into an image in `TRANSFER_DST_OPTIMAL` or `GENERAL` layout.
     ///
-    /// This initial implementation supports uncompressed color formats with a known texel size.
-    /// Compressed and depth/stencil formats fail explicitly until block-aware copy metadata exists.
+    /// Supports explicitly enumerated uncompressed color, BC/ETC2/EAC/ASTC compressed,
+    /// and depth/stencil formats. Compressed copies enforce texel-block alignment and
+    /// edge rules; depth/stencil copies select exactly one aspect per region.
     pub fn copy_buffer_to_image(
         &mut self,
         source: &'recording VulkanBuffer<'device>,
@@ -881,7 +972,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         regions: &[vk::BufferImageCopy],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_transfer(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
             || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
             || !source.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -897,7 +989,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         for region in regions {
             validate_buffer_image_copy_region(region, source.size(), destination.config())?;
         }
-        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // SAFETY: Buffer/image usage, layouts, format-block/aspect support, subresources, extents,
         // and required buffer byte ranges were validated; both resources are retained.
         unsafe {
             self.buffer_mut()
@@ -917,7 +1009,9 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
-    /// Copies a color image into a buffer in `TRANSFER_SRC_OPTIMAL` or `GENERAL` layout.
+    /// Copies an image into a buffer in `TRANSFER_SRC_OPTIMAL` or `GENERAL` layout.
+    ///
+    /// Supports the same explicit format/aspect set as [`Self::copy_buffer_to_image`].
     pub fn copy_image_to_buffer(
         &mut self,
         source: &'recording VulkanImage<'device>,
@@ -926,7 +1020,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         regions: &[vk::BufferImageCopy],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_transfer(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
             || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
             || !source
@@ -944,7 +1039,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         for region in regions {
             validate_buffer_image_copy_region(region, destination.size(), source.config())?;
         }
-        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // SAFETY: Buffer/image usage, layouts, format-block/aspect support, subresources, extents,
         // and required buffer byte ranges were validated; both resources are retained.
         unsafe {
             self.buffer_mut()
@@ -982,7 +1077,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         if format_bytes_per_texel(source_config.format).is_none() {
             return Err(VulkanError::UnsupportedCopyFormat);
         }
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_transfer(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
             || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
             || source.handle() == destination.handle()
@@ -1023,8 +1119,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
 
     /// Records buffer/image memory barriers and image layout transitions.
     ///
-    /// Queue-family ownership transfers are not exposed yet; all barriers use
-    /// `QUEUE_FAMILY_IGNORED` because this initial queue wrapper submits to one family.
+    /// Ordinary barriers keep queue-family ownership unchanged. Use the explicit
+    /// release/acquire ownership methods when moving a resource between enabled queues.
     pub fn pipeline_barrier(
         &mut self,
         source_stages: vk::PipelineStageFlags,
@@ -1034,8 +1130,11 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         images: &[ImageBarrier<'recording, 'device>],
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if source_stages.is_empty()
-            || destination_stages.is_empty()
+        if !queue_supports_pipeline_stages(self.buffer_mut().pool.queue_flags, source_stages)
+            || !queue_supports_pipeline_stages(
+                self.buffer_mut().pool.queue_flags,
+                destination_stages,
+            )
             || (buffers.is_empty() && images.is_empty())
         {
             return Err(VulkanError::InvalidCommandBufferState);
@@ -1106,6 +1205,192 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
+    /// Records the release half of a queue-family ownership transfer.
+    ///
+    /// This command buffer must come from the source queue family. Submit it on
+    /// that queue and signal a semaphore; the destination queue must wait on that
+    /// semaphore before recording/submitting the matching acquire barrier.
+    pub fn release_queue_family_ownership(
+        &mut self,
+        source_stages: vk::PipelineStageFlags,
+        buffers: &[BufferOwnershipTransfer<'recording, 'device>],
+        images: &[ImageOwnershipTransfer<'recording, 'device>],
+    ) -> Result<(), VulkanError> {
+        self.record_queue_family_ownership(
+            OwnershipTransferPhase::Release,
+            source_stages,
+            buffers,
+            images,
+        )
+    }
+
+    /// Records the acquire half of a queue-family ownership transfer.
+    ///
+    /// This command buffer must come from the destination queue family and its
+    /// submission must wait on the semaphore signaled by the matching release.
+    pub fn acquire_queue_family_ownership(
+        &mut self,
+        destination_stages: vk::PipelineStageFlags,
+        buffers: &[BufferOwnershipTransfer<'recording, 'device>],
+        images: &[ImageOwnershipTransfer<'recording, 'device>],
+    ) -> Result<(), VulkanError> {
+        self.record_queue_family_ownership(
+            OwnershipTransferPhase::Acquire,
+            destination_stages,
+            buffers,
+            images,
+        )
+    }
+
+    fn record_queue_family_ownership(
+        &mut self,
+        phase: OwnershipTransferPhase,
+        requested_stages: vk::PipelineStageFlags,
+        buffers: &[BufferOwnershipTransfer<'recording, 'device>],
+        images: &[ImageOwnershipTransfer<'recording, 'device>],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let device = self.buffer_mut().pool.device;
+        let current_family = self.buffer_mut().pool.queue_family;
+        if self.buffer_mut().current_render_pass.is_some()
+            || (buffers.is_empty() && images.is_empty())
+            || !queue_supports_pipeline_stages(self.buffer_mut().pool.queue_flags, requested_stages)
+        {
+            return Err(VulkanError::InvalidQueueFamilyOwnershipTransfer);
+        }
+
+        let mut raw_buffers = Vec::with_capacity(buffers.len());
+        for transfer in buffers {
+            if !std::ptr::eq(device, transfer.buffer.device)
+                || !queue_family_transfer_matches(
+                    current_family,
+                    transfer.source_queue_family,
+                    transfer.destination_queue_family,
+                    phase,
+                )
+                || !device.supports_command_queue_family(transfer.source_queue_family)
+                || !device.supports_command_queue_family(transfer.destination_queue_family)
+                || !validate_buffer_barrier_range(
+                    transfer.offset,
+                    transfer.size,
+                    transfer.buffer.size(),
+                )
+            {
+                return Err(VulkanError::InvalidQueueFamilyOwnershipTransfer);
+            }
+            let (source_access, destination_access) = match phase {
+                OwnershipTransferPhase::Release => {
+                    (transfer.source_access, vk::AccessFlags::empty())
+                }
+                OwnershipTransferPhase::Acquire => {
+                    (vk::AccessFlags::empty(), transfer.destination_access)
+                }
+            };
+            raw_buffers.push(
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(source_access)
+                    .dst_access_mask(destination_access)
+                    .src_queue_family_index(transfer.source_queue_family)
+                    .dst_queue_family_index(transfer.destination_queue_family)
+                    .buffer(transfer.buffer.handle())
+                    .offset(transfer.offset)
+                    .size(if transfer.size == vk::WHOLE_SIZE {
+                        transfer.buffer.size() - transfer.offset
+                    } else {
+                        transfer.size
+                    }),
+            );
+        }
+
+        let mut raw_images = Vec::with_capacity(images.len());
+        for transfer in images {
+            let validation_barrier = ImageBarrier {
+                image: transfer.image,
+                old_layout: transfer.old_layout,
+                new_layout: transfer.new_layout,
+                source_access: transfer.source_access,
+                destination_access: transfer.destination_access,
+                aspect: transfer.aspect,
+                base_mip_level: transfer.base_mip_level,
+                level_count: transfer.level_count,
+                base_array_layer: transfer.base_array_layer,
+                layer_count: transfer.layer_count,
+            };
+            if !std::ptr::eq(device, transfer.image.device)
+                || !queue_family_transfer_matches(
+                    current_family,
+                    transfer.source_queue_family,
+                    transfer.destination_queue_family,
+                    phase,
+                )
+                || !device.supports_command_queue_family(transfer.source_queue_family)
+                || !device.supports_command_queue_family(transfer.destination_queue_family)
+                || validate_image_barrier(&validation_barrier, device).is_err()
+            {
+                return Err(VulkanError::InvalidQueueFamilyOwnershipTransfer);
+            }
+            let (source_access, destination_access) = match phase {
+                OwnershipTransferPhase::Release => {
+                    (transfer.source_access, vk::AccessFlags::empty())
+                }
+                OwnershipTransferPhase::Acquire => {
+                    (vk::AccessFlags::empty(), transfer.destination_access)
+                }
+            };
+            raw_images.push(
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(source_access)
+                    .dst_access_mask(destination_access)
+                    .old_layout(transfer.old_layout)
+                    .new_layout(transfer.new_layout)
+                    .src_queue_family_index(transfer.source_queue_family)
+                    .dst_queue_family_index(transfer.destination_queue_family)
+                    .image(transfer.image.handle())
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(transfer.aspect)
+                            .base_mip_level(transfer.base_mip_level)
+                            .level_count(transfer.level_count)
+                            .base_array_layer(transfer.base_array_layer)
+                            .layer_count(transfer.layer_count),
+                    ),
+            );
+        }
+
+        let (source_stages, destination_stages) = match phase {
+            OwnershipTransferPhase::Release => {
+                (requested_stages, vk::PipelineStageFlags::BOTTOM_OF_PIPE)
+            }
+            OwnershipTransferPhase::Acquire => {
+                (vk::PipelineStageFlags::TOP_OF_PIPE, requested_stages)
+            }
+        };
+        // SAFETY: Each transfer's queue-family pair, resource identity, and range
+        // were validated. Caller coordinates release/acquire submissions with a semaphore.
+        unsafe {
+            device.handle.cmd_pipeline_barrier(
+                self.buffer_mut().handle,
+                source_stages,
+                destination_stages,
+                vk::DependencyFlags::empty(),
+                &[],
+                &raw_buffers,
+                &raw_images,
+            );
+        }
+        self.resources.extend(
+            buffers
+                .iter()
+                .map(|transfer| transfer.buffer as &dyn CommandResource),
+        );
+        self.resources.extend(
+            images
+                .iter()
+                .map(|transfer| transfer.image as &dyn CommandResource),
+        );
+        Ok(())
+    }
+
     /// Pushes bytes to a validated push-constant range for the active pipeline layout.
     pub fn push_constants(
         &mut self,
@@ -1127,7 +1412,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
             .ok_or(VulkanError::InvalidPushConstantWrite)?;
         if !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
             || expected_layout != Some(layout.handle())
-            || stages.is_empty()
+            || !queue_supports_shader_stages(self.buffer_mut().pool.queue_flags, stages)
             || offset % 4 != 0
             || size == 0
             || size % 4 != 0
@@ -1158,7 +1443,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         first_instance: u32,
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_none()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_none()
             || self.buffer_mut().graphics_pipeline.is_none()
             || !self.buffer_mut().viewport_set
             || !self.buffer_mut().scissor_set
@@ -1188,7 +1474,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         first_instance: u32,
     ) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_none()
+        if !queue_supports_graphics(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_none()
             || self.buffer_mut().graphics_pipeline.is_none()
             || !self.buffer_mut().viewport_set
             || !self.buffer_mut().scissor_set
@@ -1213,7 +1500,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
     /// Records a compute dispatch outside a render pass.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), VulkanError> {
         self.buffer_mut().require_recording()?;
-        if self.buffer_mut().current_render_pass.is_some()
+        if !queue_supports_compute(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
             || self.buffer_mut().compute_pipeline_layout.is_none()
             || !self
                 .buffer_mut()
@@ -1291,11 +1579,12 @@ impl ExecutableCommandBuffer<'_, '_, '_> {
     }
 }
 
-/// Submits one executable primary command buffer to the device graphics queue.
+/// Submits one executable primary command buffer to a selected device queue.
 pub struct VulkanQueue<'device> {
     device: &'device VulkanDevice,
     handle: vk::Queue,
     family: u32,
+    flags: vk::QueueFlags,
 }
 
 impl<'device> VulkanQueue<'device> {
@@ -1306,6 +1595,18 @@ impl<'device> VulkanQueue<'device> {
             device,
             handle: device.graphics_queue,
             family: device.graphics_queue_family,
+            flags: device.graphics_queue_flags,
+        }
+    }
+
+    /// Creates a queue wrapper for the selected transfer-capable queue.
+    #[must_use]
+    pub const fn transfer(device: &'device VulkanDevice) -> Self {
+        Self {
+            device,
+            handle: device.transfer_queue,
+            family: device.transfer_queue_family,
+            flags: device.transfer_queue_flags,
         }
     }
 
@@ -1321,7 +1622,9 @@ impl<'device> VulkanQueue<'device> {
             || executable.command_buffer.pool.queue_family != self.family
             || executable.command_buffer.state != CommandBufferState::Executable
             || wait_semaphores.len() != wait_stage_masks.len()
-            || wait_stage_masks.iter().any(|stage| stage.is_empty())
+            || wait_stage_masks
+                .iter()
+                .any(|stage| !queue_supports_wait_stages(self.flags, *stage))
             || wait_semaphores
                 .iter()
                 .chain(signal_semaphores)
@@ -1369,7 +1672,9 @@ impl<'device> VulkanQueue<'device> {
             || executable.command_buffer.pool.queue_family != self.family
             || executable.command_buffer.state != CommandBufferState::Executable
             || wait_semaphores.len() != wait_stage_masks.len()
-            || wait_stage_masks.iter().any(|stage| stage.is_empty())
+            || wait_stage_masks
+                .iter()
+                .any(|stage| !queue_supports_wait_stages(self.flags, *stage))
             || wait_semaphores
                 .iter()
                 .chain(signal_semaphores)
@@ -1619,18 +1924,161 @@ fn format_bytes_per_texel(format: vk::Format) -> Option<u64> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FormatCopyBlockInfo {
+    width: u32,
+    height: u32,
+    depth: u32,
+    bytes: u64,
+}
+
+impl FormatCopyBlockInfo {
+    const fn texel(bytes: u64) -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            depth: 1,
+            bytes,
+        }
+    }
+
+    const fn compressed(width: u32, height: u32, bytes: u64) -> Self {
+        Self {
+            width,
+            height,
+            depth: 1,
+            bytes,
+        }
+    }
+}
+
+/// Returns the byte/block geometry for one copy aspect. Combined depth/stencil
+/// formats must be copied one aspect at a time, as required by Vulkan.
+fn format_copy_block_info(
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> Option<FormatCopyBlockInfo> {
+    use vk::{Format as F, ImageAspectFlags as A};
+    if aspect.as_raw().count_ones() != 1 {
+        return None;
+    }
+    if aspect == A::COLOR {
+        if let Some(bytes) = format_bytes_per_texel(format) {
+            return Some(FormatCopyBlockInfo::texel(bytes));
+        }
+        return Some(match format {
+            F::BC1_RGB_UNORM_BLOCK
+            | F::BC1_RGB_SRGB_BLOCK
+            | F::BC1_RGBA_UNORM_BLOCK
+            | F::BC1_RGBA_SRGB_BLOCK
+            | F::BC4_UNORM_BLOCK
+            | F::BC4_SNORM_BLOCK
+            | F::ETC2_R8G8B8_UNORM_BLOCK
+            | F::ETC2_R8G8B8_SRGB_BLOCK
+            | F::ETC2_R8G8B8A1_UNORM_BLOCK
+            | F::ETC2_R8G8B8A1_SRGB_BLOCK
+            | F::EAC_R11_UNORM_BLOCK
+            | F::EAC_R11_SNORM_BLOCK => FormatCopyBlockInfo::compressed(4, 4, 8),
+            F::BC2_UNORM_BLOCK
+            | F::BC2_SRGB_BLOCK
+            | F::BC3_UNORM_BLOCK
+            | F::BC3_SRGB_BLOCK
+            | F::BC5_UNORM_BLOCK
+            | F::BC5_SNORM_BLOCK
+            | F::BC6H_UFLOAT_BLOCK
+            | F::BC6H_SFLOAT_BLOCK
+            | F::BC7_UNORM_BLOCK
+            | F::BC7_SRGB_BLOCK
+            | F::ETC2_R8G8B8A8_UNORM_BLOCK
+            | F::ETC2_R8G8B8A8_SRGB_BLOCK
+            | F::EAC_R11G11_UNORM_BLOCK
+            | F::EAC_R11G11_SNORM_BLOCK => FormatCopyBlockInfo::compressed(4, 4, 16),
+            F::ASTC_4X4_UNORM_BLOCK | F::ASTC_4X4_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(4, 4, 16)
+            }
+            F::ASTC_5X4_UNORM_BLOCK | F::ASTC_5X4_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(5, 4, 16)
+            }
+            F::ASTC_5X5_UNORM_BLOCK | F::ASTC_5X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(5, 5, 16)
+            }
+            F::ASTC_6X5_UNORM_BLOCK | F::ASTC_6X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(6, 5, 16)
+            }
+            F::ASTC_6X6_UNORM_BLOCK | F::ASTC_6X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(6, 6, 16)
+            }
+            F::ASTC_8X5_UNORM_BLOCK | F::ASTC_8X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 5, 16)
+            }
+            F::ASTC_8X6_UNORM_BLOCK | F::ASTC_8X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 6, 16)
+            }
+            F::ASTC_8X8_UNORM_BLOCK | F::ASTC_8X8_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 8, 16)
+            }
+            F::ASTC_10X5_UNORM_BLOCK | F::ASTC_10X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 5, 16)
+            }
+            F::ASTC_10X6_UNORM_BLOCK | F::ASTC_10X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 6, 16)
+            }
+            F::ASTC_10X8_UNORM_BLOCK | F::ASTC_10X8_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 8, 16)
+            }
+            F::ASTC_10X10_UNORM_BLOCK | F::ASTC_10X10_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 10, 16)
+            }
+            F::ASTC_12X10_UNORM_BLOCK | F::ASTC_12X10_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(12, 10, 16)
+            }
+            F::ASTC_12X12_UNORM_BLOCK | F::ASTC_12X12_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(12, 12, 16)
+            }
+            _ => return None,
+        });
+    }
+    if aspect == A::DEPTH {
+        return match format {
+            F::D16_UNORM | F::D16_UNORM_S8_UINT => Some(FormatCopyBlockInfo::texel(2)),
+            F::X8_D24_UNORM_PACK32
+            | F::D32_SFLOAT
+            | F::D24_UNORM_S8_UINT
+            | F::D32_SFLOAT_S8_UINT => Some(FormatCopyBlockInfo::texel(4)),
+            _ => None,
+        };
+    }
+    if aspect == A::STENCIL {
+        return match format {
+            F::S8_UINT | F::D16_UNORM_S8_UINT | F::D24_UNORM_S8_UINT | F::D32_SFLOAT_S8_UINT => {
+                Some(FormatCopyBlockInfo::texel(1))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn div_ceil(value: u64, divisor: u64) -> Option<u64> {
+    if divisor == 0 {
+        return None;
+    }
+    value
+        .checked_add(divisor - 1)
+        .map(|rounded| rounded / divisor)
+}
+
 fn validate_buffer_image_copy_region(
     region: &vk::BufferImageCopy,
     buffer_size: vk::DeviceSize,
     image: crate::ImageConfig,
 ) -> Result<(), VulkanError> {
-    let texel_size =
-        format_bytes_per_texel(image.format).ok_or(VulkanError::UnsupportedCopyFormat)?;
     let subresource = region.image_subresource;
     let extent = region.image_extent;
     let offset = region.image_offset;
+    let block = format_copy_block_info(image.format, subresource.aspect_mask)
+        .ok_or(VulkanError::UnsupportedCopyFormat)?;
     if image.samples != vk::SampleCountFlags::TYPE_1
-        || subresource.aspect_mask != vk::ImageAspectFlags::COLOR
         || subresource.mip_level >= image.mip_levels
         || subresource.layer_count == 0
         || subresource
@@ -1645,9 +2093,15 @@ fn validate_buffer_image_copy_region(
         || offset.z < 0
         || (region.buffer_row_length != 0 && region.buffer_row_length < extent.width)
         || (region.buffer_image_height != 0 && region.buffer_image_height < extent.height)
+        || (region.buffer_row_length != 0 && region.buffer_row_length % block.width != 0)
+        || (region.buffer_image_height != 0 && region.buffer_image_height % block.height != 0)
         || region.buffer_offset % 4 != 0
-        || region.buffer_offset % texel_size != 0
+        || region.buffer_offset % block.bytes != 0
     {
+        return Err(VulkanError::InvalidCopyRegion);
+    }
+    let compressed = block.width > 1 || block.height > 1 || block.depth > 1;
+    if compressed && image.image_type != vk::ImageType::TYPE_2D {
         return Err(VulkanError::InvalidCopyRegion);
     }
     match image.image_type {
@@ -1671,18 +2125,28 @@ fn validate_buffer_image_copy_region(
         height: mip_dimension(image.extent.height, subresource.mip_level),
         depth: mip_dimension(image.extent.depth, subresource.mip_level),
     };
-    if (offset.x as u32)
+    let end_x = (offset.x as u32)
         .checked_add(extent.width)
-        .is_none_or(|end| end > mip_extent.width)
-        || (offset.y as u32)
-            .checked_add(extent.height)
-            .is_none_or(|end| end > mip_extent.height)
-        || (offset.z as u32)
-            .checked_add(extent.depth)
-            .is_none_or(|end| end > mip_extent.depth)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let end_y = (offset.y as u32)
+        .checked_add(extent.height)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let end_z = (offset.z as u32)
+        .checked_add(extent.depth)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    if end_x > mip_extent.width
+        || end_y > mip_extent.height
+        || end_z > mip_extent.depth
+        || (offset.x as u32) % block.width != 0
+        || (offset.y as u32) % block.height != 0
+        || (offset.z as u32) % block.depth != 0
+        || (extent.width % block.width != 0 && end_x != mip_extent.width)
+        || (extent.height % block.height != 0 && end_y != mip_extent.height)
+        || (extent.depth % block.depth != 0 && end_z != mip_extent.depth)
     {
         return Err(VulkanError::InvalidCopyRegion);
     }
+
     let row_texels = u64::from(if region.buffer_row_length == 0 {
         extent.width
     } else {
@@ -1693,26 +2157,36 @@ fn validate_buffer_image_copy_region(
     } else {
         region.buffer_image_height
     });
-    let row_bytes = row_texels
-        .checked_mul(texel_size)
+    let row_blocks =
+        div_ceil(row_texels, u64::from(block.width)).ok_or(VulkanError::InvalidCopyRegion)?;
+    let image_block_rows =
+        div_ceil(image_rows, u64::from(block.height)).ok_or(VulkanError::InvalidCopyRegion)?;
+    let copy_block_rows = div_ceil(u64::from(extent.height), u64::from(block.height))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let copy_block_slices = div_ceil(u64::from(extent.depth), u64::from(block.depth))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let final_row_blocks = div_ceil(u64::from(extent.width), u64::from(block.width))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let row_bytes = row_blocks
+        .checked_mul(block.bytes)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let slice_bytes = row_bytes
-        .checked_mul(image_rows)
+        .checked_mul(image_block_rows)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let layer_bytes = slice_bytes
-        .checked_mul(u64::from(extent.depth))
+        .checked_mul(copy_block_slices)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_layers = layer_bytes
         .checked_mul(u64::from(subresource.layer_count - 1))
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_depth = slice_bytes
-        .checked_mul(u64::from(extent.depth - 1))
+        .checked_mul(copy_block_slices - 1)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_rows = row_bytes
-        .checked_mul(u64::from(extent.height - 1))
+        .checked_mul(copy_block_rows - 1)
         .ok_or(VulkanError::InvalidCopyRegion)?;
-    let final_row = u64::from(extent.width)
-        .checked_mul(texel_size)
+    let final_row = final_row_blocks
+        .checked_mul(block.bytes)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let required = preceding_layers
         .checked_add(preceding_depth)
@@ -1809,6 +2283,81 @@ fn validate_image_copy_region(
         && (dst_offset.z as u32)
             .checked_add(extent.depth)
             .is_some_and(|end| end <= dst_extent.depth)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipTransferPhase {
+    Release,
+    Acquire,
+}
+
+fn queue_family_transfer_matches(
+    current_family: u32,
+    source_family: u32,
+    destination_family: u32,
+    phase: OwnershipTransferPhase,
+) -> bool {
+    source_family != vk::QUEUE_FAMILY_IGNORED
+        && destination_family != vk::QUEUE_FAMILY_IGNORED
+        && source_family != destination_family
+        && match phase {
+            OwnershipTransferPhase::Release => current_family == source_family,
+            OwnershipTransferPhase::Acquire => current_family == destination_family,
+        }
+}
+
+fn queue_supports_transfer(flags: vk::QueueFlags) -> bool {
+    flags.intersects(vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+}
+
+fn queue_supports_graphics(flags: vk::QueueFlags) -> bool {
+    flags.contains(vk::QueueFlags::GRAPHICS)
+}
+
+fn queue_supports_compute(flags: vk::QueueFlags) -> bool {
+    flags.contains(vk::QueueFlags::COMPUTE)
+}
+
+fn queue_supports_pipeline_stages(
+    queue_flags: vk::QueueFlags,
+    stages: vk::PipelineStageFlags,
+) -> bool {
+    let mut supported = vk::PipelineStageFlags::TOP_OF_PIPE
+        | vk::PipelineStageFlags::BOTTOM_OF_PIPE
+        | vk::PipelineStageFlags::HOST
+        | vk::PipelineStageFlags::ALL_COMMANDS;
+    if queue_supports_transfer(queue_flags) {
+        supported |= vk::PipelineStageFlags::TRANSFER;
+    }
+    if queue_supports_graphics(queue_flags) {
+        supported |= vk::PipelineStageFlags::DRAW_INDIRECT
+            | vk::PipelineStageFlags::VERTEX_INPUT
+            | vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::ALL_GRAPHICS;
+    }
+    if queue_supports_compute(queue_flags) {
+        supported |= vk::PipelineStageFlags::COMPUTE_SHADER;
+    }
+    !stages.is_empty() && (stages & !supported).is_empty()
+}
+
+fn queue_supports_wait_stages(queue_flags: vk::QueueFlags, stages: vk::PipelineStageFlags) -> bool {
+    !stages.contains(vk::PipelineStageFlags::HOST)
+        && queue_supports_pipeline_stages(queue_flags, stages)
+}
+
+fn queue_supports_shader_stages(queue_flags: vk::QueueFlags, stages: vk::ShaderStageFlags) -> bool {
+    // The initial graphics-pipeline API enables only vertex and fragment shader stages.
+    let graphics_stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
+    let supported_stages = graphics_stages | vk::ShaderStageFlags::COMPUTE;
+    !stages.is_empty()
+        && (stages & !supported_stages).is_empty()
+        && (!stages.intersects(graphics_stages) || queue_supports_graphics(queue_flags))
+        && (!stages.contains(vk::ShaderStageFlags::COMPUTE) || queue_supports_compute(queue_flags))
 }
 
 fn validate_command_pool_flags(flags: vk::CommandPoolCreateFlags) -> bool {
@@ -2013,7 +2562,10 @@ fn swapchain_target_matches(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBarrierSubresourceRange, format_bytes_per_texel, push_constant_range_covers,
+        ImageBarrierSubresourceRange, OwnershipTransferPhase, format_bytes_per_texel,
+        format_copy_block_info, push_constant_range_covers, queue_family_transfer_matches,
+        queue_supports_compute, queue_supports_graphics, queue_supports_pipeline_stages,
+        queue_supports_shader_stages, queue_supports_transfer, queue_supports_wait_stages,
         ranges_overlap, swapchain_target_matches, validate_buffer_barrier_range,
         validate_buffer_copy_region, validate_buffer_image_copy_region,
         validate_command_pool_flags, validate_dynamic_offset_requirement,
@@ -2022,6 +2574,205 @@ mod tests {
     use crate::descriptor::DynamicOffsetRequirement;
     use ash::vk;
     use std::sync::Arc;
+
+    #[test]
+    fn queue_capabilities_restrict_graphics_compute_and_transfer_commands() {
+        let transfer = vk::QueueFlags::TRANSFER;
+        let graphics = vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER;
+        let compute = vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+
+        assert!(queue_supports_transfer(transfer));
+        assert!(!queue_supports_graphics(transfer));
+        assert!(!queue_supports_compute(transfer));
+        assert!(queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::TOP_OF_PIPE | vk::PipelineStageFlags::TRANSFER,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ));
+
+        assert!(queue_supports_graphics(graphics));
+        assert!(!queue_supports_compute(graphics));
+        assert!(queue_supports_pipeline_stages(
+            graphics,
+            vk::PipelineStageFlags::VERTEX_INPUT | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            graphics,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        ));
+        assert!(queue_supports_shader_stages(
+            graphics,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+        ));
+        assert!(!queue_supports_shader_stages(
+            graphics,
+            vk::ShaderStageFlags::COMPUTE
+        ));
+
+        assert!(queue_supports_compute(compute));
+        assert!(!queue_supports_graphics(compute));
+        assert!(queue_supports_pipeline_stages(
+            compute,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+        ));
+        assert!(queue_supports_shader_stages(
+            compute,
+            vk::ShaderStageFlags::COMPUTE
+        ));
+        assert!(!queue_supports_shader_stages(
+            compute,
+            vk::ShaderStageFlags::VERTEX
+        ));
+    }
+
+    #[test]
+    fn queue_family_ownership_requires_matching_distinct_enabled_families() {
+        assert!(queue_family_transfer_matches(
+            2,
+            2,
+            5,
+            OwnershipTransferPhase::Release,
+        ));
+        assert!(queue_family_transfer_matches(
+            5,
+            2,
+            5,
+            OwnershipTransferPhase::Acquire,
+        ));
+        assert!(!queue_family_transfer_matches(
+            5,
+            2,
+            5,
+            OwnershipTransferPhase::Release,
+        ));
+        assert!(!queue_family_transfer_matches(
+            2,
+            2,
+            5,
+            OwnershipTransferPhase::Acquire,
+        ));
+        assert!(!queue_family_transfer_matches(
+            2,
+            2,
+            2,
+            OwnershipTransferPhase::Release,
+        ));
+        assert!(!queue_family_transfer_matches(
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED,
+            5,
+            OwnershipTransferPhase::Release,
+        ));
+        assert!(!queue_family_transfer_matches(
+            2,
+            2,
+            vk::QUEUE_FAMILY_IGNORED,
+            OwnershipTransferPhase::Release,
+        ));
+    }
+
+    #[test]
+    fn queue_capabilities_restrict_recorded_commands_and_pipeline_stages() {
+        let transfer = vk::QueueFlags::TRANSFER;
+        let graphics = vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER;
+        let compute = vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+
+        assert!(queue_supports_transfer(transfer));
+        assert!(queue_supports_transfer(graphics));
+        assert!(queue_supports_transfer(compute));
+        assert!(!queue_supports_graphics(transfer));
+        assert!(!queue_supports_compute(transfer));
+        assert!(queue_supports_graphics(graphics));
+        assert!(queue_supports_compute(compute));
+
+        assert!(queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::TOP_OF_PIPE,
+        ));
+        assert!(queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            graphics,
+            vk::PipelineStageFlags::GEOMETRY_SHADER,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            graphics,
+            vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+        ));
+        assert!(queue_supports_pipeline_stages(
+            graphics,
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER,
+        ));
+        assert!(queue_supports_pipeline_stages(
+            compute,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+        ));
+        assert!(!queue_supports_pipeline_stages(
+            transfer,
+            vk::PipelineStageFlags::empty(),
+        ));
+        assert!(queue_supports_wait_stages(
+            transfer,
+            vk::PipelineStageFlags::TRANSFER,
+        ));
+        assert!(!queue_supports_wait_stages(
+            transfer,
+            vk::PipelineStageFlags::HOST,
+        ));
+        assert!(!queue_supports_wait_stages(
+            transfer,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+        ));
+    }
+
+    #[test]
+    fn queue_capabilities_restrict_shader_stages() {
+        assert!(queue_supports_shader_stages(
+            vk::QueueFlags::GRAPHICS,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+        ));
+        assert!(queue_supports_shader_stages(
+            vk::QueueFlags::COMPUTE,
+            vk::ShaderStageFlags::COMPUTE,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::TRANSFER,
+            vk::ShaderStageFlags::COMPUTE,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::GRAPHICS,
+            vk::ShaderStageFlags::COMPUTE,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::COMPUTE,
+            vk::ShaderStageFlags::FRAGMENT,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::GRAPHICS,
+            vk::ShaderStageFlags::GEOMETRY,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::GRAPHICS,
+            vk::ShaderStageFlags::TESSELLATION_CONTROL,
+        ));
+        assert!(!queue_supports_shader_stages(
+            vk::QueueFlags::GRAPHICS,
+            vk::ShaderStageFlags::empty(),
+        ));
+    }
 
     #[test]
     fn validates_command_pool_flags_and_barrier_ranges() {
@@ -2194,6 +2945,43 @@ mod tests {
     }
 
     #[test]
+    fn copy_block_metadata_covers_compressed_and_depth_stencil_aspects() {
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::BC1_RGBA_UNORM_BLOCK,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Some(super::FormatCopyBlockInfo::compressed(4, 4, 8))
+        );
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::ASTC_10X6_SRGB_BLOCK,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Some(super::FormatCopyBlockInfo::compressed(10, 6, 16))
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D24_UNORM_S8_UINT, vk::ImageAspectFlags::DEPTH,),
+            Some(super::FormatCopyBlockInfo::texel(4))
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D24_UNORM_S8_UINT, vk::ImageAspectFlags::STENCIL,),
+            Some(super::FormatCopyBlockInfo::texel(1))
+        );
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::D24_UNORM_S8_UINT,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            ),
+            None
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D32_SFLOAT, vk::ImageAspectFlags::COLOR,),
+            None
+        );
+    }
+
+    #[test]
     fn validates_buffer_image_copy_required_bytes_and_subresource_bounds() {
         let image = test_color_image_config();
         let region = test_buffer_image_region();
@@ -2214,8 +3002,85 @@ mod tests {
             .image_subresource(region.image_subresource)
             .image_extent(region.image_extent);
         assert!(validate_buffer_image_copy_region(&misaligned, 128, image).is_err());
-        let unsupported = crate::ImageConfig {
+        let compressed = crate::ImageConfig {
             format: vk::Format::BC1_RGBA_UNORM_BLOCK,
+            ..image
+        };
+        let compressed_region = vk::BufferImageCopy {
+            image_extent: vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ..region
+        };
+        assert!(validate_buffer_image_copy_region(&compressed_region, 8, compressed).is_ok());
+        assert!(validate_buffer_image_copy_region(&compressed_region, 7, compressed).is_err());
+        let compressed_edge_image = crate::ImageConfig {
+            extent: vk::Extent3D {
+                width: 5,
+                height: 4,
+                depth: 1,
+            },
+            ..compressed
+        };
+        let compressed_edge_region = vk::BufferImageCopy {
+            image_extent: vk::Extent3D {
+                width: 5,
+                height: 4,
+                depth: 1,
+            },
+            ..compressed_region
+        };
+        assert!(
+            validate_buffer_image_copy_region(&compressed_edge_region, 16, compressed_edge_image)
+                .is_ok()
+        );
+        let bad_compressed_row = vk::BufferImageCopy {
+            buffer_row_length: 6,
+            ..compressed_region
+        };
+        assert!(validate_buffer_image_copy_region(&bad_compressed_row, 32, compressed).is_err());
+        let bad_compressed_offset = vk::BufferImageCopy {
+            image_offset: vk::Offset3D { x: 1, y: 0, z: 0 },
+            ..compressed_region
+        };
+        assert!(validate_buffer_image_copy_region(&bad_compressed_offset, 32, compressed).is_err());
+
+        let depth_stencil = crate::ImageConfig {
+            format: vk::Format::D24_UNORM_S8_UINT,
+            ..image
+        };
+        let depth_region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        let stencil_region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::STENCIL,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        assert!(validate_buffer_image_copy_region(&depth_region, 64, depth_stencil).is_ok());
+        assert!(validate_buffer_image_copy_region(&stencil_region, 16, depth_stencil).is_ok());
+        let combined_aspect = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        assert!(matches!(
+            validate_buffer_image_copy_region(&combined_aspect, 64, depth_stencil),
+            Err(crate::VulkanError::UnsupportedCopyFormat)
+        ));
+
+        let unsupported = crate::ImageConfig {
+            format: vk::Format::R64G64B64_SFLOAT,
             ..image
         };
         assert!(matches!(

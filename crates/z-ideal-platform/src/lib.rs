@@ -1,10 +1,15 @@
 //! Cross-platform native window and event-loop integration.
 #![forbid(unsafe_code)]
 
+pub mod frame_policy;
 pub mod input;
 pub mod input_router;
 pub mod window_manager;
 
+pub use frame_policy::{
+    FrameDecision, FrameMode, FramePolicy, FramePolicyConfig, FramePolicyError,
+    FrameSuspensionReason,
+};
 pub use input::{InputState, ScrollDelta};
 pub use input_router::{InputRouter, InputRouterError, InputWindowId};
 pub use window_manager::{WindowEventOutcome, WindowManager, WindowManagerError, WindowMetrics};
