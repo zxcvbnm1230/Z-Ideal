@@ -18,7 +18,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Dynamic Vulkan loader discovery with actionable loader and API errors.
 - Instance-extension and validation-layer discovery before instance creation.
 - Optional Khronos validation layer and debug-utils callback; requested validation fails clearly if unavailable.
-- The debug callback retains thread-safe validation diagnostics, exposed through `VulkanInstance::validation_messages()` for automated tests and runtime diagnostics.
+- The debug callback retains thread-safe validation diagnostics, exposed through `VulkanInstance::validation_messages()` for automated tests and runtime diagnostics. The lavapipe integration test exercises GLSL compilation/reflection, shader modules, graphics-pipeline creation, vertex-buffer upload/binding, a non-indexed draw, render-pass transitions, image-to-buffer copy, host visibility, and deterministic pixel readback.
 - Vulkan portability enumeration is enabled when advertised; macOS initialization fails clearly if that extension is absent.
 - Deterministic physical-device preference and graphics-queue-family selection.
 - Portability-subset device extension enabled when advertised.
@@ -59,7 +59,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Higher-level application frame policy: redraw throttling, pause/resume behavior, and integration of minimized-window events with the scheduler. The low-level scheduler reports zero-extent and out-of-date conditions but does not own the platform event loop.
 - Swapchain-backed framebuffer helpers for depth attachments, multisample color/depth targets, and multi-attachment render passes.
 - Compressed and depth/stencil buffer-image copy metadata, explicit queue-family ownership transfers, and deferred resource retirement.
-- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job now performs deterministic offscreen clear/copy/readback and fails on validation errors; software Vulkan is not a substitute for physical-GPU testing.
+- Physical-GPU presentation tests and hardware-specific validation. A dedicated Ubuntu 24.04 Mesa lavapipe job performs deterministic offscreen graphics-pipeline rendering, buffer upload, triangle drawing, image copy/readback, pixel assertions, and fails on Vulkan validation errors; software Vulkan is not a substitute for physical-GPU testing.
 
 ## Platform notes
 
