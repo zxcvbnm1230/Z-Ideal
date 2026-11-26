@@ -656,10 +656,11 @@ pub struct PhysicalDeviceInfo {
     pub api_version: u32,
 }
 
-/// Owns a logical device and its selected graphics, transfer, and presentation queues.
+/// Owns a logical device and its selected graphics, optional compute, transfer, and presentation queues.
 ///
-/// A dedicated transfer family is preferred when available; otherwise the graphics
-/// or compute-capable family is used as the transfer queue.
+/// A dedicated transfer family is preferred when graphics supports compute. If it
+/// does not, a compute-capable family is preferred for transfer work so compute
+/// pipelines remain executable through the selected compute queue wrapper.
 pub struct VulkanDevice {
     _instance: Arc<VulkanInstance>,
     handle: ash::Device,
@@ -739,7 +740,12 @@ impl VulkanDevice {
                 continue;
             };
             let graphics_queue_family = graphics_index as u32;
-            let Some(transfer_queue_family) = select_transfer_queue_family(&queue_families) else {
+            let graphics_supports_compute = queue_families[graphics_index]
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE);
+            let Some(transfer_queue_family) =
+                select_transfer_queue_family(&queue_families, graphics_supports_compute)
+            else {
                 continue;
             };
 
@@ -1012,6 +1018,30 @@ impl VulkanDevice {
         self.transfer_queue_family
     }
 
+    /// Returns a compute-capable queue when either selected family supports compute.
+    #[must_use]
+    pub const fn compute_queue(&self) -> Option<vk::Queue> {
+        if self.graphics_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.graphics_queue)
+        } else if self.transfer_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.transfer_queue)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the queue-family index selected for compute commands, when available.
+    #[must_use]
+    pub const fn compute_queue_family(&self) -> Option<u32> {
+        if self.graphics_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.graphics_queue_family)
+        } else if self.transfer_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.transfer_queue_family)
+        } else {
+            None
+        }
+    }
+
     pub(crate) const fn supports_command_queue_family(&self, family: u32) -> bool {
         family == self.graphics_queue_family || family == self.transfer_queue_family
     }
@@ -1158,7 +1188,10 @@ impl VulkanContext {
     }
 }
 
-fn select_transfer_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Option<u32> {
+fn select_transfer_queue_family(
+    queue_families: &[vk::QueueFamilyProperties],
+    graphics_supports_compute: bool,
+) -> Option<u32> {
     queue_families
         .iter()
         .enumerate()
@@ -1169,15 +1202,16 @@ fn select_transfer_queue_family(queue_families: &[vk::QueueFamilyProperties]) ->
                 )
         })
         .min_by_key(|(_, family)| {
-            if family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            let dedicated_transfer = family.queue_flags.contains(vk::QueueFlags::TRANSFER)
                 && !family
                     .queue_flags
-                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-            {
+                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
+            let compute_capable = family.queue_flags.contains(vk::QueueFlags::COMPUTE);
+            if !graphics_supports_compute && compute_capable {
                 0
-            } else if family.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            {
+            } else if dedicated_transfer {
+                if graphics_supports_compute { 0 } else { 1 }
+            } else if compute_capable {
                 1
             } else {
                 2
@@ -1233,7 +1267,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(select_transfer_queue_family(&families), Some(1));
+        assert_eq!(select_transfer_queue_family(&families, true), Some(1));
     }
 
     #[test]
@@ -1250,14 +1284,39 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(select_transfer_queue_family(&families), Some(1));
-        assert_eq!(select_transfer_queue_family(&families[..1]), Some(0));
+        assert_eq!(select_transfer_queue_family(&families, false), Some(1));
+        assert_eq!(select_transfer_queue_family(&families[..1], true), Some(0));
         let implicit_transfer = [vk::QueueFamilyProperties {
             queue_flags: vk::QueueFlags::GRAPHICS,
             queue_count: 1,
             ..Default::default()
         }];
-        assert_eq!(select_transfer_queue_family(&implicit_transfer), Some(0));
+        assert_eq!(
+            select_transfer_queue_family(&implicit_transfer, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn transfer_queue_selection_preserves_compute_when_graphics_lacks_it() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(select_transfer_queue_family(&families, false), Some(2));
     }
 
     #[test]
@@ -1267,7 +1326,7 @@ mod tests {
             queue_count: 0,
             ..Default::default()
         }];
-        assert_eq!(select_transfer_queue_family(&families), None);
+        assert_eq!(select_transfer_queue_family(&families, true), None);
     }
 
     #[test]
