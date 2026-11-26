@@ -1,15 +1,21 @@
 //! Owned Vulkan command pools, command-buffer recording, and queue submissions.
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use ash::vk;
 
 use crate::{
     DescriptorSetLeaseRef, FenceConfig, FenceWaitResult, VulkanBuffer, VulkanComputePipeline,
     VulkanDevice, VulkanError, VulkanFence, VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage,
-    VulkanPipelineLayout, VulkanRenderPass, VulkanSemaphore, api_error,
+    VulkanPipelineLayout, VulkanRenderPass, VulkanSemaphore, VulkanSwapchainFramebuffer, api_error,
 };
 
 trait CommandResource {}
 impl CommandResource for VulkanRenderPass<'_> {}
 impl CommandResource for VulkanFramebuffer<'_, '_, '_, '_> {}
+impl CommandResource for VulkanSwapchainFramebuffer<'_, '_, '_> {}
 impl CommandResource for VulkanGraphicsPipeline<'_, '_, '_> {}
 impl CommandResource for VulkanComputePipeline<'_, '_, '_> {}
 impl CommandResource for VulkanPipelineLayout<'_, '_> {}
@@ -226,6 +232,7 @@ impl<'pool, 'device> VulkanCommandBuffer<'pool, 'device> {
             command_buffer: Some(self),
             descriptor_leases: Vec::new(),
             resources: Vec::new(),
+            swapchain_target: None,
         })
     }
 
@@ -324,6 +331,7 @@ pub struct CommandBufferRecording<'recording, 'pool, 'device> {
     command_buffer: Option<&'recording mut VulkanCommandBuffer<'pool, 'device>>,
     descriptor_leases: Vec<DescriptorSetLeaseRef<'recording>>,
     resources: Vec<&'recording dyn CommandResource>,
+    swapchain_target: Option<(Arc<()>, u64, u32)>,
 }
 
 impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'device> {
@@ -349,6 +357,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
             command_buffer,
             _descriptor_leases: std::mem::take(&mut self.descriptor_leases),
             _resources: std::mem::take(&mut self.resources),
+            swapchain_target: self.swapchain_target.take(),
         })
     }
 
@@ -382,6 +391,65 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
             .clear_values(clear_values);
         // SAFETY: The render pass/framebuffer are compatible and retained by the caller;
         // the command-buffer recording guard's borrow prevents them being dropped here.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_begin_render_pass(
+                self.buffer_mut().handle,
+                &info,
+                vk::SubpassContents::INLINE,
+            );
+        }
+        self.buffer_mut().current_render_pass = Some(render_pass.handle());
+        self.buffer_mut().current_subpass = 0;
+        self.buffer_mut().graphics_pipeline = None;
+        self.buffer_mut().viewport_set = false;
+        self.buffer_mut().scissor_set = false;
+        self.resources.push(render_pass);
+        self.resources.push(framebuffer);
+        Ok(())
+    }
+
+    /// Begins a render pass using one image from the active swapchain.
+    pub fn begin_swapchain_render_pass(
+        &mut self,
+        render_pass: &'recording VulkanRenderPass<'device>,
+        framebuffer: &'recording VulkanSwapchainFramebuffer<'_, '_, 'device>,
+        clear_values: &[vk::ClearValue],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(self.buffer_mut().pool.device, render_pass.device)
+            || !std::ptr::eq(
+                self.buffer_mut().pool.device,
+                framebuffer.render_pass().device,
+            )
+            || framebuffer.render_pass().handle() != render_pass.handle()
+            || clear_values.len() != render_pass.attachment_count()
+        {
+            return Err(VulkanError::InvalidCommandBufferState);
+        }
+        let identity = framebuffer.swapchain_identity()?;
+        let target = (identity.0, identity.1, framebuffer.image_index());
+        if let Some(existing) = &self.swapchain_target {
+            if !Arc::ptr_eq(&existing.0, &target.0)
+                || existing.1 != target.1
+                || existing.2 != target.2
+            {
+                return Err(VulkanError::InvalidSwapchainFramebuffer);
+            }
+        } else {
+            self.swapchain_target = Some(target);
+        }
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: framebuffer.extent(),
+        };
+        let info = vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass.handle())
+            .framebuffer(framebuffer.handle())
+            .render_area(area)
+            .clear_values(clear_values);
+        // SAFETY: The framebuffer retains the compatible swapchain view and render pass
+        // for the recording borrow; the command buffer is in its recording state.
         unsafe {
             self.buffer_mut().pool.device.handle.cmd_begin_render_pass(
                 self.buffer_mut().handle,
@@ -992,6 +1060,7 @@ pub struct ExecutableCommandBuffer<'recording, 'pool, 'device> {
     command_buffer: &'recording mut VulkanCommandBuffer<'pool, 'device>,
     _descriptor_leases: Vec<DescriptorSetLeaseRef<'recording>>,
     _resources: Vec<&'recording dyn CommandResource>,
+    swapchain_target: Option<(Arc<()>, u64, u32)>,
 }
 
 impl Drop for ExecutableCommandBuffer<'_, '_, '_> {
@@ -1020,6 +1089,10 @@ impl ExecutableCommandBuffer<'_, '_, '_> {
     #[must_use]
     pub const fn handle(&self) -> vk::CommandBuffer {
         self.command_buffer.handle
+    }
+
+    pub(crate) fn targets_swapchain(&self, identity: &(Arc<()>, u64), image_index: u32) -> bool {
+        swapchain_target_matches(self.swapchain_target.as_ref(), identity, image_index)
     }
 }
 
@@ -1057,7 +1130,55 @@ impl<'device> VulkanQueue<'device> {
             || wait_semaphores
                 .iter()
                 .chain(signal_semaphores)
-                .any(|semaphore| !std::ptr::eq(self.device, semaphore.device))
+                .any(|semaphore| !semaphore.belongs_to(self.device))
+        {
+            return Err(VulkanError::InvalidQueueSubmission);
+        }
+        let wait_handles: Vec<_> = wait_semaphores
+            .iter()
+            .map(|semaphore| semaphore.handle())
+            .collect();
+        let signal_handles: Vec<_> = signal_semaphores
+            .iter()
+            .map(|semaphore| semaphore.handle())
+            .collect();
+        if !validate_semaphore_handle_sets(&wait_handles, &signal_handles) {
+            return Err(VulkanError::InvalidQueueSubmission);
+        }
+        let fence = Arc::new(VulkanFence::new(
+            self.device,
+            FenceConfig { signaled: false },
+        )?);
+        self.submit_with_fence(
+            executable,
+            wait_semaphores,
+            wait_stage_masks,
+            signal_semaphores,
+            fence,
+            None,
+        )
+    }
+
+    pub(crate) fn submit_with_fence<'recording, 'pool>(
+        &self,
+        executable: ExecutableCommandBuffer<'recording, 'pool, 'device>,
+        wait_semaphores: &[&VulkanSemaphore<'device>],
+        wait_stage_masks: &[vk::PipelineStageFlags],
+        signal_semaphores: &[&VulkanSemaphore<'device>],
+        fence: Arc<VulkanFence<'device>>,
+        slot_lease: Option<Arc<AtomicBool>>,
+    ) -> Result<VulkanSubmission<'recording, 'pool, 'device>, VulkanError> {
+        if !fence.belongs_to(self.device)
+            || fence.is_signaled()?
+            || !std::ptr::eq(self.device, executable.command_buffer.pool.device)
+            || executable.command_buffer.pool.queue_family != self.family
+            || executable.command_buffer.state != CommandBufferState::Executable
+            || wait_semaphores.len() != wait_stage_masks.len()
+            || wait_stage_masks.iter().any(|stage| stage.is_empty())
+            || wait_semaphores
+                .iter()
+                .chain(signal_semaphores)
+                .any(|semaphore| !semaphore.belongs_to(self.device))
         {
             return Err(VulkanError::InvalidQueueSubmission);
         }
@@ -1078,7 +1199,6 @@ impl<'device> VulkanQueue<'device> {
             .wait_dst_stage_mask(wait_stage_masks)
             .command_buffers(&command_handles)
             .signal_semaphores(&signal_handles);
-        let fence = VulkanFence::new(self.device, FenceConfig { signaled: false })?;
         let _queue_guard = self
             .device
             .queue_submit_lock
@@ -1093,11 +1213,19 @@ impl<'device> VulkanQueue<'device> {
                 .map_err(|error| api_error("submit Vulkan command buffer", error))?;
         }
         executable.command_buffer.state = CommandBufferState::Pending;
+        if let Some(lease) = &slot_lease {
+            lease.store(true, Ordering::Release);
+        }
         Ok(VulkanSubmission {
             executable: Some(executable),
             fence,
             completed: false,
+            slot_lease,
         })
+    }
+
+    pub(crate) fn belongs_to(&self, device: &VulkanDevice) -> bool {
+        std::ptr::eq(self.device, device)
     }
 
     /// Returns the queue-family index used by this wrapper.
@@ -1110,8 +1238,9 @@ impl<'device> VulkanQueue<'device> {
 /// Retains a submitted command buffer and its descriptor leases until its fence signals.
 pub struct VulkanSubmission<'recording, 'pool, 'device> {
     executable: Option<ExecutableCommandBuffer<'recording, 'pool, 'device>>,
-    fence: VulkanFence<'device>,
+    fence: Arc<VulkanFence<'device>>,
     completed: bool,
+    slot_lease: Option<Arc<AtomicBool>>,
 }
 
 impl VulkanSubmission<'_, '_, '_> {
@@ -1135,8 +1264,11 @@ impl VulkanSubmission<'_, '_, '_> {
     }
 
     /// Returns the fence handle associated with this submission.
+    ///
+    /// The handle is only associated with this submission until completion is acknowledged;
+    /// a frame scheduler may reset and reuse it after `wait` reports `Signaled`.
     #[must_use]
-    pub const fn fence(&self) -> vk::Fence {
+    pub fn fence(&self) -> vk::Fence {
         self.fence.handle()
     }
 
@@ -1145,20 +1277,35 @@ impl VulkanSubmission<'_, '_, '_> {
             executable.command_buffer.state = CommandBufferState::Executable;
         }
         self.completed = true;
+        if let Some(lease) = &self.slot_lease {
+            lease.store(false, Ordering::Release);
+        }
     }
 }
 
 impl Drop for VulkanSubmission<'_, '_, '_> {
     fn drop(&mut self) {
         if !self.completed {
-            if let Some(executable) = &mut self.executable {
-                if let Err(error) = executable.command_buffer.pool.device.wait_idle() {
-                    tracing::warn!(
-                        ?error,
-                        "Vulkan device idle wait failed before submission resources were released"
-                    );
+            match self.fence.wait(u64::MAX) {
+                Ok(FenceWaitResult::Signaled) => self.mark_completed(),
+                Ok(FenceWaitResult::Timeout) => {
+                    tracing::error!("infinite Vulkan submission-fence wait unexpectedly timed out")
                 }
-                executable.command_buffer.state = CommandBufferState::Executable;
+                Err(error) => {
+                    let idle_result = self
+                        .executable
+                        .as_ref()
+                        .map(|executable| executable.command_buffer.pool.device.wait_idle());
+                    if matches!(idle_result, Some(Ok(()))) {
+                        self.mark_completed();
+                    } else {
+                        tracing::error!(
+                            ?error,
+                            ?idle_result,
+                            "failed to establish Vulkan completion before releasing submission resources"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1353,15 +1500,27 @@ fn push_constant_range_covers(
     true
 }
 
+fn swapchain_target_matches(
+    target: Option<&(Arc<()>, u64, u32)>,
+    identity: &(Arc<()>, u64),
+    image_index: u32,
+) -> bool {
+    target.is_some_and(|target| {
+        Arc::ptr_eq(&target.0, &identity.0) && target.1 == identity.1 && target.2 == image_index
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBarrierSubresourceRange, push_constant_range_covers, validate_buffer_barrier_range,
-        validate_command_pool_flags, validate_dynamic_offset_requirement,
-        validate_image_barrier_range, validate_semaphore_handle_sets,
+        ImageBarrierSubresourceRange, push_constant_range_covers, swapchain_target_matches,
+        validate_buffer_barrier_range, validate_command_pool_flags,
+        validate_dynamic_offset_requirement, validate_image_barrier_range,
+        validate_semaphore_handle_sets,
     };
     use crate::descriptor::DynamicOffsetRequirement;
     use ash::vk;
+    use std::sync::Arc;
 
     #[test]
     fn validates_command_pool_flags_and_barrier_ranges() {
@@ -1450,6 +1609,26 @@ mod tests {
             &[],
             &[vk::Semaphore::null()]
         ));
+    }
+
+    #[test]
+    fn swapchain_command_targets_must_match_owner_generation_and_image_index() {
+        let token = Arc::new(());
+        let identity = (Arc::clone(&token), 4);
+        let target = (Arc::clone(&token), 4, 2);
+        assert!(swapchain_target_matches(Some(&target), &identity, 2));
+        assert!(!swapchain_target_matches(Some(&target), &identity, 1));
+        assert!(!swapchain_target_matches(
+            Some(&target),
+            &(Arc::clone(&token), 5),
+            2
+        ));
+        assert!(!swapchain_target_matches(
+            Some(&target),
+            &(Arc::new(()), 4),
+            2
+        ));
+        assert!(!swapchain_target_matches(None, &identity, 2));
     }
 
     #[test]

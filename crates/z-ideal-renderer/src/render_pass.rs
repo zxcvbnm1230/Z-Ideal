@@ -1,7 +1,7 @@
 //! Owned Vulkan render passes and framebuffers.
 use ash::vk;
 
-use crate::{VulkanDevice, VulkanError, VulkanImageView, api_error};
+use crate::{VulkanDevice, VulkanError, VulkanImageView, VulkanSwapchain, api_error};
 
 /// One attachment description owned by a render-pass configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +410,140 @@ impl Drop for VulkanFramebuffer<'_, '_, '_, '_> {
     }
 }
 
+/// Owns a framebuffer targeting one image from a Vulkan swapchain.
+///
+/// The framebuffer borrows both the render pass and swapchain. Recreating or dropping either
+/// resource is therefore prevented while this framebuffer exists.
+pub struct VulkanSwapchainFramebuffer<'render_pass, 'swapchain, 'device> {
+    device: &'device VulkanDevice,
+    handle: vk::Framebuffer,
+    render_pass: &'render_pass VulkanRenderPass<'device>,
+    _swapchain: &'swapchain VulkanSwapchain<'device>,
+    image_index: u32,
+    extent: vk::Extent2D,
+}
+
+impl<'render_pass, 'swapchain, 'device>
+    VulkanSwapchainFramebuffer<'render_pass, 'swapchain, 'device>
+{
+    /// Creates a framebuffer for a single-color-attachment render pass and one swapchain image.
+    pub fn new(
+        render_pass: &'render_pass VulkanRenderPass<'device>,
+        swapchain: &'swapchain VulkanSwapchain<'device>,
+        image_index: u32,
+    ) -> Result<Self, VulkanError> {
+        let attachment = render_pass.config.attachments.first();
+        let swapchain_format = swapchain.format().ok_or(VulkanError::MissingSwapchain)?;
+        if !swapchain.belongs_to(render_pass.device)
+            || render_pass.config.attachments.len() != 1
+            || !attachment.is_some_and(|attachment| {
+                is_compatible_swapchain_attachment(
+                    attachment,
+                    render_pass.attachment_usage[0],
+                    swapchain_format,
+                )
+            })
+        {
+            return Err(VulkanError::InvalidSwapchainFramebuffer);
+        }
+        let extent = swapchain.extent().ok_or(VulkanError::MissingSwapchain)?;
+        // SAFETY: Physical-device limits belong to the instance retained by the render pass.
+        let limits = unsafe {
+            render_pass
+                .device
+                ._instance
+                .handle
+                .get_physical_device_properties(render_pass.device.physical_device)
+                .limits
+        };
+        if extent.width > limits.max_framebuffer_width
+            || extent.height > limits.max_framebuffer_height
+        {
+            return Err(VulkanError::InvalidSwapchainFramebuffer);
+        }
+        let view = swapchain.image_view(image_index)?;
+        let attachments = [view];
+        let info = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass.handle)
+            .attachments(&attachments)
+            .width(extent.width)
+            .height(extent.height)
+            .layers(1);
+        // SAFETY: The swapchain owns the image view and is borrowed for this framebuffer's
+        // lifetime; the compatible render pass is likewise retained by the returned owner.
+        let handle = unsafe {
+            render_pass
+                .device
+                .handle
+                .create_framebuffer(&info, None)
+                .map_err(|error| api_error("create Vulkan swapchain framebuffer", error))?
+        };
+        Ok(Self {
+            device: render_pass.device,
+            handle,
+            render_pass,
+            _swapchain: swapchain,
+            image_index,
+            extent,
+        })
+    }
+
+    /// Returns the raw Vulkan framebuffer handle.
+    #[must_use]
+    pub const fn handle(&self) -> vk::Framebuffer {
+        self.handle
+    }
+
+    /// Returns the render pass this framebuffer was created for.
+    #[must_use]
+    pub const fn render_pass(&self) -> &'render_pass VulkanRenderPass<'device> {
+        self.render_pass
+    }
+
+    pub(crate) fn swapchain_identity(&self) -> Result<(std::sync::Arc<()>, u64), VulkanError> {
+        self._swapchain.identity()
+    }
+
+    /// Returns the swapchain image index targeted by this framebuffer.
+    #[must_use]
+    pub const fn image_index(&self) -> u32 {
+        self.image_index
+    }
+
+    /// Returns the framebuffer extent.
+    pub const fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+}
+
+impl Drop for VulkanSwapchainFramebuffer<'_, '_, '_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.device.wait_idle() {
+            tracing::warn!(
+                ?error,
+                "Vulkan device idle wait failed before swapchain framebuffer destruction"
+            );
+        }
+        // SAFETY: This wrapper uniquely owns the framebuffer and retains its render pass/swapchain.
+        unsafe { self.device.handle.destroy_framebuffer(self.handle, None) };
+    }
+}
+
+fn is_compatible_swapchain_attachment(
+    attachment: &RenderPassAttachmentConfig,
+    usage: vk::ImageUsageFlags,
+    swapchain_format: vk::Format,
+) -> bool {
+    attachment.format == swapchain_format
+        && attachment.samples == vk::SampleCountFlags::TYPE_1
+        && usage == vk::ImageUsageFlags::COLOR_ATTACHMENT
+        && matches!(
+            attachment.initial_layout,
+            vk::ImageLayout::UNDEFINED | vk::ImageLayout::PRESENT_SRC_KHR
+        )
+        && attachment.final_layout == vk::ImageLayout::PRESENT_SRC_KHR
+}
+
 struct RenderPassMetadata {
     attachment_usage: Vec<vk::ImageUsageFlags>,
     subpass_color_counts: Vec<u32>,
@@ -735,5 +869,75 @@ mod tests {
             }],
         };
         assert!(validate_render_pass_config(&bad_dependency).is_err());
+    }
+}
+
+#[cfg(test)]
+mod swapchain_framebuffer_tests {
+    use super::{RenderPassAttachmentConfig, is_compatible_swapchain_attachment};
+    use ash::vk;
+
+    fn attachment() -> RenderPassAttachmentConfig {
+        RenderPassAttachmentConfig {
+            format: vk::Format::B8G8R8A8_SRGB,
+            samples: vk::SampleCountFlags::TYPE_1,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+        }
+    }
+
+    #[test]
+    fn accepts_single_sample_color_attachment_with_present_final_layout() {
+        assert!(is_compatible_swapchain_attachment(
+            &attachment(),
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::Format::B8G8R8A8_SRGB
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_format_samples_usage_and_final_layout() {
+        let mut config = attachment();
+        config.format = vk::Format::R8G8B8A8_UNORM;
+        assert!(!is_compatible_swapchain_attachment(
+            &config,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::Format::B8G8R8A8_SRGB
+        ));
+        config = attachment();
+        config.samples = vk::SampleCountFlags::TYPE_4;
+        assert!(!is_compatible_swapchain_attachment(
+            &config,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::Format::B8G8R8A8_SRGB
+        ));
+        config = attachment();
+        config.final_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        assert!(!is_compatible_swapchain_attachment(
+            &config,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::Format::B8G8R8A8_SRGB
+        ));
+        config = attachment();
+        assert!(!is_compatible_swapchain_attachment(
+            &config,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::Format::B8G8R8A8_SRGB
+        ));
+    }
+
+    #[test]
+    fn accepts_present_layout_as_the_next_frame_initial_layout() {
+        let mut config = attachment();
+        config.initial_layout = vk::ImageLayout::PRESENT_SRC_KHR;
+        assert!(is_compatible_swapchain_attachment(
+            &config,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::Format::B8G8R8A8_SRGB
+        ));
     }
 }

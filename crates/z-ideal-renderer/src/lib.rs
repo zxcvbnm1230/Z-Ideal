@@ -13,6 +13,7 @@ use winit::window::Window;
 mod buffer;
 mod command;
 mod descriptor;
+mod frame;
 mod graphics_pipeline;
 mod image;
 mod pipeline;
@@ -35,6 +36,7 @@ pub use descriptor::{
     DescriptorSetLeaseRef, ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool,
     VulkanDescriptorSet, VulkanDescriptorSetLayout,
 };
+pub use frame::{FrameStart, FrameTicket, VulkanFrameScheduler};
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use pipeline::VulkanComputePipeline;
@@ -42,6 +44,7 @@ pub use pipeline_layout::VulkanPipelineLayout;
 pub use render_pass::{
     RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
     RenderPassDependency, RenderPassSubpassConfig, VulkanFramebuffer, VulkanRenderPass,
+    VulkanSwapchainFramebuffer,
 };
 pub use sampler::{SamplerConfig, VulkanSampler};
 pub use shader::{
@@ -311,6 +314,27 @@ pub enum VulkanError {
     /// Push-constant write is not covered by the pipeline layout.
     #[error("Vulkan push-constant write is invalid or not covered by the pipeline layout")]
     InvalidPushConstantWrite,
+    /// The frame scheduler was constructed with an invalid zero frame count.
+    #[error("Vulkan frame scheduler requires at least one frame in flight")]
+    InvalidFrameSchedulerConfig,
+    /// The swapchain belongs to a different logical device than the frame scheduler.
+    #[error("Vulkan frame scheduler and swapchain belong to different devices")]
+    FrameSwapchainDeviceMismatch,
+    /// A frame submission command buffer does not target the acquired swapchain image.
+    #[error("Vulkan frame command buffer does not render to the acquired swapchain image")]
+    FrameCommandBufferTargetMismatch,
+    /// A render pass is incompatible with a swapchain-backed framebuffer.
+    #[error("Vulkan render pass is incompatible with the swapchain image format or usage")]
+    InvalidSwapchainFramebuffer,
+    /// A swapchain identity generation counter overflowed during recreation.
+    #[error("Vulkan swapchain generation counter overflowed")]
+    SwapchainGenerationOverflow,
+    /// The caller recreated or replaced a swapchain while a frame ticket still owns an acquired image.
+    #[error("cannot replace a swapchain while an acquired frame ticket is still pending")]
+    PendingFrameSwapchainChanged,
+    /// A failed queue submission left the frame scheduler unable to restore a signaled fence.
+    #[error("Vulkan frame scheduler is poisoned after a failed fence recovery")]
+    FrameSchedulerPoisoned,
     /// Host synchronization for queue submission was poisoned.
     #[error("Vulkan queue submission synchronization lock was poisoned")]
     QueueSynchronizationPoisoned,

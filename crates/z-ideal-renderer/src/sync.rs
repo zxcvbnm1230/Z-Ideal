@@ -54,6 +54,10 @@ impl<'device> VulkanFence<'device> {
         self.handle
     }
 
+    pub(crate) fn belongs_to(&self, device: &VulkanDevice) -> bool {
+        std::ptr::eq(self.device, device)
+    }
+
     /// Waits until this fence is signaled or the timeout expires.
     pub fn wait(&self, timeout_nanoseconds: u64) -> Result<FenceWaitResult, VulkanError> {
         // SAFETY: The fence is live and belongs to the retained logical device.
@@ -133,6 +137,10 @@ impl<'device> VulkanSemaphore<'device> {
     #[must_use]
     pub const fn handle(&self) -> vk::Semaphore {
         self.handle
+    }
+
+    pub(crate) fn belongs_to(&self, device: &VulkanDevice) -> bool {
+        std::ptr::eq(self.device, device)
     }
 }
 
