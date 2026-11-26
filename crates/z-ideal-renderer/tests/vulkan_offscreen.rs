@@ -3,23 +3,24 @@ use std::sync::Arc;
 use ash::vk;
 use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferMemoryLocation, CommandPoolConfig, FenceWaitResult,
-    ImageConfig, ImageViewConfig, RenderPassAttachmentConfig, RenderPassAttachmentReference,
-    RenderPassConfig, RenderPassDependency, RenderPassSubpassConfig, VulkanBuffer,
-    VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanImage, VulkanInstance,
-    VulkanQueue, VulkanRenderPass,
+    GraphicsPipelineConfig, ImageConfig, ImageViewConfig, RenderPassAttachmentConfig,
+    RenderPassAttachmentReference, RenderPassConfig, RenderPassDependency, RenderPassSubpassConfig,
+    ShaderCompileConfig, ShaderStage, VulkanBuffer, VulkanCommandPool, VulkanConfig, VulkanDevice,
+    VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage, VulkanInstance, VulkanPipelineLayout,
+    VulkanQueue, VulkanRenderPass, VulkanShaderModule, compile_glsl,
 };
 
 /// Runs on the dedicated Mesa lavapipe + Khronos validation CI job.
 #[test]
 #[ignore = "requires a Vulkan ICD and Khronos validation layer; run in the dedicated Vulkan CI job"]
-fn offscreen_clear_copy_readback_is_deterministic_and_validation_clean() {
-    const WIDTH: u32 = 16;
-    const HEIGHT: u32 = 16;
+fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean() {
+    const WIDTH: u32 = 32;
+    const HEIGHT: u32 = 32;
     const BYTE_COUNT: usize = (WIDTH * HEIGHT * 4) as usize;
 
     let instance = Arc::new(
         VulkanInstance::new(&VulkanConfig {
-            application_name: "Z Ideal Vulkan offscreen validation".to_owned(),
+            application_name: "Z Ideal Vulkan offscreen triangle validation".to_owned(),
             enable_validation: true,
         })
         .expect("create Vulkan instance with validation enabled"),
@@ -86,6 +87,77 @@ fn offscreen_clear_copy_readback_is_deterministic_and_validation_clean() {
         1,
     )
     .expect("create offscreen framebuffer");
+
+    let vertex_values = [
+        -0.8_f32, -0.8, 1.0, 0.0, 0.0, 0.8, -0.8, 0.0, 1.0, 0.0, 0.0, 0.8, 0.0, 0.0, 1.0,
+    ];
+    let vertex_bytes: Vec<u8> = vertex_values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect();
+    let mut vertex_buffer = VulkanBuffer::new(
+        &device,
+        BufferConfig {
+            size: vertex_bytes.len() as u64,
+            usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+            memory: BufferMemoryLocation::Upload,
+        },
+    )
+    .expect("create host-visible vertex buffer");
+    vertex_buffer
+        .write(0, &vertex_bytes)
+        .expect("upload triangle vertices");
+
+    let vertex_shader = VulkanShaderModule::new(
+        &device,
+        compile_glsl(
+            "#version 450\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec3 vertex_color;\nlayout(location=0) out vec3 color;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); color = vertex_color; }",
+            &ShaderCompileConfig::new(ShaderStage::Vertex),
+        )
+        .expect("compile triangle vertex shader"),
+    )
+    .expect("create triangle vertex shader module");
+    let fragment_shader = VulkanShaderModule::new(
+        &device,
+        compile_glsl(
+            "#version 450\nlayout(location=0) in vec3 color;\nlayout(location=0) out vec4 output_color;\nvoid main() { output_color = vec4(color, 1.0); }",
+            &ShaderCompileConfig::new(ShaderStage::Fragment),
+        )
+        .expect("compile triangle fragment shader"),
+    )
+    .expect("create triangle fragment shader module");
+    let pipeline_layout = VulkanPipelineLayout::new(&device, &[], &[])
+        .expect("create empty graphics pipeline layout");
+    let graphics_pipeline = VulkanGraphicsPipeline::new(
+        &pipeline_layout,
+        &vertex_shader,
+        &fragment_shader,
+        &render_pass,
+        &GraphicsPipelineConfig {
+            vertex_bindings: vec![vk::VertexInputBindingDescription {
+                binding: 0,
+                stride: 20,
+                input_rate: vk::VertexInputRate::VERTEX,
+            }],
+            vertex_attributes: vec![
+                vk::VertexInputAttributeDescription {
+                    location: 0,
+                    binding: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 0,
+                },
+                vk::VertexInputAttributeDescription {
+                    location: 1,
+                    binding: 0,
+                    format: vk::Format::R32G32B32_SFLOAT,
+                    offset: 8,
+                },
+            ],
+            ..GraphicsPipelineConfig::default()
+        },
+    )
+    .expect("create triangle graphics pipeline");
+
     let mut readback = VulkanBuffer::new(
         &device,
         BufferConfig {
@@ -104,7 +176,7 @@ fn offscreen_clear_copy_readback_is_deterministic_and_validation_clean() {
 
     let clear = [vk::ClearValue {
         color: vk::ClearColorValue {
-            float32: [0.25, 0.5, 0.75, 1.0],
+            float32: [0.0, 0.0, 0.0, 1.0],
         },
     }];
     let region = [vk::BufferImageCopy::default()
@@ -130,6 +202,32 @@ fn offscreen_clear_copy_readback_is_deterministic_and_validation_clean() {
     recording
         .begin_render_pass(&render_pass, &framebuffer, &clear)
         .expect("begin offscreen render pass");
+    recording
+        .bind_graphics_pipeline(&graphics_pipeline)
+        .expect("bind triangle graphics pipeline");
+    recording
+        .set_viewport(vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: WIDTH as f32,
+            height: HEIGHT as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        })
+        .expect("set offscreen viewport");
+    recording
+        .set_scissor(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+        })
+        .expect("set offscreen scissor");
+    recording
+        .bind_vertex_buffers(0, &[&vertex_buffer], &[0])
+        .expect("bind triangle vertex buffer");
+    recording.draw(3, 1, 0, 0).expect("draw triangle");
     recording
         .end_render_pass()
         .expect("end offscreen render pass");
@@ -172,28 +270,35 @@ fn offscreen_clear_copy_readback_is_deterministic_and_validation_clean() {
     readback
         .read(0, &mut pixels)
         .expect("read back rendered pixels");
-    for pixel in pixels.chunks_exact(4) {
-        assert!(
-            (i16::from(pixel[0]) - 64).abs() <= 1,
-            "unexpected red channel: {pixel:?}"
-        );
-        assert!(
-            (i16::from(pixel[1]) - 128).abs() <= 1,
-            "unexpected green channel: {pixel:?}"
-        );
-        assert!(
-            (i16::from(pixel[2]) - 191).abs() <= 1,
-            "unexpected blue channel: {pixel:?}"
-        );
-        assert_eq!(pixel[3], 255, "unexpected alpha channel: {pixel:?}");
-    }
+    let center = &pixels[((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize..][..4];
+    assert!(center[0] > 20, "triangle red channel too small: {center:?}");
+    assert!(
+        center[1] > 20,
+        "triangle green channel too small: {center:?}"
+    );
+    assert!(
+        center[2] > 20,
+        "triangle blue channel too small: {center:?}"
+    );
+    assert_eq!(center[3], 255, "unexpected triangle alpha: {center:?}");
+    let corner = &pixels[0..4];
+    assert_eq!(
+        corner,
+        &[0, 0, 0, 255],
+        "unexpected clear pixel: {corner:?}"
+    );
 
-    drop(command_pool);
+    drop(graphics_pipeline);
+    drop(pipeline_layout);
+    drop(fragment_shader);
+    drop(vertex_shader);
     drop(framebuffer);
     drop(render_pass);
     drop(image_view);
     drop(readback);
+    drop(vertex_buffer);
     drop(image);
+    drop(command_pool);
     drop(device);
 
     let validation_errors: Vec<_> = instance
