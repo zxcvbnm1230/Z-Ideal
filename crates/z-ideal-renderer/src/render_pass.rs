@@ -287,58 +287,8 @@ impl<'render_pass, 'views, 'image, 'device>
         {
             return Err(VulkanError::InvalidFramebufferConfig);
         }
-        for (index, (view, attachment)) in attachments
-            .iter()
-            .zip(&render_pass.config.attachments)
-            .enumerate()
-        {
-            if !std::ptr::eq(render_pass.device, view.image().device) {
-                return Err(VulkanError::FramebufferDeviceMismatch);
-            }
-            let image = view.image().config();
-            let view_config = view.config();
-            let mip_width = (image.extent.width >> view_config.base_mip_level).max(1);
-            let mip_height = (image.extent.height >> view_config.base_mip_level).max(1);
-            let required_usage = render_pass.attachment_usage[index];
-            if image.format != attachment.format
-                || image.samples != attachment.samples
-                || mip_width < extent.width
-                || mip_height < extent.height
-                || layers > view_config.layer_count
-                || !image.usage.contains(required_usage)
-                || (required_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                    && !view_config.aspect.contains(vk::ImageAspectFlags::COLOR))
-                || (required_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                    && !view_config
-                        .aspect
-                        .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL))
-            {
-                return Err(VulkanError::InvalidFramebufferConfig);
-            }
-            // SAFETY: The physical device belongs to the instance retained by the render pass.
-            let format_properties = unsafe {
-                render_pass
-                    .device
-                    ._instance
-                    .handle
-                    .get_physical_device_format_properties(
-                        render_pass.device.physical_device,
-                        image.format,
-                    )
-            };
-            let available_features = if image.tiling == vk::ImageTiling::LINEAR {
-                format_properties.linear_tiling_features
-            } else {
-                format_properties.optimal_tiling_features
-            };
-            if (required_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                && !available_features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT))
-                || (required_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                    && !available_features
-                        .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT))
-            {
-                return Err(VulkanError::InvalidFramebufferConfig);
-            }
+        for (index, view) in attachments.iter().enumerate() {
+            validate_framebuffer_attachment(render_pass, index, view, extent, layers)?;
         }
         let raw_views: Vec<_> = attachments.iter().map(|view| view.handle()).collect();
         let info = vk::FramebufferCreateInfo::default()
@@ -399,6 +349,67 @@ impl Drop for VulkanFramebuffer<'_, '_, '_, '_> {
     }
 }
 
+fn validate_framebuffer_attachment(
+    render_pass: &VulkanRenderPass<'_>,
+    index: usize,
+    view: &VulkanImageView<'_, '_>,
+    extent: vk::Extent2D,
+    layers: u32,
+) -> Result<(), VulkanError> {
+    let attachment = render_pass
+        .config
+        .attachments
+        .get(index)
+        .ok_or(VulkanError::InvalidFramebufferConfig)?;
+    let required_usage = *render_pass
+        .attachment_usage
+        .get(index)
+        .ok_or(VulkanError::InvalidFramebufferConfig)?;
+    if !std::ptr::eq(render_pass.device, view.image().device) {
+        return Err(VulkanError::FramebufferDeviceMismatch);
+    }
+    let image = view.image().config();
+    let view_config = view.config();
+    let mip_width = (image.extent.width >> view_config.base_mip_level).max(1);
+    let mip_height = (image.extent.height >> view_config.base_mip_level).max(1);
+    if image.format != attachment.format
+        || image.samples != attachment.samples
+        || mip_width < extent.width
+        || mip_height < extent.height
+        || layers > view_config.layer_count
+        || !image.usage.contains(required_usage)
+        || (required_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            && !view_config.aspect.contains(vk::ImageAspectFlags::COLOR))
+        || (required_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            && !view_config
+                .aspect
+                .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL))
+    {
+        return Err(VulkanError::InvalidFramebufferConfig);
+    }
+    // SAFETY: The physical device belongs to the instance retained by the render pass.
+    let format_properties = unsafe {
+        render_pass
+            .device
+            ._instance
+            .handle
+            .get_physical_device_format_properties(render_pass.device.physical_device, image.format)
+    };
+    let available_features = if image.tiling == vk::ImageTiling::LINEAR {
+        format_properties.linear_tiling_features
+    } else {
+        format_properties.optimal_tiling_features
+    };
+    if (required_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        && !available_features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT))
+        || (required_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            && !available_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT))
+    {
+        return Err(VulkanError::InvalidFramebufferConfig);
+    }
+    Ok(())
+}
+
 /// Owns a framebuffer targeting one image from a Vulkan swapchain.
 ///
 /// The framebuffer borrows both the render pass and swapchain. Recreating or dropping either
@@ -408,6 +419,7 @@ pub struct VulkanSwapchainFramebuffer<'render_pass, 'swapchain, 'device> {
     handle: vk::Framebuffer,
     render_pass: &'render_pass VulkanRenderPass<'device>,
     _swapchain: &'swapchain VulkanSwapchain<'device>,
+    _attachments: Vec<&'swapchain VulkanImageView<'swapchain, 'device>>,
     image_index: u32,
     extent: vk::Extent2D,
 }
@@ -421,17 +433,30 @@ impl<'render_pass, 'swapchain, 'device>
         swapchain: &'swapchain VulkanSwapchain<'device>,
         image_index: u32,
     ) -> Result<Self, VulkanError> {
-        let attachment = render_pass.config.attachments.first();
+        Self::with_attachments(render_pass, swapchain, image_index, 0, &[])
+    }
+
+    /// Creates a swapchain framebuffer with additional owned-image attachments.
+    ///
+    /// `swapchain_attachment_index` identifies the render-pass attachment backed by the
+    /// acquired swapchain image. `attachments` supplies every other attachment in render-pass
+    /// order with that slot omitted. This supports depth/stencil attachments and multisample
+    /// color targets whose resolve attachment is the swapchain image.
+    pub fn with_attachments(
+        render_pass: &'render_pass VulkanRenderPass<'device>,
+        swapchain: &'swapchain VulkanSwapchain<'device>,
+        image_index: u32,
+        swapchain_attachment_index: u32,
+        attachments: &[&'swapchain VulkanImageView<'swapchain, 'device>],
+    ) -> Result<Self, VulkanError> {
+        let attachment_count = render_pass.config.attachments.len();
         let swapchain_format = swapchain.format().ok_or(VulkanError::MissingSwapchain)?;
         if !swapchain.belongs_to(render_pass.device)
-            || render_pass.config.attachments.len() != 1
-            || !attachment.is_some_and(|attachment| {
-                is_compatible_swapchain_attachment(
-                    attachment,
-                    render_pass.attachment_usage[0],
-                    swapchain_format,
-                )
-            })
+            || !swapchain_attachment_arity_is_valid(
+                attachment_count,
+                swapchain_attachment_index,
+                attachments.len(),
+            )
         {
             return Err(VulkanError::InvalidSwapchainFramebuffer);
         }
@@ -447,19 +472,67 @@ impl<'render_pass, 'swapchain, 'device>
         };
         if extent.width > limits.max_framebuffer_width
             || extent.height > limits.max_framebuffer_height
+            || limits.max_framebuffer_layers < 1
         {
             return Err(VulkanError::InvalidSwapchainFramebuffer);
         }
-        let view = swapchain.image_view(image_index)?;
-        let attachments = [view];
+        let swapchain_view = swapchain.image_view(image_index)?;
+        let swapchain_attachment = render_pass
+            .config
+            .attachments
+            .get(swapchain_attachment_index as usize)
+            .ok_or(VulkanError::InvalidSwapchainFramebuffer)?;
+        let swapchain_usage = *render_pass
+            .attachment_usage
+            .get(swapchain_attachment_index as usize)
+            .ok_or(VulkanError::InvalidSwapchainFramebuffer)?;
+        if !is_compatible_swapchain_attachment(
+            swapchain_attachment,
+            swapchain_usage,
+            swapchain_format,
+        ) {
+            return Err(VulkanError::InvalidSwapchainFramebuffer);
+        }
+        // SAFETY: The physical device belongs to the instance retained by the render pass.
+        let swapchain_format_properties = unsafe {
+            render_pass
+                .device
+                ._instance
+                .handle
+                .get_physical_device_format_properties(
+                    render_pass.device.physical_device,
+                    swapchain_format,
+                )
+        };
+        if !swapchain_format_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT)
+        {
+            return Err(VulkanError::InvalidSwapchainFramebuffer);
+        }
+
+        let mut raw_views = Vec::with_capacity(attachment_count);
+        let mut additional_index = 0;
+        for attachment_index in 0..attachment_count {
+            if attachment_index == swapchain_attachment_index as usize {
+                raw_views.push(swapchain_view);
+            } else {
+                let view = attachments
+                    .get(additional_index)
+                    .ok_or(VulkanError::InvalidSwapchainFramebuffer)?;
+                validate_framebuffer_attachment(render_pass, attachment_index, view, extent, 1)?;
+                raw_views.push(view.handle());
+                additional_index += 1;
+            }
+        }
         let info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass.handle)
-            .attachments(&attachments)
+            .attachments(&raw_views)
             .width(extent.width)
             .height(extent.height)
             .layers(1);
-        // SAFETY: The swapchain owns the image view and is borrowed for this framebuffer's
-        // lifetime; the compatible render pass is likewise retained by the returned owner.
+        // SAFETY: The swapchain and every additional image view are borrowed for the
+        // framebuffer lifetime; all attachment compatibility was validated above.
         let handle = unsafe {
             render_pass
                 .device
@@ -472,6 +545,7 @@ impl<'render_pass, 'swapchain, 'device>
             handle,
             render_pass,
             _swapchain: swapchain,
+            _attachments: attachments.to_vec(),
             image_index,
             extent,
         })
@@ -510,6 +584,15 @@ impl Drop for VulkanSwapchainFramebuffer<'_, '_, '_> {
         // SAFETY: This wrapper uniquely owns the framebuffer and retains its render pass/swapchain.
         unsafe { self.device.handle.destroy_framebuffer(self.handle, None) };
     }
+}
+
+fn swapchain_attachment_arity_is_valid(
+    attachment_count: usize,
+    swapchain_attachment_index: u32,
+    additional_attachment_count: usize,
+) -> bool {
+    (swapchain_attachment_index as usize) < attachment_count
+        && additional_attachment_count.checked_add(1) == Some(attachment_count)
 }
 
 fn is_compatible_swapchain_attachment(
@@ -857,7 +940,10 @@ mod tests {
 
 #[cfg(test)]
 mod swapchain_framebuffer_tests {
-    use super::{RenderPassAttachmentConfig, is_compatible_swapchain_attachment};
+    use super::{
+        RenderPassAttachmentConfig, is_compatible_swapchain_attachment,
+        swapchain_attachment_arity_is_valid,
+    };
     use ash::vk;
 
     fn attachment() -> RenderPassAttachmentConfig {
@@ -871,6 +957,21 @@ mod swapchain_framebuffer_tests {
             initial_layout: vk::ImageLayout::UNDEFINED,
             final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
         }
+    }
+
+    #[test]
+    fn validates_swapchain_attachment_slot_and_additional_attachment_count() {
+        assert!(swapchain_attachment_arity_is_valid(1, 0, 0));
+        assert!(swapchain_attachment_arity_is_valid(3, 2, 2));
+        assert!(swapchain_attachment_arity_is_valid(3, 0, 2));
+        assert!(!swapchain_attachment_arity_is_valid(0, 0, 0));
+        assert!(!swapchain_attachment_arity_is_valid(2, 2, 1));
+        assert!(!swapchain_attachment_arity_is_valid(3, 1, 1));
+        assert!(!swapchain_attachment_arity_is_valid(
+            usize::MAX,
+            0,
+            usize::MAX
+        ));
     }
 
     #[test]
