@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use ash::vk;
 use z_ideal_renderer::{
-    BufferBarrier, BufferConfig, BufferMemoryLocation, CommandPoolConfig, FenceWaitResult,
-    GraphicsPipelineConfig, ImageConfig, ImageViewConfig, RenderPassAttachmentConfig,
-    RenderPassAttachmentReference, RenderPassConfig, RenderPassDependency, RenderPassSubpassConfig,
-    ShaderCompileConfig, ShaderStage, VulkanBuffer, VulkanCommandPool, VulkanConfig, VulkanDevice,
-    VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage, VulkanInstance, VulkanPipelineLayout,
-    VulkanQueue, VulkanRenderPass, VulkanShaderModule, compile_glsl,
+    BufferBarrier, BufferConfig, BufferMemoryLocation, BufferOwnershipTransfer, CommandPoolConfig,
+    FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig,
+    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
+    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanBuffer,
+    VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline,
+    VulkanImage, VulkanInstance, VulkanPipelineLayout, VulkanQueue, VulkanRenderPass,
+    VulkanSemaphore, VulkanShaderModule, compile_glsl,
 };
 
 /// Runs on the dedicated Mesa lavapipe + Khronos validation CI job.
@@ -176,6 +177,50 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         },
     )
     .expect("create second host-visible readback buffer sharing the memory pool");
+
+    let transfer_payload: Vec<u8> = (0..64).collect();
+    let mut transfer_source = VulkanBuffer::new(
+        &device,
+        BufferConfig {
+            size: transfer_payload.len() as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_SRC,
+            memory: BufferMemoryLocation::Upload,
+        },
+    )
+    .expect("create transfer upload buffer");
+    transfer_source
+        .write(0, &transfer_payload)
+        .expect("upload transfer test payload");
+    let transfer_intermediate = VulkanBuffer::new(
+        &device,
+        BufferConfig {
+            size: transfer_payload.len() as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            memory: BufferMemoryLocation::DeviceLocal,
+        },
+    )
+    .expect("create transfer intermediate buffer");
+    let mut transfer_destination = VulkanBuffer::new(
+        &device,
+        BufferConfig {
+            size: transfer_payload.len() as u64,
+            usage: vk::BufferUsageFlags::TRANSFER_DST,
+            memory: BufferMemoryLocation::Readback,
+        },
+    )
+    .expect("create transfer readback buffer");
+    let transfer_queue = VulkanQueue::transfer(&device);
+    let transfer_pool =
+        VulkanCommandPool::new_for_queue(&device, &transfer_queue, CommandPoolConfig::default())
+            .expect("create transfer command pool");
+    let ownership_transfer_required =
+        device.graphics_queue_family() != device.transfer_queue_family();
+    let transfer_semaphore = if ownership_transfer_required {
+        Some(VulkanSemaphore::new(&device).expect("create queue-transfer semaphore"))
+    } else {
+        None
+    };
+
     let command_pool = VulkanCommandPool::new(&device, CommandPoolConfig::default())
         .expect("create graphics command pool");
     let mut command_buffer = command_pool
@@ -280,9 +325,53 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
             &[],
         )
         .expect("make transfer writes visible to the host");
+    recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[BufferBarrier {
+                buffer: &transfer_source,
+                source_access: vk::AccessFlags::HOST_WRITE,
+                destination_access: vk::AccessFlags::TRANSFER_READ,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            }],
+            &[],
+        )
+        .expect("make uploaded transfer payload visible to the graphics queue");
+    recording
+        .copy_buffer(
+            &transfer_source,
+            &transfer_intermediate,
+            &[vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: transfer_payload.len() as u64,
+            }],
+        )
+        .expect("copy transfer payload on the graphics queue");
+    if ownership_transfer_required {
+        recording
+            .release_queue_family_ownership(
+                vk::PipelineStageFlags::TRANSFER,
+                &[BufferOwnershipTransfer {
+                    buffer: &transfer_intermediate,
+                    source_queue_family: device.graphics_queue_family(),
+                    destination_queue_family: device.transfer_queue_family(),
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::TRANSFER_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                }],
+                &[],
+            )
+            .expect("release intermediate buffer to transfer queue family");
+    }
     let executable = recording.end().expect("finish command buffer");
+    let signal_semaphores: Vec<_> = transfer_semaphore.iter().collect();
     let mut submission = queue
-        .submit(executable, &[], &[], &[])
+        .submit(executable, &[], &[], &signal_semaphores)
         .expect("submit offscreen render and copy");
     assert_eq!(
         submission
@@ -319,6 +408,104 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         "unexpected clear pixel: {corner:?}"
     );
 
+    let mut transfer_command_buffer = transfer_pool
+        .allocate_primary()
+        .expect("allocate transfer command buffer");
+    let mut transfer_recording = transfer_command_buffer
+        .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+        .expect("begin transfer command recording");
+    if ownership_transfer_required {
+        transfer_recording
+            .acquire_queue_family_ownership(
+                vk::PipelineStageFlags::TRANSFER,
+                &[BufferOwnershipTransfer {
+                    buffer: &transfer_intermediate,
+                    source_queue_family: device.graphics_queue_family(),
+                    destination_queue_family: device.transfer_queue_family(),
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::TRANSFER_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                }],
+                &[],
+            )
+            .expect("acquire intermediate buffer on transfer queue family");
+    } else {
+        transfer_recording
+            .pipeline_barrier(
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[BufferBarrier {
+                    buffer: &transfer_intermediate,
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::TRANSFER_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                }],
+                &[],
+            )
+            .expect("make graphics-queue transfer writes visible on the shared family");
+    }
+    transfer_recording
+        .copy_buffer(
+            &transfer_intermediate,
+            &transfer_destination,
+            &[vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: transfer_payload.len() as u64,
+            }],
+        )
+        .expect("copy payload on transfer queue");
+    transfer_recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[BufferBarrier {
+                buffer: &transfer_destination,
+                source_access: vk::AccessFlags::TRANSFER_WRITE,
+                destination_access: vk::AccessFlags::HOST_READ,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            }],
+            &[],
+        )
+        .expect("make transfer queue writes visible to the host");
+    let transfer_executable = transfer_recording
+        .end()
+        .expect("finish transfer command buffer");
+    let wait_semaphores: Vec<_> = transfer_semaphore.iter().collect();
+    let wait_stage_masks = if ownership_transfer_required {
+        vec![vk::PipelineStageFlags::TRANSFER]
+    } else {
+        Vec::new()
+    };
+    let mut transfer_submission = transfer_queue
+        .submit(
+            transfer_executable,
+            &wait_semaphores,
+            &wait_stage_masks,
+            &[],
+        )
+        .expect("submit transfer queue copy");
+    assert_eq!(
+        transfer_submission
+            .wait(u64::MAX)
+            .expect("wait for transfer queue submission"),
+        FenceWaitResult::Signaled
+    );
+    drop(transfer_submission);
+    let mut transfer_pixels = vec![0_u8; transfer_payload.len()];
+    transfer_destination
+        .read(0, &mut transfer_pixels)
+        .expect("read transfer queue result");
+    assert_eq!(
+        transfer_pixels, transfer_payload,
+        "transfer queue copy changed the payload"
+    );
+
     drop(graphics_pipeline);
     drop(pipeline_layout);
     drop(fragment_shader);
@@ -326,6 +513,11 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(framebuffer);
     drop(render_pass);
     drop(image_view);
+    drop(transfer_destination);
+    drop(transfer_intermediate);
+    drop(transfer_source);
+    drop(transfer_pool);
+    drop(transfer_semaphore);
     drop(second_readback);
     drop(readback);
     drop(vertex_buffer);

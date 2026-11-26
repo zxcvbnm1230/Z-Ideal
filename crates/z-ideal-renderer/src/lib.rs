@@ -28,8 +28,9 @@ mod sync;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use command::{
-    BufferBarrier, CommandBufferRecording, CommandPoolConfig, ExecutableCommandBuffer,
-    ImageBarrier, VulkanCommandBuffer, VulkanCommandPool, VulkanQueue, VulkanSubmission,
+    BufferBarrier, BufferOwnershipTransfer, CommandBufferRecording, CommandPoolConfig,
+    ExecutableCommandBuffer, ImageBarrier, ImageOwnershipTransfer, VulkanCommandBuffer,
+    VulkanCommandPool, VulkanQueue, VulkanSubmission,
 };
 pub use descriptor::{
     BufferDescriptorWrite, DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize,
@@ -336,6 +337,9 @@ pub enum VulkanError {
     /// Command-buffer recording, render-pass, or pipeline state is invalid.
     #[error("Vulkan command-buffer operation is invalid for its current state")]
     InvalidCommandBufferState,
+    /// A queue-family ownership transfer has invalid queue families or resource ranges.
+    #[error("Vulkan queue-family ownership transfer is invalid for this queue or resource")]
+    InvalidQueueFamilyOwnershipTransfer,
     /// Queue submission parameters or command-buffer state are invalid.
     #[error("Vulkan queue submission parameters or command-buffer state are invalid")]
     InvalidQueueSubmission,
@@ -652,13 +656,21 @@ pub struct PhysicalDeviceInfo {
     pub api_version: u32,
 }
 
-/// Owns a logical device and its selected graphics queue.
+/// Owns a logical device and its selected graphics, optional compute, transfer, and presentation queues.
+///
+/// A dedicated transfer family is preferred when graphics supports compute. If it
+/// does not, a compute-capable family is preferred for transfer work so compute
+/// pipelines remain executable through the selected compute queue wrapper.
 pub struct VulkanDevice {
     _instance: Arc<VulkanInstance>,
     handle: ash::Device,
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
+    graphics_queue_flags: vk::QueueFlags,
+    transfer_queue: vk::Queue,
+    transfer_queue_family: u32,
+    transfer_queue_flags: vk::QueueFlags,
     queue_submit_lock: Mutex<()>,
     present_queue: vk::Queue,
     present_queue_family: u32,
@@ -728,6 +740,14 @@ impl VulkanDevice {
                 continue;
             };
             let graphics_queue_family = graphics_index as u32;
+            let graphics_supports_compute = queue_families[graphics_index]
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE);
+            let Some(transfer_queue_family) =
+                select_transfer_queue_family(&queue_families, graphics_supports_compute)
+            else {
+                continue;
+            };
 
             let present_queue_family = if let Some(surface) = surface {
                 let mut present_index = None;
@@ -770,6 +790,7 @@ impl VulkanDevice {
                 physical_device,
                 graphics_queue_family,
                 present_queue_family,
+                transfer_queue_family,
                 PhysicalDeviceInfo {
                     name,
                     device_type: properties.device_type,
@@ -783,21 +804,39 @@ impl VulkanDevice {
         // Prefer discrete, then integrated, virtual, CPU and other devices.
         // Ties are resolved by stable reported identity fields.
         candidates.sort_by(|left, right| {
-            device_rank(right.3.device_type)
-                .cmp(&device_rank(left.3.device_type))
-                .then_with(|| left.3.name.cmp(&right.3.name))
-                .then_with(|| left.3.vendor_id.cmp(&right.3.vendor_id))
-                .then_with(|| left.3.device_id.cmp(&right.3.device_id))
+            device_rank(right.4.device_type)
+                .cmp(&device_rank(left.4.device_type))
+                .then_with(|| left.4.name.cmp(&right.4.name))
+                .then_with(|| left.4.vendor_id.cmp(&right.4.vendor_id))
+                .then_with(|| left.4.device_id.cmp(&right.4.device_id))
         });
-        let (physical_device, graphics_queue_family, present_queue_family, info) =
-            candidates.into_iter().next().ok_or_else(|| {
-                if surface.is_some() {
-                    VulkanError::NoPresentDevice
-                } else {
-                    VulkanError::NoGraphicsDevice
-                }
-            })?;
-
+        let (
+            physical_device,
+            graphics_queue_family,
+            present_queue_family,
+            transfer_queue_family,
+            info,
+        ) = candidates.into_iter().next().ok_or_else(|| {
+            if surface.is_some() {
+                VulkanError::NoPresentDevice
+            } else {
+                VulkanError::NoGraphicsDevice
+            }
+        })?;
+        // SAFETY: The selected queue-family indices were obtained from this physical device.
+        let selected_queue_families = unsafe {
+            instance
+                .handle
+                .get_physical_device_queue_family_properties(physical_device)
+        };
+        let graphics_queue_flags = selected_queue_families
+            .get(graphics_queue_family as usize)
+            .map(|family| family.queue_flags)
+            .ok_or(VulkanError::NoGraphicsDevice)?;
+        let transfer_queue_flags = selected_queue_families
+            .get(transfer_queue_family as usize)
+            .map(|family| family.queue_flags)
+            .ok_or(VulkanError::NoGraphicsDevice)?;
         // SAFETY: physical_device belongs to the retained instance.
         let available_extensions = unsafe {
             instance
@@ -868,6 +907,9 @@ impl VulkanDevice {
         if present_queue_family != graphics_queue_family {
             queue_family_indices.push(present_queue_family);
         }
+        if !queue_family_indices.contains(&transfer_queue_family) {
+            queue_family_indices.push(transfer_queue_family);
+        }
         let queue_info: Vec<_> = queue_family_indices
             .iter()
             .map(|&queue_family_index| vk::DeviceQueueCreateInfo {
@@ -898,6 +940,8 @@ impl VulkanDevice {
         let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_family, 0) };
         // SAFETY: This queue family was included in logical-device creation.
         let present_queue = unsafe { handle.get_device_queue(present_queue_family, 0) };
+        // SAFETY: This queue family was included in logical-device creation.
+        let transfer_queue = unsafe { handle.get_device_queue(transfer_queue_family, 0) };
         let memory_allocator =
             memory::MemoryAllocator::new(&handle, memory_properties, max_memory_allocation_count);
 
@@ -907,6 +951,10 @@ impl VulkanDevice {
             physical_device,
             graphics_queue,
             graphics_queue_family,
+            graphics_queue_flags,
+            transfer_queue,
+            transfer_queue_family,
+            transfer_queue_flags,
             queue_submit_lock: Mutex::new(()),
             present_queue,
             present_queue_family,
@@ -956,6 +1004,46 @@ impl VulkanDevice {
     #[must_use]
     pub const fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
+    }
+
+    /// Returns the selected transfer-capable queue.
+    #[must_use]
+    pub const fn transfer_queue(&self) -> vk::Queue {
+        self.transfer_queue
+    }
+
+    /// Returns the queue-family index selected for transfer commands.
+    #[must_use]
+    pub const fn transfer_queue_family(&self) -> u32 {
+        self.transfer_queue_family
+    }
+
+    /// Returns a compute-capable queue when either selected family supports compute.
+    #[must_use]
+    pub const fn compute_queue(&self) -> Option<vk::Queue> {
+        if self.graphics_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.graphics_queue)
+        } else if self.transfer_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.transfer_queue)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the queue-family index selected for compute commands, when available.
+    #[must_use]
+    pub const fn compute_queue_family(&self) -> Option<u32> {
+        if self.graphics_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.graphics_queue_family)
+        } else if self.transfer_queue_flags.contains(vk::QueueFlags::COMPUTE) {
+            Some(self.transfer_queue_family)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn supports_command_queue_family(&self, family: u32) -> bool {
+        family == self.graphics_queue_family || family == self.transfer_queue_family
     }
 
     /// Whether this device was created with presentation support and VK_KHR_swapchain.
@@ -1100,6 +1188,38 @@ impl VulkanContext {
     }
 }
 
+fn select_transfer_queue_family(
+    queue_families: &[vk::QueueFamilyProperties],
+    graphics_supports_compute: bool,
+) -> Option<u32> {
+    queue_families
+        .iter()
+        .enumerate()
+        .filter(|(_, family)| {
+            family.queue_count > 0
+                && family.queue_flags.intersects(
+                    vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+                )
+        })
+        .min_by_key(|(_, family)| {
+            let dedicated_transfer = family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !family
+                    .queue_flags
+                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
+            let compute_capable = family.queue_flags.contains(vk::QueueFlags::COMPUTE);
+            if !graphics_supports_compute && compute_capable {
+                0
+            } else if dedicated_transfer {
+                if graphics_supports_compute { 0 } else { 1 }
+            } else if compute_capable {
+                1
+            } else {
+                2
+            }
+        })
+        .map(|(index, _)| index as u32)
+}
+
 const fn device_rank(device_type: vk::PhysicalDeviceType) -> u8 {
     match device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 5,
@@ -1112,7 +1232,7 @@ const fn device_rank(device_type: vk::PhysicalDeviceType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CRATE_NAME, VulkanConfig, device_rank};
+    use super::{CRATE_NAME, VulkanConfig, device_rank, select_transfer_queue_family};
     use ash::vk;
 
     #[test]
@@ -1126,6 +1246,87 @@ mod tests {
             VulkanConfig::default().enable_validation,
             cfg!(debug_assertions)
         );
+    }
+
+    #[test]
+    fn transfer_queue_selection_prefers_a_dedicated_transfer_family() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(select_transfer_queue_family(&families, true), Some(1));
+    }
+
+    #[test]
+    fn transfer_queue_selection_falls_back_to_compute_then_graphics() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(select_transfer_queue_family(&families, false), Some(1));
+        assert_eq!(select_transfer_queue_family(&families[..1], true), Some(0));
+        let implicit_transfer = [vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::GRAPHICS,
+            queue_count: 1,
+            ..Default::default()
+        }];
+        assert_eq!(
+            select_transfer_queue_family(&implicit_transfer, true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn transfer_queue_selection_preserves_compute_when_graphics_lacks_it() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(select_transfer_queue_family(&families, false), Some(2));
+    }
+
+    #[test]
+    fn transfer_queue_selection_rejects_empty_families() {
+        let families = [vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::TRANSFER,
+            queue_count: 0,
+            ..Default::default()
+        }];
+        assert_eq!(select_transfer_queue_family(&families, true), None);
     }
 
     #[test]
