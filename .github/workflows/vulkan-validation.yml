@@ -1,0 +1,39 @@
+name: Vulkan offscreen validation
+
+on:
+  push:
+    branches: [main, "dev/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulkan-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lavapipe-offscreen:
+    name: Mesa lavapipe offscreen rendering
+    runs-on: ubuntu-24.04
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install software Vulkan driver and validation layer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+      - name: Verify lavapipe and validation layer
+        run: |
+          test -f "$VK_ICD_FILENAMES"
+          vulkaninfo --summary
+          vulkaninfo --summary | grep -q 'llvmpipe\|lavapipe'
+      - name: Run offscreen rendering and readback validation
+        run: cargo test -p z-ideal-renderer --all-features --test vulkan_offscreen -- --ignored --nocapture
