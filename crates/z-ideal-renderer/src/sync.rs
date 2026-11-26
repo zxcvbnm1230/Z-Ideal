@@ -21,9 +21,9 @@ pub enum FenceWaitResult {
 
 /// Owns a Vulkan fence and borrows the logical device that created it.
 ///
-/// Dropping the owner waits for device idle before destroying the fence. This is
-/// intentionally conservative; higher-level frame scheduling should retain and
-/// recycle fences rather than create and destroy them in the frame-critical path.
+/// A signaled fence is destroyed immediately. If it is still unsignaled, dropping
+/// the owner waits for device idle before destruction. Higher-level frame scheduling
+/// should retain and recycle fences rather than create them in the frame-critical path.
 pub struct VulkanFence<'device> {
     device: &'device VulkanDevice,
     handle: vk::Fence,
@@ -98,11 +98,13 @@ impl<'device> VulkanFence<'device> {
 
 impl Drop for VulkanFence<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before fence destruction"
-            );
+        if !matches!(self.is_signaled(), Ok(true)) {
+            if let Err(error) = self.device.wait_idle() {
+                tracing::warn!(
+                    ?error,
+                    "Vulkan device idle wait failed before unsignaled fence destruction"
+                );
+            }
         }
         // SAFETY: This owner uniquely owns the fence and retains its parent device.
         unsafe { self.device.handle().destroy_fence(self.handle, None) };

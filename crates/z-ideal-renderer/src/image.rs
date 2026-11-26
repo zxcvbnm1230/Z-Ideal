@@ -194,14 +194,9 @@ impl<'device> VulkanImage<'device> {
 
 impl Drop for VulkanImage<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before image destruction"
-            );
-        }
-        // SAFETY: This owner uniquely owns the image. Its suballocation is returned
-        // to the shared pool only after the image has been destroyed.
+        // SAFETY: Engine-recorded command buffers and borrowed image views retain
+        // this image until submission fences complete. Raw Vulkan users must provide
+        // equivalent external synchronization before dropping the image.
         unsafe { self.device.handle.destroy_image(self.handle, None) };
     }
 }
@@ -235,13 +230,8 @@ impl<'image, 'device> VulkanImageView<'image, 'device> {
 
 impl Drop for VulkanImageView<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.image.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before image-view destruction"
-            );
-        }
-        // SAFETY: This owner uniquely owns the view and borrows its live parent image.
+        // SAFETY: Framebuffers and descriptor leases borrow this view through command
+        // submission completion. The parent image remains borrowed for this view's life.
         unsafe {
             self.image
                 .device

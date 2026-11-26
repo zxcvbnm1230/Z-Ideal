@@ -118,13 +118,8 @@ impl<'device> VulkanSampler<'device> {
 
 impl Drop for VulkanSampler<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.device.wait_idle() {
-            tracing::warn!(
-                ?error,
-                "Vulkan device idle wait failed before sampler destruction"
-            );
-        }
-        // SAFETY: This wrapper uniquely owns the sampler and its device is still borrowed.
+        // SAFETY: Descriptor leases retained by submitted command buffers borrow this sampler
+        // until their submission fences complete. Raw Vulkan users synchronize manually.
         unsafe { self.device.handle.destroy_sampler(self.handle, None) };
     }
 }
