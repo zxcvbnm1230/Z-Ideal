@@ -213,8 +213,12 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     let transfer_pool =
         VulkanCommandPool::new_for_queue(&device, &transfer_queue, CommandPoolConfig::default())
             .expect("create transfer command pool");
-    let ownership_transfer_required =
-        device.graphics_queue_family() != device.transfer_queue_family();
+    let graphics_queue_family = device.graphics_queue_family();
+    let transfer_queue_family = device.transfer_queue_family();
+    let ownership_transfer_required = graphics_queue_family != transfer_queue_family;
+    eprintln!(
+        "lavapipe queue families: graphics={graphics_queue_family}, transfer={transfer_queue_family}; cross-family ownership path={ownership_transfer_required}"
+    );
     let transfer_semaphore = if ownership_transfer_required {
         Some(VulkanSemaphore::new(&device).expect("create queue-transfer semaphore"))
     } else {
