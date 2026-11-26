@@ -826,6 +826,206 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
+    /// Copies one or more aligned ranges between distinct transfer-capable buffers.
+    ///
+    /// The source and destination must have `TRANSFER_SRC` and `TRANSFER_DST` usage respectively.
+    /// This records no memory barriers; callers establish producer/consumer dependencies explicitly.
+    pub fn copy_buffer(
+        &mut self,
+        source: &'recording VulkanBuffer<'device>,
+        destination: &'recording VulkanBuffer<'device>,
+        regions: &[vk::BufferCopy],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
+            || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
+            || source.handle() == destination.handle()
+            || !source.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
+            || !destination
+                .usage
+                .contains(vk::BufferUsageFlags::TRANSFER_DST)
+            || regions.is_empty()
+            || regions.iter().any(|region| {
+                !validate_buffer_copy_region(region, source.size(), destination.size())
+            })
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        let destination_ranges: Vec<_> = regions
+            .iter()
+            .map(|region| (region.dst_offset, region.dst_offset + region.size))
+            .collect();
+        if ranges_overlap(&destination_ranges) {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        // SAFETY: Buffer usage, device identity, offsets, sizes, and destination overlap
+        // were validated; both resources are retained until submitted work completes.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_copy_buffer(
+                self.buffer_mut().handle,
+                source.handle(),
+                destination.handle(),
+                regions,
+            );
+        }
+        self.resources.push(source);
+        self.resources.push(destination);
+        Ok(())
+    }
+
+    /// Copies buffer data into a color image in `TRANSFER_DST_OPTIMAL` or `GENERAL` layout.
+    ///
+    /// This initial implementation supports uncompressed color formats with a known texel size.
+    /// Compressed and depth/stencil formats fail explicitly until block-aware copy metadata exists.
+    pub fn copy_buffer_to_image(
+        &mut self,
+        source: &'recording VulkanBuffer<'device>,
+        destination: &'recording VulkanImage<'device>,
+        destination_layout: vk::ImageLayout,
+        regions: &[vk::BufferImageCopy],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
+            || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
+            || !source.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
+            || !destination
+                .config()
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_DST)
+            || !is_transfer_destination_layout(destination_layout)
+            || regions.is_empty()
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        for region in regions {
+            validate_buffer_image_copy_region(region, source.size(), destination.config())?;
+        }
+        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // and required buffer byte ranges were validated; both resources are retained.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_copy_buffer_to_image(
+                    self.buffer_mut().handle,
+                    source.handle(),
+                    destination.handle(),
+                    destination_layout,
+                    regions,
+                );
+        }
+        self.resources.push(source);
+        self.resources.push(destination);
+        Ok(())
+    }
+
+    /// Copies a color image into a buffer in `TRANSFER_SRC_OPTIMAL` or `GENERAL` layout.
+    pub fn copy_image_to_buffer(
+        &mut self,
+        source: &'recording VulkanImage<'device>,
+        source_layout: vk::ImageLayout,
+        destination: &'recording VulkanBuffer<'device>,
+        regions: &[vk::BufferImageCopy],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
+            || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
+            || !source
+                .config()
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+            || !destination
+                .usage
+                .contains(vk::BufferUsageFlags::TRANSFER_DST)
+            || !is_transfer_source_layout(source_layout)
+            || regions.is_empty()
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        for region in regions {
+            validate_buffer_image_copy_region(region, destination.size(), source.config())?;
+        }
+        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // and required buffer byte ranges were validated; both resources are retained.
+        unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                .handle
+                .cmd_copy_image_to_buffer(
+                    self.buffer_mut().handle,
+                    source.handle(),
+                    source_layout,
+                    destination.handle(),
+                    regions,
+                );
+        }
+        self.resources.push(source);
+        self.resources.push(destination);
+        Ok(())
+    }
+
+    /// Copies matching uncompressed color regions between distinct images.
+    ///
+    /// Both images must have the same format and sample count, and their layouts must be
+    /// `TRANSFER_SRC_OPTIMAL`/`TRANSFER_DST_OPTIMAL` or `GENERAL` as appropriate.
+    pub fn copy_image(
+        &mut self,
+        source: &'recording VulkanImage<'device>,
+        source_layout: vk::ImageLayout,
+        destination: &'recording VulkanImage<'device>,
+        destination_layout: vk::ImageLayout,
+        regions: &[vk::ImageCopy],
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let source_config = source.config();
+        let destination_config = destination.config();
+        if format_bytes_per_texel(source_config.format).is_none() {
+            return Err(VulkanError::UnsupportedCopyFormat);
+        }
+        if self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(source.device, self.buffer_mut().pool.device)
+            || !std::ptr::eq(destination.device, self.buffer_mut().pool.device)
+            || source.handle() == destination.handle()
+            || !source_config
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+            || !destination_config
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_DST)
+            || source_config.format != destination_config.format
+            || source_config.samples != destination_config.samples
+            || source_config.image_type != destination_config.image_type
+            || !is_transfer_source_layout(source_layout)
+            || !is_transfer_destination_layout(destination_layout)
+            || regions.is_empty()
+            || regions.iter().any(|region| {
+                !validate_image_copy_region(region, source_config, destination_config)
+            })
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        // SAFETY: Image usage, format/sample compatibility, layouts, subresources and extents
+        // were validated; both images are retained until submitted work completes.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_copy_image(
+                self.buffer_mut().handle,
+                source.handle(),
+                source_layout,
+                destination.handle(),
+                destination_layout,
+                regions,
+            );
+        }
+        self.resources.push(source);
+        self.resources.push(destination);
+        Ok(())
+    }
+
     /// Records buffer/image memory barriers and image layout transitions.
     ///
     /// Queue-family ownership transfers are not exposed yet; all barriers use
@@ -1311,6 +1511,300 @@ impl Drop for VulkanSubmission<'_, '_, '_> {
     }
 }
 
+fn validate_buffer_copy_region(
+    region: &vk::BufferCopy,
+    source_size: vk::DeviceSize,
+    destination_size: vk::DeviceSize,
+) -> bool {
+    region.size > 0
+        && region.src_offset % 4 == 0
+        && region.dst_offset % 4 == 0
+        && region.size % 4 == 0
+        && region
+            .src_offset
+            .checked_add(region.size)
+            .is_some_and(|end| end <= source_size)
+        && region
+            .dst_offset
+            .checked_add(region.size)
+            .is_some_and(|end| end <= destination_size)
+}
+
+fn ranges_overlap(ranges: &[(u64, u64)]) -> bool {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|range| range.0);
+    sorted.windows(2).any(|pair| pair[0].1 > pair[1].0)
+}
+
+fn is_transfer_source_layout(layout: vk::ImageLayout) -> bool {
+    matches!(
+        layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL | vk::ImageLayout::GENERAL
+    )
+}
+
+fn is_transfer_destination_layout(layout: vk::ImageLayout) -> bool {
+    matches!(
+        layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL | vk::ImageLayout::GENERAL
+    )
+}
+
+fn mip_dimension(base: u32, level: u32) -> u32 {
+    base.checked_shr(level).unwrap_or(0).max(1)
+}
+
+fn format_bytes_per_texel(format: vk::Format) -> Option<u64> {
+    use vk::Format as F;
+    Some(match format {
+        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT => 1,
+        F::R8G8_UNORM
+        | F::R8G8_SNORM
+        | F::R8G8_UINT
+        | F::R8G8_SINT
+        | F::R16_UNORM
+        | F::R16_SNORM
+        | F::R16_UINT
+        | F::R16_SINT
+        | F::R16_SFLOAT => 2,
+        F::R8G8B8_UNORM
+        | F::R8G8B8_SNORM
+        | F::R8G8B8_UINT
+        | F::R8G8B8_SINT
+        | F::B8G8R8_UNORM
+        | F::B8G8R8_SNORM
+        | F::B8G8R8_UINT
+        | F::B8G8R8_SINT => 3,
+        F::R8G8B8A8_UNORM
+        | F::R8G8B8A8_SNORM
+        | F::R8G8B8A8_UINT
+        | F::R8G8B8A8_SINT
+        | F::R8G8B8A8_SRGB
+        | F::B8G8R8A8_UNORM
+        | F::B8G8R8A8_SRGB
+        | F::A2B10G10R10_UNORM_PACK32
+        | F::A2R10G10B10_UNORM_PACK32
+        | F::B10G11R11_UFLOAT_PACK32
+        | F::E5B9G9R9_UFLOAT_PACK32
+        | F::R16G16_UNORM
+        | F::R16G16_SNORM
+        | F::R16G16_UINT
+        | F::R16G16_SINT
+        | F::R16G16_SFLOAT
+        | F::R32_UINT
+        | F::R32_SINT
+        | F::R32_SFLOAT => 4,
+        F::R16G16B16_UNORM
+        | F::R16G16B16_SNORM
+        | F::R16G16B16_UINT
+        | F::R16G16B16_SINT
+        | F::R16G16B16_SFLOAT => 6,
+        F::R16G16B16A16_UNORM
+        | F::R16G16B16A16_SNORM
+        | F::R16G16B16A16_UINT
+        | F::R16G16B16A16_SINT
+        | F::R16G16B16A16_SFLOAT
+        | F::R32G32_UINT
+        | F::R32G32_SINT
+        | F::R32G32_SFLOAT => 8,
+        F::R32G32B32_UINT | F::R32G32B32_SINT | F::R32G32B32_SFLOAT => 12,
+        F::R32G32B32A32_UINT | F::R32G32B32A32_SINT | F::R32G32B32A32_SFLOAT => 16,
+        _ => return None,
+    })
+}
+
+fn validate_buffer_image_copy_region(
+    region: &vk::BufferImageCopy,
+    buffer_size: vk::DeviceSize,
+    image: crate::ImageConfig,
+) -> Result<(), VulkanError> {
+    let texel_size =
+        format_bytes_per_texel(image.format).ok_or(VulkanError::UnsupportedCopyFormat)?;
+    let subresource = region.image_subresource;
+    let extent = region.image_extent;
+    let offset = region.image_offset;
+    if image.samples != vk::SampleCountFlags::TYPE_1
+        || subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+        || subresource.mip_level >= image.mip_levels
+        || subresource.layer_count == 0
+        || subresource
+            .base_array_layer
+            .checked_add(subresource.layer_count)
+            .is_none_or(|end| end > image.array_layers)
+        || extent.width == 0
+        || extent.height == 0
+        || extent.depth == 0
+        || offset.x < 0
+        || offset.y < 0
+        || offset.z < 0
+        || (region.buffer_row_length != 0 && region.buffer_row_length < extent.width)
+        || (region.buffer_image_height != 0 && region.buffer_image_height < extent.height)
+        || region.buffer_offset % 4 != 0
+        || region.buffer_offset % texel_size != 0
+    {
+        return Err(VulkanError::InvalidCopyRegion);
+    }
+    match image.image_type {
+        vk::ImageType::TYPE_1D
+            if offset.y != 0 || extent.height != 1 || offset.z != 0 || extent.depth != 1 =>
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        vk::ImageType::TYPE_2D if offset.z != 0 || extent.depth != 1 => {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        vk::ImageType::TYPE_3D
+            if subresource.base_array_layer != 0 || subresource.layer_count != 1 =>
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        _ => {}
+    }
+    let mip_extent = vk::Extent3D {
+        width: mip_dimension(image.extent.width, subresource.mip_level),
+        height: mip_dimension(image.extent.height, subresource.mip_level),
+        depth: mip_dimension(image.extent.depth, subresource.mip_level),
+    };
+    if (offset.x as u32)
+        .checked_add(extent.width)
+        .is_none_or(|end| end > mip_extent.width)
+        || (offset.y as u32)
+            .checked_add(extent.height)
+            .is_none_or(|end| end > mip_extent.height)
+        || (offset.z as u32)
+            .checked_add(extent.depth)
+            .is_none_or(|end| end > mip_extent.depth)
+    {
+        return Err(VulkanError::InvalidCopyRegion);
+    }
+    let row_texels = u64::from(if region.buffer_row_length == 0 {
+        extent.width
+    } else {
+        region.buffer_row_length
+    });
+    let image_rows = u64::from(if region.buffer_image_height == 0 {
+        extent.height
+    } else {
+        region.buffer_image_height
+    });
+    let row_bytes = row_texels
+        .checked_mul(texel_size)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let slice_bytes = row_bytes
+        .checked_mul(image_rows)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let layer_bytes = slice_bytes
+        .checked_mul(u64::from(extent.depth))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let preceding_layers = layer_bytes
+        .checked_mul(u64::from(subresource.layer_count - 1))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let preceding_depth = slice_bytes
+        .checked_mul(u64::from(extent.depth - 1))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let preceding_rows = row_bytes
+        .checked_mul(u64::from(extent.height - 1))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let final_row = u64::from(extent.width)
+        .checked_mul(texel_size)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let required = preceding_layers
+        .checked_add(preceding_depth)
+        .and_then(|value| value.checked_add(preceding_rows))
+        .and_then(|value| value.checked_add(final_row))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    if region
+        .buffer_offset
+        .checked_add(required)
+        .is_none_or(|end| end > buffer_size)
+    {
+        return Err(VulkanError::InvalidCopyRegion);
+    }
+    Ok(())
+}
+
+fn validate_image_copy_region(
+    region: &vk::ImageCopy,
+    source: crate::ImageConfig,
+    destination: crate::ImageConfig,
+) -> bool {
+    let src = region.src_subresource;
+    let dst = region.dst_subresource;
+    let extent = region.extent;
+    let src_offset = region.src_offset;
+    let dst_offset = region.dst_offset;
+    if src.aspect_mask != vk::ImageAspectFlags::COLOR
+        || dst.aspect_mask != vk::ImageAspectFlags::COLOR
+        || src.mip_level >= source.mip_levels
+        || dst.mip_level >= destination.mip_levels
+        || src.layer_count == 0
+        || src.layer_count != dst.layer_count
+        || src
+            .base_array_layer
+            .checked_add(src.layer_count)
+            .is_none_or(|end| end > source.array_layers)
+        || dst
+            .base_array_layer
+            .checked_add(dst.layer_count)
+            .is_none_or(|end| end > destination.array_layers)
+        || extent.width == 0
+        || extent.height == 0
+        || extent.depth == 0
+        || src_offset.x < 0
+        || src_offset.y < 0
+        || src_offset.z < 0
+        || dst_offset.x < 0
+        || dst_offset.y < 0
+        || dst_offset.z < 0
+    {
+        return false;
+    }
+    if source.image_type == vk::ImageType::TYPE_3D {
+        if src.base_array_layer != 0
+            || dst.base_array_layer != 0
+            || src.layer_count != 1
+            || dst.layer_count != 1
+        {
+            return false;
+        }
+    } else if src_offset.z != 0 || dst_offset.z != 0 || extent.depth != 1 {
+        return false;
+    }
+    if source.image_type == vk::ImageType::TYPE_1D
+        && (src_offset.y != 0 || dst_offset.y != 0 || extent.height != 1)
+    {
+        return false;
+    }
+    let src_extent = vk::Extent3D {
+        width: mip_dimension(source.extent.width, src.mip_level),
+        height: mip_dimension(source.extent.height, src.mip_level),
+        depth: mip_dimension(source.extent.depth, src.mip_level),
+    };
+    let dst_extent = vk::Extent3D {
+        width: mip_dimension(destination.extent.width, dst.mip_level),
+        height: mip_dimension(destination.extent.height, dst.mip_level),
+        depth: mip_dimension(destination.extent.depth, dst.mip_level),
+    };
+    (src_offset.x as u32)
+        .checked_add(extent.width)
+        .is_some_and(|end| end <= src_extent.width)
+        && (src_offset.y as u32)
+            .checked_add(extent.height)
+            .is_some_and(|end| end <= src_extent.height)
+        && (src_offset.z as u32)
+            .checked_add(extent.depth)
+            .is_some_and(|end| end <= src_extent.depth)
+        && (dst_offset.x as u32)
+            .checked_add(extent.width)
+            .is_some_and(|end| end <= dst_extent.width)
+        && (dst_offset.y as u32)
+            .checked_add(extent.height)
+            .is_some_and(|end| end <= dst_extent.height)
+        && (dst_offset.z as u32)
+            .checked_add(extent.depth)
+            .is_some_and(|end| end <= dst_extent.depth)
+}
+
 fn validate_command_pool_flags(flags: vk::CommandPoolCreateFlags) -> bool {
     let allowed =
         vk::CommandPoolCreateFlags::TRANSIENT | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER;
@@ -1513,10 +2007,11 @@ fn swapchain_target_matches(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBarrierSubresourceRange, push_constant_range_covers, swapchain_target_matches,
-        validate_buffer_barrier_range, validate_command_pool_flags,
-        validate_dynamic_offset_requirement, validate_image_barrier_range,
-        validate_semaphore_handle_sets,
+        ImageBarrierSubresourceRange, format_bytes_per_texel, push_constant_range_covers,
+        ranges_overlap, swapchain_target_matches, validate_buffer_barrier_range,
+        validate_buffer_copy_region, validate_buffer_image_copy_region,
+        validate_command_pool_flags, validate_dynamic_offset_requirement,
+        validate_image_barrier_range, validate_image_copy_region, validate_semaphore_handle_sets,
     };
     use crate::descriptor::DynamicOffsetRequirement;
     use ash::vk;
@@ -1609,6 +2104,152 @@ mod tests {
             &[],
             &[vk::Semaphore::null()]
         ));
+    }
+
+    fn test_color_image_config() -> crate::ImageConfig {
+        crate::ImageConfig {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            format: vk::Format::R8G8B8A8_UNORM,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            flags: vk::ImageCreateFlags::empty(),
+        }
+    }
+
+    fn test_buffer_image_region() -> vk::BufferImageCopy {
+        vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            })
+    }
+
+    #[test]
+    fn validates_buffer_copy_alignment_bounds_and_overlap() {
+        let valid = vk::BufferCopy::default()
+            .src_offset(4)
+            .dst_offset(8)
+            .size(16);
+        assert!(validate_buffer_copy_region(&valid, 64, 64));
+        assert!(!validate_buffer_copy_region(&valid, 19, 64));
+        assert!(!validate_buffer_copy_region(&valid, 64, 23));
+        assert!(!validate_buffer_copy_region(
+            &vk::BufferCopy::default().size(0),
+            64,
+            64
+        ));
+        let misaligned = vk::BufferCopy::default()
+            .src_offset(2)
+            .dst_offset(0)
+            .size(4);
+        assert!(!validate_buffer_copy_region(&misaligned, 64, 64));
+        let overflow = vk::BufferCopy::default()
+            .src_offset(u64::MAX - 3)
+            .dst_offset(0)
+            .size(8);
+        assert!(!validate_buffer_copy_region(&overflow, u64::MAX, 64));
+        assert!(!ranges_overlap(&[(0, 4), (4, 8)]));
+        assert!(ranges_overlap(&[(0, 8), (4, 12)]));
+    }
+
+    #[test]
+    fn image_copy_texel_size_support_is_explicit() {
+        assert_eq!(format_bytes_per_texel(vk::Format::R8_UNORM), Some(1));
+        assert_eq!(format_bytes_per_texel(vk::Format::R8G8B8A8_UNORM), Some(4));
+        assert_eq!(
+            format_bytes_per_texel(vk::Format::R32G32B32_SFLOAT),
+            Some(12)
+        );
+        assert_eq!(
+            format_bytes_per_texel(vk::Format::BC1_RGBA_UNORM_BLOCK),
+            None
+        );
+        assert_eq!(format_bytes_per_texel(vk::Format::D32_SFLOAT), None);
+    }
+
+    #[test]
+    fn validates_buffer_image_copy_required_bytes_and_subresource_bounds() {
+        let image = test_color_image_config();
+        let region = test_buffer_image_region();
+        assert!(validate_buffer_image_copy_region(&region, 64, image).is_ok());
+        assert!(validate_buffer_image_copy_region(&region, 63, image).is_err());
+        let outside = vk::BufferImageCopy::default()
+            .image_subresource(region.image_subresource)
+            .image_offset(vk::Offset3D { x: 1, y: 0, z: 0 })
+            .image_extent(region.image_extent);
+        assert!(validate_buffer_image_copy_region(&outside, 128, image).is_err());
+        let short_row = vk::BufferImageCopy::default()
+            .buffer_row_length(3)
+            .image_subresource(region.image_subresource)
+            .image_extent(region.image_extent);
+        assert!(validate_buffer_image_copy_region(&short_row, 128, image).is_err());
+        let misaligned = vk::BufferImageCopy::default()
+            .buffer_offset(2)
+            .image_subresource(region.image_subresource)
+            .image_extent(region.image_extent);
+        assert!(validate_buffer_image_copy_region(&misaligned, 128, image).is_err());
+        let unsupported = crate::ImageConfig {
+            format: vk::Format::BC1_RGBA_UNORM_BLOCK,
+            ..image
+        };
+        assert!(matches!(
+            validate_buffer_image_copy_region(&region, 128, unsupported),
+            Err(crate::VulkanError::UnsupportedCopyFormat)
+        ));
+    }
+
+    #[test]
+    fn validates_image_copy_source_and_destination_extents() {
+        let config = test_color_image_config();
+        let subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let region = vk::ImageCopy::default()
+            .src_subresource(subresource)
+            .dst_subresource(subresource)
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            });
+        assert!(validate_image_copy_region(&region, config, config));
+        let outside = vk::ImageCopy {
+            dst_offset: vk::Offset3D { x: 1, y: 0, z: 0 },
+            ..region
+        };
+        assert!(!validate_image_copy_region(&outside, config, config));
+        let bad_layers = vk::ImageCopy {
+            dst_subresource: vk::ImageSubresourceLayers {
+                layer_count: 0,
+                ..subresource
+            },
+            ..region
+        };
+        assert!(!validate_image_copy_region(&bad_layers, config, config));
     }
 
     #[test]

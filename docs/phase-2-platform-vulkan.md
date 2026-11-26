@@ -41,6 +41,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 - Swapchain command recording tags executable command buffers with the exact swapchain owner/generation/image targeted by their swapchain framebuffer. The frame ticket rejects command buffers recorded for a different image or swapchain before resetting/submitting the frame fence.
 - Swapchain-backed framebuffers now bridge swapchain image views into render-pass recording. The initial helper intentionally supports one single-sampled color attachment whose final layout is `PRESENT_SRC_KHR`; command recording retains the framebuffer and swapchain lifetime. More complex attachment sets (e.g. depth/MSAA resolve) remain caller-managed through separate framebuffer resources.
 - Swapchain recreation passes the previous swapchain handle through Vulkan's `oldSwapchain` field, creates replacement resources before dropping the old owner, preserves the current swapchain for zero-size deferrals, and clears the owner after a failed nonzero recreation because Vulkan may already have retired the previous handle.
+- Command recording now exposes buffer-to-buffer, buffer-to-image, image-to-buffer, and image-to-image copies. It validates transfer usage, device identity, 4-byte and texel-block buffer-offset alignment, checked buffer bounds, image mip/layer/type/extent bounds, sample/layout compatibility, and destination buffer overlap for buffer copies. Image transfers currently support an explicit set of uncompressed color formats with known texel sizes; compressed and depth/stencil formats return `UnsupportedCopyFormat`. These operations do not insert barriers or perform queue-family ownership transfers; callers must establish layouts and memory dependencies.
 - Device and swapchain teardown wait for outstanding device work before releasing owned resources.
 
 ## Frame scheduling contract
@@ -56,7 +57,7 @@ Phase 2 is complete only when the engine has cross-platform window/input integra
 
 - Higher-level application frame policy: redraw throttling, pause/resume behavior, and integration of minimized-window events with the scheduler. The low-level scheduler reports zero-extent and out-of-date conditions but does not own the platform event loop.
 - Swapchain-backed framebuffer helpers for depth attachments, multisample color/depth targets, and multi-attachment render passes.
-- Buffer/image copy commands, explicit queue-family ownership transfers, allocator pooling, and deferred resource retirement.
+- Compressed and depth/stencil buffer-image copy metadata, explicit queue-family ownership transfers, allocator pooling, and deferred resource retirement.
 - GPU-backed smoke tests, offscreen rendering tests, and validation-layer clean-run evidence.
 
 ## Platform notes

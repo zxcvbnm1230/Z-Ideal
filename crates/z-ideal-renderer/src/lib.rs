@@ -314,6 +314,12 @@ pub enum VulkanError {
     /// Push-constant write is not covered by the pipeline layout.
     #[error("Vulkan push-constant write is invalid or not covered by the pipeline layout")]
     InvalidPushConstantWrite,
+    /// A Vulkan buffer/image copy region is invalid or incompatible with its resources.
+    #[error("Vulkan copy region is invalid or incompatible with the source/destination resources")]
+    InvalidCopyRegion,
+    /// The requested image-copy format is not covered by the initial uncompressed color-copy support.
+    #[error("Vulkan image copy format is unsupported by the initial copy helpers")]
+    UnsupportedCopyFormat,
     /// The frame scheduler was constructed with an invalid zero frame count.
     #[error("Vulkan frame scheduler requires at least one frame in flight")]
     InvalidFrameSchedulerConfig,
