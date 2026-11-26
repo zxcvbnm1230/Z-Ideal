@@ -869,10 +869,11 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
-    /// Copies buffer data into a color image in `TRANSFER_DST_OPTIMAL` or `GENERAL` layout.
+    /// Copies buffer data into an image in `TRANSFER_DST_OPTIMAL` or `GENERAL` layout.
     ///
-    /// This initial implementation supports uncompressed color formats with a known texel size.
-    /// Compressed and depth/stencil formats fail explicitly until block-aware copy metadata exists.
+    /// Supports explicitly enumerated uncompressed color, BC/ETC2/EAC/ASTC compressed,
+    /// and depth/stencil formats. Compressed copies enforce texel-block alignment and
+    /// edge rules; depth/stencil copies select exactly one aspect per region.
     pub fn copy_buffer_to_image(
         &mut self,
         source: &'recording VulkanBuffer<'device>,
@@ -897,7 +898,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         for region in regions {
             validate_buffer_image_copy_region(region, source.size(), destination.config())?;
         }
-        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // SAFETY: Buffer/image usage, layouts, format-block/aspect support, subresources, extents,
         // and required buffer byte ranges were validated; both resources are retained.
         unsafe {
             self.buffer_mut()
@@ -917,7 +918,9 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
-    /// Copies a color image into a buffer in `TRANSFER_SRC_OPTIMAL` or `GENERAL` layout.
+    /// Copies an image into a buffer in `TRANSFER_SRC_OPTIMAL` or `GENERAL` layout.
+    ///
+    /// Supports the same explicit format/aspect set as [`Self::copy_buffer_to_image`].
     pub fn copy_image_to_buffer(
         &mut self,
         source: &'recording VulkanImage<'device>,
@@ -944,7 +947,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         for region in regions {
             validate_buffer_image_copy_region(region, destination.size(), source.config())?;
         }
-        // SAFETY: Buffer/image usage, layouts, texel-format support, subresources, extents,
+        // SAFETY: Buffer/image usage, layouts, format-block/aspect support, subresources, extents,
         // and required buffer byte ranges were validated; both resources are retained.
         unsafe {
             self.buffer_mut()
@@ -1619,18 +1622,161 @@ fn format_bytes_per_texel(format: vk::Format) -> Option<u64> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FormatCopyBlockInfo {
+    width: u32,
+    height: u32,
+    depth: u32,
+    bytes: u64,
+}
+
+impl FormatCopyBlockInfo {
+    const fn texel(bytes: u64) -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            depth: 1,
+            bytes,
+        }
+    }
+
+    const fn compressed(width: u32, height: u32, bytes: u64) -> Self {
+        Self {
+            width,
+            height,
+            depth: 1,
+            bytes,
+        }
+    }
+}
+
+/// Returns the byte/block geometry for one copy aspect. Combined depth/stencil
+/// formats must be copied one aspect at a time, as required by Vulkan.
+fn format_copy_block_info(
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> Option<FormatCopyBlockInfo> {
+    use vk::{Format as F, ImageAspectFlags as A};
+    if aspect.as_raw().count_ones() != 1 {
+        return None;
+    }
+    if aspect == A::COLOR {
+        if let Some(bytes) = format_bytes_per_texel(format) {
+            return Some(FormatCopyBlockInfo::texel(bytes));
+        }
+        return Some(match format {
+            F::BC1_RGB_UNORM_BLOCK
+            | F::BC1_RGB_SRGB_BLOCK
+            | F::BC1_RGBA_UNORM_BLOCK
+            | F::BC1_RGBA_SRGB_BLOCK
+            | F::BC4_UNORM_BLOCK
+            | F::BC4_SNORM_BLOCK
+            | F::ETC2_R8G8B8_UNORM_BLOCK
+            | F::ETC2_R8G8B8_SRGB_BLOCK
+            | F::ETC2_R8G8B8A1_UNORM_BLOCK
+            | F::ETC2_R8G8B8A1_SRGB_BLOCK
+            | F::EAC_R11_UNORM_BLOCK
+            | F::EAC_R11_SNORM_BLOCK => FormatCopyBlockInfo::compressed(4, 4, 8),
+            F::BC2_UNORM_BLOCK
+            | F::BC2_SRGB_BLOCK
+            | F::BC3_UNORM_BLOCK
+            | F::BC3_SRGB_BLOCK
+            | F::BC5_UNORM_BLOCK
+            | F::BC5_SNORM_BLOCK
+            | F::BC6H_UFLOAT_BLOCK
+            | F::BC6H_SFLOAT_BLOCK
+            | F::BC7_UNORM_BLOCK
+            | F::BC7_SRGB_BLOCK
+            | F::ETC2_R8G8B8A8_UNORM_BLOCK
+            | F::ETC2_R8G8B8A8_SRGB_BLOCK
+            | F::EAC_R11G11_UNORM_BLOCK
+            | F::EAC_R11G11_SNORM_BLOCK => FormatCopyBlockInfo::compressed(4, 4, 16),
+            F::ASTC_4X4_UNORM_BLOCK | F::ASTC_4X4_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(4, 4, 16)
+            }
+            F::ASTC_5X4_UNORM_BLOCK | F::ASTC_5X4_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(5, 4, 16)
+            }
+            F::ASTC_5X5_UNORM_BLOCK | F::ASTC_5X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(5, 5, 16)
+            }
+            F::ASTC_6X5_UNORM_BLOCK | F::ASTC_6X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(6, 5, 16)
+            }
+            F::ASTC_6X6_UNORM_BLOCK | F::ASTC_6X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(6, 6, 16)
+            }
+            F::ASTC_8X5_UNORM_BLOCK | F::ASTC_8X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 5, 16)
+            }
+            F::ASTC_8X6_UNORM_BLOCK | F::ASTC_8X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 6, 16)
+            }
+            F::ASTC_8X8_UNORM_BLOCK | F::ASTC_8X8_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(8, 8, 16)
+            }
+            F::ASTC_10X5_UNORM_BLOCK | F::ASTC_10X5_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 5, 16)
+            }
+            F::ASTC_10X6_UNORM_BLOCK | F::ASTC_10X6_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 6, 16)
+            }
+            F::ASTC_10X8_UNORM_BLOCK | F::ASTC_10X8_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 8, 16)
+            }
+            F::ASTC_10X10_UNORM_BLOCK | F::ASTC_10X10_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(10, 10, 16)
+            }
+            F::ASTC_12X10_UNORM_BLOCK | F::ASTC_12X10_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(12, 10, 16)
+            }
+            F::ASTC_12X12_UNORM_BLOCK | F::ASTC_12X12_SRGB_BLOCK => {
+                FormatCopyBlockInfo::compressed(12, 12, 16)
+            }
+            _ => return None,
+        });
+    }
+    if aspect == A::DEPTH {
+        return match format {
+            F::D16_UNORM | F::D16_UNORM_S8_UINT => Some(FormatCopyBlockInfo::texel(2)),
+            F::X8_D24_UNORM_PACK32
+            | F::D32_SFLOAT
+            | F::D24_UNORM_S8_UINT
+            | F::D32_SFLOAT_S8_UINT => Some(FormatCopyBlockInfo::texel(4)),
+            _ => None,
+        };
+    }
+    if aspect == A::STENCIL {
+        return match format {
+            F::S8_UINT | F::D16_UNORM_S8_UINT | F::D24_UNORM_S8_UINT | F::D32_SFLOAT_S8_UINT => {
+                Some(FormatCopyBlockInfo::texel(1))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn div_ceil(value: u64, divisor: u64) -> Option<u64> {
+    if divisor == 0 {
+        return None;
+    }
+    value
+        .checked_add(divisor - 1)
+        .map(|rounded| rounded / divisor)
+}
+
 fn validate_buffer_image_copy_region(
     region: &vk::BufferImageCopy,
     buffer_size: vk::DeviceSize,
     image: crate::ImageConfig,
 ) -> Result<(), VulkanError> {
-    let texel_size =
-        format_bytes_per_texel(image.format).ok_or(VulkanError::UnsupportedCopyFormat)?;
     let subresource = region.image_subresource;
     let extent = region.image_extent;
     let offset = region.image_offset;
+    let block = format_copy_block_info(image.format, subresource.aspect_mask)
+        .ok_or(VulkanError::UnsupportedCopyFormat)?;
     if image.samples != vk::SampleCountFlags::TYPE_1
-        || subresource.aspect_mask != vk::ImageAspectFlags::COLOR
         || subresource.mip_level >= image.mip_levels
         || subresource.layer_count == 0
         || subresource
@@ -1645,9 +1791,15 @@ fn validate_buffer_image_copy_region(
         || offset.z < 0
         || (region.buffer_row_length != 0 && region.buffer_row_length < extent.width)
         || (region.buffer_image_height != 0 && region.buffer_image_height < extent.height)
+        || (region.buffer_row_length != 0 && region.buffer_row_length % block.width != 0)
+        || (region.buffer_image_height != 0 && region.buffer_image_height % block.height != 0)
         || region.buffer_offset % 4 != 0
-        || region.buffer_offset % texel_size != 0
+        || region.buffer_offset % block.bytes != 0
     {
+        return Err(VulkanError::InvalidCopyRegion);
+    }
+    let compressed = block.width > 1 || block.height > 1 || block.depth > 1;
+    if compressed && image.image_type != vk::ImageType::TYPE_2D {
         return Err(VulkanError::InvalidCopyRegion);
     }
     match image.image_type {
@@ -1671,18 +1823,28 @@ fn validate_buffer_image_copy_region(
         height: mip_dimension(image.extent.height, subresource.mip_level),
         depth: mip_dimension(image.extent.depth, subresource.mip_level),
     };
-    if (offset.x as u32)
+    let end_x = (offset.x as u32)
         .checked_add(extent.width)
-        .is_none_or(|end| end > mip_extent.width)
-        || (offset.y as u32)
-            .checked_add(extent.height)
-            .is_none_or(|end| end > mip_extent.height)
-        || (offset.z as u32)
-            .checked_add(extent.depth)
-            .is_none_or(|end| end > mip_extent.depth)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let end_y = (offset.y as u32)
+        .checked_add(extent.height)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let end_z = (offset.z as u32)
+        .checked_add(extent.depth)
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    if end_x > mip_extent.width
+        || end_y > mip_extent.height
+        || end_z > mip_extent.depth
+        || (offset.x as u32) % block.width != 0
+        || (offset.y as u32) % block.height != 0
+        || (offset.z as u32) % block.depth != 0
+        || (extent.width % block.width != 0 && end_x != mip_extent.width)
+        || (extent.height % block.height != 0 && end_y != mip_extent.height)
+        || (extent.depth % block.depth != 0 && end_z != mip_extent.depth)
     {
         return Err(VulkanError::InvalidCopyRegion);
     }
+
     let row_texels = u64::from(if region.buffer_row_length == 0 {
         extent.width
     } else {
@@ -1693,26 +1855,36 @@ fn validate_buffer_image_copy_region(
     } else {
         region.buffer_image_height
     });
-    let row_bytes = row_texels
-        .checked_mul(texel_size)
+    let row_blocks =
+        div_ceil(row_texels, u64::from(block.width)).ok_or(VulkanError::InvalidCopyRegion)?;
+    let image_block_rows =
+        div_ceil(image_rows, u64::from(block.height)).ok_or(VulkanError::InvalidCopyRegion)?;
+    let copy_block_rows = div_ceil(u64::from(extent.height), u64::from(block.height))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let copy_block_slices = div_ceil(u64::from(extent.depth), u64::from(block.depth))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let final_row_blocks = div_ceil(u64::from(extent.width), u64::from(block.width))
+        .ok_or(VulkanError::InvalidCopyRegion)?;
+    let row_bytes = row_blocks
+        .checked_mul(block.bytes)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let slice_bytes = row_bytes
-        .checked_mul(image_rows)
+        .checked_mul(image_block_rows)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let layer_bytes = slice_bytes
-        .checked_mul(u64::from(extent.depth))
+        .checked_mul(copy_block_slices)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_layers = layer_bytes
         .checked_mul(u64::from(subresource.layer_count - 1))
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_depth = slice_bytes
-        .checked_mul(u64::from(extent.depth - 1))
+        .checked_mul(copy_block_slices - 1)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let preceding_rows = row_bytes
-        .checked_mul(u64::from(extent.height - 1))
+        .checked_mul(copy_block_rows - 1)
         .ok_or(VulkanError::InvalidCopyRegion)?;
-    let final_row = u64::from(extent.width)
-        .checked_mul(texel_size)
+    let final_row = final_row_blocks
+        .checked_mul(block.bytes)
         .ok_or(VulkanError::InvalidCopyRegion)?;
     let required = preceding_layers
         .checked_add(preceding_depth)
@@ -2013,11 +2185,12 @@ fn swapchain_target_matches(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBarrierSubresourceRange, format_bytes_per_texel, push_constant_range_covers,
-        ranges_overlap, swapchain_target_matches, validate_buffer_barrier_range,
-        validate_buffer_copy_region, validate_buffer_image_copy_region,
-        validate_command_pool_flags, validate_dynamic_offset_requirement,
-        validate_image_barrier_range, validate_image_copy_region, validate_semaphore_handle_sets,
+        ImageBarrierSubresourceRange, format_bytes_per_texel, format_copy_block_info,
+        push_constant_range_covers, ranges_overlap, swapchain_target_matches,
+        validate_buffer_barrier_range, validate_buffer_copy_region,
+        validate_buffer_image_copy_region, validate_command_pool_flags,
+        validate_dynamic_offset_requirement, validate_image_barrier_range,
+        validate_image_copy_region, validate_semaphore_handle_sets,
     };
     use crate::descriptor::DynamicOffsetRequirement;
     use ash::vk;
@@ -2194,6 +2367,43 @@ mod tests {
     }
 
     #[test]
+    fn copy_block_metadata_covers_compressed_and_depth_stencil_aspects() {
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::BC1_RGBA_UNORM_BLOCK,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Some(super::FormatCopyBlockInfo::compressed(4, 4, 8))
+        );
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::ASTC_10X6_SRGB_BLOCK,
+                vk::ImageAspectFlags::COLOR,
+            ),
+            Some(super::FormatCopyBlockInfo::compressed(10, 6, 16))
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D24_UNORM_S8_UINT, vk::ImageAspectFlags::DEPTH,),
+            Some(super::FormatCopyBlockInfo::texel(4))
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D24_UNORM_S8_UINT, vk::ImageAspectFlags::STENCIL,),
+            Some(super::FormatCopyBlockInfo::texel(1))
+        );
+        assert_eq!(
+            format_copy_block_info(
+                vk::Format::D24_UNORM_S8_UINT,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            ),
+            None
+        );
+        assert_eq!(
+            format_copy_block_info(vk::Format::D32_SFLOAT, vk::ImageAspectFlags::COLOR,),
+            None
+        );
+    }
+
+    #[test]
     fn validates_buffer_image_copy_required_bytes_and_subresource_bounds() {
         let image = test_color_image_config();
         let region = test_buffer_image_region();
@@ -2214,8 +2424,85 @@ mod tests {
             .image_subresource(region.image_subresource)
             .image_extent(region.image_extent);
         assert!(validate_buffer_image_copy_region(&misaligned, 128, image).is_err());
-        let unsupported = crate::ImageConfig {
+        let compressed = crate::ImageConfig {
             format: vk::Format::BC1_RGBA_UNORM_BLOCK,
+            ..image
+        };
+        let compressed_region = vk::BufferImageCopy {
+            image_extent: vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            ..region
+        };
+        assert!(validate_buffer_image_copy_region(&compressed_region, 8, compressed).is_ok());
+        assert!(validate_buffer_image_copy_region(&compressed_region, 7, compressed).is_err());
+        let compressed_edge_image = crate::ImageConfig {
+            extent: vk::Extent3D {
+                width: 5,
+                height: 4,
+                depth: 1,
+            },
+            ..compressed
+        };
+        let compressed_edge_region = vk::BufferImageCopy {
+            image_extent: vk::Extent3D {
+                width: 5,
+                height: 4,
+                depth: 1,
+            },
+            ..compressed_region
+        };
+        assert!(
+            validate_buffer_image_copy_region(&compressed_edge_region, 16, compressed_edge_image)
+                .is_ok()
+        );
+        let bad_compressed_row = vk::BufferImageCopy {
+            buffer_row_length: 6,
+            ..compressed_region
+        };
+        assert!(validate_buffer_image_copy_region(&bad_compressed_row, 32, compressed).is_err());
+        let bad_compressed_offset = vk::BufferImageCopy {
+            image_offset: vk::Offset3D { x: 1, y: 0, z: 0 },
+            ..compressed_region
+        };
+        assert!(validate_buffer_image_copy_region(&bad_compressed_offset, 32, compressed).is_err());
+
+        let depth_stencil = crate::ImageConfig {
+            format: vk::Format::D24_UNORM_S8_UINT,
+            ..image
+        };
+        let depth_region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        let stencil_region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::STENCIL,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        assert!(validate_buffer_image_copy_region(&depth_region, 64, depth_stencil).is_ok());
+        assert!(validate_buffer_image_copy_region(&stencil_region, 16, depth_stencil).is_ok());
+        let combined_aspect = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                ..region.image_subresource
+            },
+            ..region
+        };
+        assert!(matches!(
+            validate_buffer_image_copy_region(&combined_aspect, 64, depth_stencil),
+            Err(crate::VulkanError::UnsupportedCopyFormat)
+        ));
+
+        let unsupported = crate::ImageConfig {
+            format: vk::Format::R64G64B64_SFLOAT,
             ..image
         };
         assert!(matches!(
