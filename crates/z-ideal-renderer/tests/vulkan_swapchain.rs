@@ -18,7 +18,7 @@ use z_ideal_renderer::{
     VulkanSwapchainFramebuffer,
 };
 
-/// Runs against Xvfb + Mesa lavapipe and the Khronos validation layer.
+/// Runs against an X11 Vulkan ICD and Khronos validation layer; CI uses Xvfb + Mesa lavapipe.
 #[test]
 #[ignore = "requires X11/Xvfb, a Vulkan ICD, and VK_LAYER_KHRONOS_validation"]
 fn swapchain_frame_submission_presents_with_a_depth_attachment_validation_clean() {
@@ -72,8 +72,14 @@ fn run_swapchain_validation(window: &Window) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let instance = Arc::clone(context.instance());
     let device = context.device();
+    eprintln!(
+        "Vulkan presentation device '{}': graphics queue family={}, presentation queue family={}",
+        device.info().name,
+        device.graphics_queue_family(),
+        device.present_queue_family()
+    );
     let extent = [64, 64];
-    let swapchain = context
+    let mut swapchain = context
         .create_swapchain(extent, SwapchainConfig::default())
         .map_err(|error| error.to_string())?;
     let swapchain_extent = swapchain
@@ -82,6 +88,15 @@ fn run_swapchain_validation(window: &Window) -> Result<(), String> {
     let swapchain_format = swapchain
         .format()
         .ok_or_else(|| "new swapchain has no selected format".to_owned())?;
+    if !matches!(
+        swapchain.recreate([0, 0]),
+        Err(z_ideal_renderer::VulkanError::ZeroExtent)
+    ) {
+        return Err("zero-sized recreation did not defer swapchain replacement".to_owned());
+    }
+    if !swapchain.is_ready() || swapchain.extent() != Some(swapchain_extent) {
+        return Err("zero-sized recreation changed the existing swapchain".to_owned());
+    }
 
     let depth_format = vk::Format::D32_SFLOAT;
     let depth_image = VulkanImage::new(
@@ -237,7 +252,73 @@ fn run_swapchain_validation(window: &Window) -> Result<(), String> {
     }
     drop(submission);
 
+    // Recreate the swapchain after a successful presentation and prove that the
+    // frame scheduler replaces its per-image synchronization for the new generation.
     drop(framebuffer);
+    swapchain
+        .recreate(extent)
+        .map_err(|error| format!("recreate swapchain after first presentation: {error}"))?;
+    if !swapchain.is_ready() || swapchain.extent() != Some(swapchain_extent) {
+        return Err("recreated swapchain did not preserve the requested extent".to_owned());
+    }
+
+    let second_ticket = match scheduler
+        .begin_frame(&swapchain, u64::MAX)
+        .map_err(|error| error.to_string())?
+    {
+        FrameStart::Ready(ticket) => ticket,
+        FrameStart::OutOfDate => {
+            return Err("recreated swapchain was out of date on first acquire".to_owned());
+        }
+        FrameStart::Timeout => {
+            return Err("recreated swapchain acquire unexpectedly timed out".to_owned());
+        }
+        FrameStart::Pending => {
+            return Err("recreated frame scheduler unexpectedly reported pending".to_owned());
+        }
+    };
+    let second_framebuffer = VulkanSwapchainFramebuffer::with_attachments(
+        &render_pass,
+        &swapchain,
+        second_ticket.image_index(),
+        0,
+        &[&depth_view],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut second_command_buffer = command_pool
+        .allocate_primary()
+        .map_err(|error| error.to_string())?;
+    let mut second_recording = second_command_buffer
+        .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+        .map_err(|error| error.to_string())?;
+    second_recording
+        .begin_swapchain_render_pass(&render_pass, &second_framebuffer, &clear_values)
+        .map_err(|error| error.to_string())?;
+    second_recording
+        .end_render_pass()
+        .map_err(|error| error.to_string())?;
+    let second_executable = second_recording.end().map_err(|error| error.to_string())?;
+    let (second_present_result, mut second_submission) = second_ticket
+        .submit_and_present(&queue, second_executable)
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        second_present_result,
+        z_ideal_renderer::PresentResult::Presented { .. }
+    ) {
+        return Err(format!(
+            "recreated swapchain present did not succeed: {second_present_result:?}"
+        ));
+    }
+    if second_submission
+        .wait(u64::MAX)
+        .map_err(|error| error.to_string())?
+        != FenceWaitResult::Signaled
+    {
+        return Err("recreated swapchain frame submission did not complete".to_owned());
+    }
+    drop(second_submission);
+    drop(second_framebuffer);
+
     drop(command_pool);
     drop(scheduler);
     drop(depth_view);

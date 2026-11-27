@@ -11,9 +11,9 @@ use z_ideal_renderer::{
     VulkanSemaphore, VulkanShaderModule, compile_glsl,
 };
 
-/// Runs on the dedicated Mesa lavapipe + Khronos validation CI job.
+/// Runs against the selected Vulkan ICD and Khronos validation layer.
 #[test]
-#[ignore = "requires a Vulkan ICD and Khronos validation layer; run in the dedicated Vulkan CI job"]
+#[ignore = "requires a Vulkan ICD and Khronos validation layer; run with --ignored on a Vulkan host"]
 fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean() {
     const WIDTH: u32 = 32;
     const HEIGHT: u32 = 32;
@@ -217,7 +217,8 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     let transfer_queue_family = device.transfer_queue_family();
     let ownership_transfer_required = graphics_queue_family != transfer_queue_family;
     eprintln!(
-        "lavapipe queue families: graphics={graphics_queue_family}, transfer={transfer_queue_family}; cross-family ownership path={ownership_transfer_required}"
+        "Vulkan device '{}': graphics queue family={graphics_queue_family}, transfer queue family={transfer_queue_family}; cross-family ownership path={ownership_transfer_required}",
+        device.info().name
     );
     let transfer_semaphore = if ownership_transfer_required {
         Some(VulkanSemaphore::new(&device).expect("create queue-transfer semaphore"))
