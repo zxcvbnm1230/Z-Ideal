@@ -23,7 +23,7 @@ pub use scene_document::{
 pub use schedule::{Schedule, ScheduleError};
 pub use world::{World, WorldError};
 
-use z_ideal_math::Transform;
+use z_ideal_math::{PerspectiveCamera, Transform};
 
 /// Built-in local transform component.
 impl Component for Transform {
@@ -35,12 +35,25 @@ impl Component for Transform {
     }
 }
 
+/// Built-in perspective camera component.
+impl Component for PerspectiveCamera {
+    const ID: &'static str = "z_ideal.camera.perspective";
+    const VERSION: u32 = 1;
+
+    fn validate(&self) -> Result<(), String> {
+        PerspectiveCamera::validate(self).map_err(|error| error.to_string())
+    }
+}
+
 /// Stable package identifier for diagnostics and tooling.
 pub const CRATE_NAME: &str = "z-ideal-scene";
 
 #[cfg(test)]
 mod tests {
-    use super::{CRATE_NAME, Component, Entity, HierarchyError, Transform, World, WorldError};
+    use super::{
+        CRATE_NAME, Component, Entity, HierarchyError, PerspectiveCamera, Transform, World,
+        WorldError,
+    };
     use serde::{Deserialize, Serialize};
     use z_ideal_math::{Quat, Vec3};
 
@@ -70,6 +83,25 @@ mod tests {
     #[test]
     fn crate_name_is_not_empty() {
         assert!(!CRATE_NAME.is_empty());
+    }
+
+    #[test]
+    fn perspective_camera_is_a_validated_scene_component() {
+        let mut world = World::new();
+        world
+            .register_component::<PerspectiveCamera>()
+            .expect("register camera");
+        let entity = world.spawn().expect("spawn camera entity");
+        let camera = PerspectiveCamera::new(1.0, 16.0 / 9.0, 0.1, 100.0).expect("valid camera");
+        world.insert(entity, camera).expect("insert camera");
+        let invalid = serde_json::from_str::<PerspectiveCamera>(
+            r#"{"vertical_fov_radians":0.0,"aspect_ratio":1.0,"near_plane":0.1,"far_plane":100.0}"#,
+        )
+        .expect("deserialize camera data");
+        assert!(matches!(
+            world.insert(entity, invalid),
+            Err(WorldError::InvalidComponent { .. })
+        ));
     }
 
     #[test]

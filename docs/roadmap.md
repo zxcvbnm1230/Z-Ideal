@@ -24,11 +24,13 @@ This is a dependency-ordered roadmap, not a claim that these systems are already
 - Vulkan instance/device/queue selection.
 - Validation layers, swapchain lifecycle, resource wrappers.
 - Shader compilation and reflection pipeline.
-Currently in progress: see [Phase 2 status](phase-2-platform-vulkan.md).
+**Validated and merged to main.** See [Phase 2 implementation and validation notes](phase-2-platform-vulkan.md).
 
 **Exit gate:** stable startup/shutdown, resize/recreation, validation-clean smoke test on each supported platform.
 
 ## Phase 3 — Asset pipeline and first renderer
+
+Currently in progress: see [Phase 3 status](phase-3-assets-and-first-renderer.md).
 - glTF 2.0/GLB import, textures, material conversion.
 - Asset handles, cache, dependency graph and metadata.
 - Mesh rendering, camera, depth, HDR target and tone mapping.

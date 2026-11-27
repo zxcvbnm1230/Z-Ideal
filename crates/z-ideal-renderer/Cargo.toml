@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+z-ideal-assets = { path = "../z-ideal-assets" }
 ash.workspace = true
 shaderc.workspace = true
 ash-window.workspace = true

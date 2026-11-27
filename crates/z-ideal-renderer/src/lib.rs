@@ -17,6 +17,7 @@ mod frame;
 mod graphics_pipeline;
 mod image;
 mod memory;
+mod mesh;
 mod pipeline;
 mod pipeline_layout;
 mod render_pass;
@@ -41,6 +42,7 @@ pub use descriptor::{
 pub use frame::{FrameStart, FrameTicket, VulkanFrameScheduler};
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
+pub use mesh::{MeshGpu, MeshUploadError, MeshVertex};
 pub use pipeline::VulkanComputePipeline;
 pub use pipeline_layout::VulkanPipelineLayout;
 pub use render_pass::{

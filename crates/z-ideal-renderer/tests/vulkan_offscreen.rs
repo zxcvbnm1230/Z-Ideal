@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use ash::vk;
+use z_ideal_assets::{ImportedPrimitive, PrimitiveTopology};
 use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferMemoryLocation, BufferOwnershipTransfer, CommandPoolConfig,
-    FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig,
+    FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig, MeshGpu,
     RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
     RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanBuffer,
     VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline,
@@ -89,30 +90,20 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     )
     .expect("create offscreen framebuffer");
 
-    let vertex_values = [
-        -0.8_f32, -0.8, 1.0, 0.0, 0.0, 0.8, -0.8, 0.0, 1.0, 0.0, 0.0, 0.8, 0.0, 0.0, 1.0,
-    ];
-    let vertex_bytes: Vec<u8> = vertex_values
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect();
-    let mut vertex_buffer = VulkanBuffer::new(
-        &device,
-        BufferConfig {
-            size: vertex_bytes.len() as u64,
-            usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-            memory: BufferMemoryLocation::Upload,
-        },
-    )
-    .expect("create host-visible vertex buffer");
-    vertex_buffer
-        .write(0, &vertex_bytes)
-        .expect("upload triangle vertices");
+    let primitive = ImportedPrimitive {
+        mode: PrimitiveTopology::Triangles,
+        positions: vec![[-0.8, -0.8, 0.0], [0.8, -0.8, 0.0], [0.0, 0.8, 0.0]],
+        normals: None,
+        tex_coords_0: Some(vec![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+        indices: vec![0, 1, 2],
+        material_index: None,
+    };
+    let mesh = MeshGpu::upload(&device, &primitive).expect("upload imported triangle mesh");
 
     let vertex_shader = VulkanShaderModule::new(
         &device,
         compile_glsl(
-            "#version 450\nlayout(location=0) in vec2 position;\nlayout(location=1) in vec3 vertex_color;\nlayout(location=0) out vec3 color;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); color = vertex_color; }",
+            "#version 450\nlayout(location=0) in vec3 position;\nlayout(location=1) in vec2 tex_coord;\nlayout(location=0) out vec2 uv;\nvoid main() { gl_Position = vec4(position, 1.0); uv = tex_coord; }",
             &ShaderCompileConfig::new(ShaderStage::Vertex),
         )
         .expect("compile triangle vertex shader"),
@@ -121,7 +112,7 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     let fragment_shader = VulkanShaderModule::new(
         &device,
         compile_glsl(
-            "#version 450\nlayout(location=0) in vec3 color;\nlayout(location=0) out vec4 output_color;\nvoid main() { output_color = vec4(color, 1.0); }",
+            "#version 450\nlayout(location=0) in vec2 uv;\nlayout(location=0) out vec4 output_color;\nvoid main() { output_color = vec4(uv, 0.5, 1.0); }",
             &ShaderCompileConfig::new(ShaderStage::Fragment),
         )
         .expect("compile triangle fragment shader"),
@@ -135,25 +126,8 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         &fragment_shader,
         &render_pass,
         &GraphicsPipelineConfig {
-            vertex_bindings: vec![vk::VertexInputBindingDescription {
-                binding: 0,
-                stride: 20,
-                input_rate: vk::VertexInputRate::VERTEX,
-            }],
-            vertex_attributes: vec![
-                vk::VertexInputAttributeDescription {
-                    location: 0,
-                    binding: 0,
-                    format: vk::Format::R32G32_SFLOAT,
-                    offset: 0,
-                },
-                vk::VertexInputAttributeDescription {
-                    location: 1,
-                    binding: 0,
-                    format: vk::Format::R32G32B32_SFLOAT,
-                    offset: 8,
-                },
-            ],
+            vertex_bindings: vec![MeshGpu::vertex_binding()],
+            vertex_attributes: MeshGpu::vertex_attributes().to_vec(),
             ..GraphicsPipelineConfig::default()
         },
     )
@@ -259,6 +233,30 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
         .expect("begin command recording");
     recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::VERTEX_INPUT,
+            vk::DependencyFlags::empty(),
+            &[
+                BufferBarrier {
+                    buffer: mesh.vertex_buffer(),
+                    source_access: vk::AccessFlags::HOST_WRITE,
+                    destination_access: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+                BufferBarrier {
+                    buffer: mesh.index_buffer(),
+                    source_access: vk::AccessFlags::HOST_WRITE,
+                    destination_access: vk::AccessFlags::INDEX_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+            ],
+            &[],
+        )
+        .expect("make uploaded mesh buffers visible to vertex input");
+    recording
         .begin_render_pass(&render_pass, &framebuffer, &clear)
         .expect("begin offscreen render pass");
     recording
@@ -284,9 +282,14 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         })
         .expect("set offscreen scissor");
     recording
-        .bind_vertex_buffers(0, &[&vertex_buffer], &[0])
+        .bind_vertex_buffers(0, &[mesh.vertex_buffer()], &[0])
         .expect("bind triangle vertex buffer");
-    recording.draw(3, 1, 0, 0).expect("draw triangle");
+    recording
+        .bind_index_buffer(mesh.index_buffer(), 0, mesh.index_type())
+        .expect("bind triangle index buffer");
+    recording
+        .draw_indexed(mesh.index_count(), 1, 0, 0, 0)
+        .expect("draw imported triangle mesh");
     recording
         .end_render_pass()
         .expect("end offscreen render pass");
@@ -525,7 +528,7 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(transfer_semaphore);
     drop(second_readback);
     drop(readback);
-    drop(vertex_buffer);
+    drop(mesh);
     drop(image);
     drop(command_pool);
     drop(device);
