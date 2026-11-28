@@ -7,7 +7,7 @@ use std::{
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-use z_ideal_assets::{GltfImportError, GltfImporter};
+use z_ideal_assets::{GltfImportError, GltfImportOptions, GltfImporter};
 
 struct FixtureDir(PathBuf);
 
@@ -250,4 +250,73 @@ fn rejects_nodes_with_multiple_parents() {
     );
     fs::write(&path, document).expect("write multi-parent fixture");
     assert!(GltfImporter::import(&path).is_err());
+}
+
+#[test]
+fn enforces_source_document_byte_budget_before_parsing() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_source_file_bytes: 1,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("source document exceeds configured budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes,
+            limit_bytes: 1,
+            ..
+        } if resource == "source document" && actual_bytes > 1
+    ));
+}
+
+#[test]
+fn enforces_per_file_external_resource_byte_budget_before_loading() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_external_resource_bytes: 41,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("external buffer exceeds configured budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes: 42,
+            limit_bytes: 41,
+            ..
+        } if resource == "mesh.bin"
+    ));
+}
+
+#[test]
+fn enforces_aggregate_external_resource_byte_budget() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_total_external_resource_bytes: 41,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("combined external resources exceed configured budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes: 42,
+            limit_bytes: 41,
+            ..
+        } if resource == "combined external resources"
+    ));
 }

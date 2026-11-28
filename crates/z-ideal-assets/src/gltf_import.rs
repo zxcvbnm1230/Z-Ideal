@@ -62,7 +62,8 @@ pub enum TextureWrapMode {
     Repeat,
 }
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -257,24 +258,94 @@ pub enum GltfImportError {
     /// The default scene index is outside the imported scene table.
     #[error("glTF {path} declares missing default scene {scene}")]
     MissingDefaultScene { path: PathBuf, scene: usize },
+    /// A source or external resource exceeded the configured import byte budget.
+    #[error(
+        "glTF {path} resource {resource:?} is {actual_bytes} bytes; configured limit is {limit_bytes} bytes"
+    )]
+    ResourceLimitExceeded {
+        path: PathBuf,
+        resource: String,
+        actual_bytes: u64,
+        limit_bytes: u64,
+    },
+}
+
+/// Pre-allocation byte limits for glTF source documents and external resources.
+///
+/// These limits bound document reads and external buffer/image file sizes before
+/// the gltf crate allocates their contents. Embedded data URIs and GLB binary chunks are
+/// bounded by max_source_file_bytes. Decoded image expansion is not bounded by
+/// this type and remains a limitation of the current importer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GltfImportOptions {
+    /// Maximum source glTF or GLB file size in bytes.
+    pub max_source_file_bytes: u64,
+    /// Maximum size of any one external buffer or image file in bytes.
+    pub max_external_resource_bytes: u64,
+    /// Maximum combined size of distinct external buffer and image files in bytes.
+    pub max_total_external_resource_bytes: u64,
+}
+
+impl Default for GltfImportOptions {
+    fn default() -> Self {
+        Self {
+            max_source_file_bytes: 64 * 1024 * 1024,
+            max_external_resource_bytes: 256 * 1024 * 1024,
+            max_total_external_resource_bytes: 512 * 1024 * 1024,
+        }
+    }
 }
 
 /// glTF 2.0 importer.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GltfImporter;
 impl GltfImporter {
-    /// Imports a .gltf or .glb file, including referenced buffers and decoded images.
-    ///
-    /// External URIs are resolved relative to the source file. This convenience API
-    /// delegates external-file loading and image decoding to gltf/image without a
-    /// configurable pre-allocation byte or pixel budget; import only trusted project assets.
+    /// Imports a .gltf or .glb file, including referenced buffers and decoded images,
+    /// using the default GltfImportOptions byte budgets.
     pub fn import(path: impl AsRef<Path>) -> Result<GltfImport, GltfImportError> {
+        Self::import_with_options(path, GltfImportOptions::default())
+    }
+
+    /// Imports a glTF/GLB document while enforcing source and external-resource byte budgets.
+    pub fn import_with_options(
+        path: impl AsRef<Path>,
+        options: GltfImportOptions,
+    ) -> Result<GltfImport, GltfImportError> {
         let path = path.as_ref();
         let source_path = path.to_path_buf();
-        let parsed = gltf::Gltf::open(path).map_err(|error| GltfImportError::Import {
+        let source_file = std::fs::File::open(path).map_err(|error| GltfImportError::Import {
             path: source_path.clone(),
-            message: error.to_string(),
+            message: format!("could not open source document: {error}"),
         })?;
+        let mut bounded_reader = source_file.take(options.max_source_file_bytes.saturating_add(1));
+        let mut source_data = Vec::new();
+        bounded_reader
+            .read_to_end(&mut source_data)
+            .map_err(|error| GltfImportError::Import {
+                path: source_path.clone(),
+                message: format!("could not read source document: {error}"),
+            })?;
+        let source_bytes = u64::try_from(source_data.len()).map_err(|_| {
+            GltfImportError::ResourceLimitExceeded {
+                path: source_path.clone(),
+                resource: "source document".to_owned(),
+                actual_bytes: u64::MAX,
+                limit_bytes: options.max_source_file_bytes,
+            }
+        })?;
+        if source_bytes > options.max_source_file_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.clone(),
+                resource: "source document".to_owned(),
+                actual_bytes: source_bytes,
+                limit_bytes: options.max_source_file_bytes,
+            });
+        }
+        let parsed =
+            gltf::Gltf::from_slice(&source_data).map_err(|error| GltfImportError::Import {
+                path: source_path.clone(),
+                message: error.to_string(),
+            })?;
         let source_directory = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -285,20 +356,28 @@ impl GltfImporter {
             })?;
         let gltf::Gltf { document, blob } = parsed;
         let mut external_dependencies = BTreeSet::new();
+        let mut external_resources = BTreeMap::new();
         for buffer in document.buffers() {
             if let buffer::Source::Uri(uri) = buffer.source() {
-                if let Some(uri) = validate_external_uri(&source_directory, &source_path, uri)? {
-                    external_dependencies.insert(uri);
+                if let Some((uri, resolved)) =
+                    validate_external_uri(&source_directory, &source_path, uri)?
+                {
+                    external_dependencies.insert(uri.clone());
+                    external_resources.insert(resolved, uri);
                 }
             }
         }
         for image in document.images() {
             if let image::Source::Uri { uri, .. } = image.source() {
-                if let Some(uri) = validate_external_uri(&source_directory, &source_path, uri)? {
-                    external_dependencies.insert(uri);
+                if let Some((uri, resolved)) =
+                    validate_external_uri(&source_directory, &source_path, uri)?
+                {
+                    external_dependencies.insert(uri.clone());
+                    external_resources.insert(resolved, uri);
                 }
             }
         }
+        validate_external_resource_budgets(&source_path, &external_resources, options)?;
         let buffers =
             gltf::import_buffers(&document, Some(&source_directory), blob).map_err(|error| {
                 GltfImportError::Import {
@@ -686,7 +765,7 @@ fn validate_external_uri(
     source_directory: &Path,
     source_path: &Path,
     uri: &str,
-) -> Result<Option<String>, GltfImportError> {
+) -> Result<Option<(String, PathBuf)>, GltfImportError> {
     if uri
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
@@ -729,7 +808,49 @@ fn validate_external_uri(
             reason: "resolved external resource escapes the source directory".to_owned(),
         });
     }
-    Ok(Some(asset_uri.to_string()))
+    Ok(Some((asset_uri.to_string(), resolved)))
+}
+
+fn validate_external_resource_budgets(
+    source_path: &Path,
+    resources: &BTreeMap<PathBuf, String>,
+    options: GltfImportOptions,
+) -> Result<(), GltfImportError> {
+    let mut total_bytes = 0_u64;
+    for (path, uri) in resources {
+        let actual_bytes = std::fs::metadata(path)
+            .map_err(|error| GltfImportError::InvalidExternalUri {
+                path: source_path.to_path_buf(),
+                uri: uri.clone(),
+                reason: format!("external resource cannot be inspected: {error}"),
+            })?
+            .len();
+        if actual_bytes > options.max_external_resource_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: uri.clone(),
+                actual_bytes,
+                limit_bytes: options.max_external_resource_bytes,
+            });
+        }
+        total_bytes = total_bytes.checked_add(actual_bytes).ok_or_else(|| {
+            GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined external resources".to_owned(),
+                actual_bytes: u64::MAX,
+                limit_bytes: options.max_total_external_resource_bytes,
+            }
+        })?;
+        if total_bytes > options.max_total_external_resource_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined external resources".to_owned(),
+                actual_bytes: total_bytes,
+                limit_bytes: options.max_total_external_resource_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn map_primitive_mode(mode: gltf::mesh::Mode) -> PrimitiveTopology {

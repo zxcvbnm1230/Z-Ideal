@@ -38,24 +38,24 @@
 
 ## Known limitations and next work
 
-- Import currently delegates file loading and image decoding to gltf/image without configurable pre-allocation byte or pixel budgets. Treat project imports as trusted input until bounded external-resource loading is implemented.
+- GltfImporter::import_with_options now enforces pre-allocation source-document, per-external-file, and aggregate external-file byte budgets (defaults: 64 MiB, 256 MiB, and 512 MiB). Embedded data URIs and GLB chunks are bounded by the source-document limit. Decoded-image expansion is not yet bounded, and canonical-path validation still has a symlink time-of-check/time-of-use race; treat imports as trusted project content until those are resolved.
 - Image channel formats and decoded bytes are preserved; color-space interpretation, GPU texture upload, mip generation, and sampler creation from imported texture state are not yet integrated.
 - ECS instantiation preserves node transforms, hierarchy, names, and mesh references, but does not yet instantiate skinning, morph targets, animation channels, tangents, or extension-defined material behavior.
 - Asset catalog registration is currently an explicit API; the importer does not yet compute a complete transitive content fingerprint or automatically populate metadata and dependency records.
 - VulkanSceneMeshes uploads geometry only. Imported material/texture binding, shader material contracts, HDR color targets, tone mapping, and a complete runtime-owned scene renderer remain outstanding.
-- Malformed-resource testing must be expanded to truncated buffers, invalid accessors, malformed images, unsupported encodings/extensions, symlink race conditions, and configured resource budgets.
+- Malformed-resource testing must be expanded to truncated buffers, invalid accessors, malformed images, unsupported encodings/extensions, decoded-image allocation limits, and symlink race conditions. Source, per-file external, and aggregate external byte budgets now have regression coverage.
 - The Vulkan CI workflow runs lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation under Xvfb. Hardware-specific driver coverage remains separate.
 
 ## Current validation
 
-Local validation after the runtime Vulkan adapter changes:
+Local validation after the runtime Vulkan adapter and glTF byte-budget changes:
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --all-features` — 207 passed, 3 GPU integration tests ignored by default, 0 failed.
+- `cargo test --workspace --all-features` — 210 passed, 3 GPU integration tests ignored by default, 0 failed.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps` — passed.
 - `git diff --check` — passed.
 
 The runtime Vulkan integration test was run manually on the connected NVIDIA Vulkan host with Khronos validation enabled. It verifies explicit missing-asset, missing-mesh, and unsupported-topology errors; shared-mesh upload deduplication; retained asset-handle lifetime after cache eviction; upload barriers recorded before the render pass; and indexed draw recording for two instances. It completed with no Vulkan validation errors.
 
-The preceding GitHub run on commit `a100c02` passed the lavapipe offscreen and X11 presentation workflow. The current uncommitted changes add the runtime scene-mesh integration test to that workflow; this new CI step still needs a GitHub run after these changes are committed and pushed.
+GitHub CI on commit `3f47c6c` passed the Windows, macOS, and Ubuntu quality jobs, and the Vulkan workflow passed lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation. The current glTF import-budget changes still require a new CI run after they are committed and pushed.
