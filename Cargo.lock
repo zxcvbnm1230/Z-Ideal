@@ -2268,6 +2268,7 @@ dependencies = [
  "boxddd",
  "thiserror 2.0.21",
  "z-ideal-math",
+ "z-ideal-scene",
 ]
 
 [[package]]

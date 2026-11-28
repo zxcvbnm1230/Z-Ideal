@@ -10,3 +10,4 @@ license.workspace = true
 boxddd.workspace = true
 thiserror.workspace = true
 z-ideal-math.workspace = true
+z-ideal-scene = { path = "../z-ideal-scene" }

@@ -6,6 +6,7 @@ mod commands;
 mod component;
 mod entity;
 mod hierarchy;
+mod physics;
 mod prefab;
 mod scene_document;
 mod schedule;
@@ -15,6 +16,7 @@ pub use commands::{CommandError, Commands, EntityTarget, PendingEntity};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use hierarchy::HierarchyError;
+pub use physics::{Collider, ColliderShape, RigidBody, RigidBodyType};
 pub use prefab::{Prefab, PrefabInstance, PrefabOverrides};
 pub use scene_document::{
     SCENE_SCHEMA_VERSION, SceneDocument, SceneEntityId, SceneEntityRecord, SceneEntityRef,

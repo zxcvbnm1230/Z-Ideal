@@ -1,8 +1,8 @@
 # Phase 5 — Physics and Lua
 
-**Status:** in progress. Fixed-step timing and the initial Box3D world/body
-adapter are implemented. ECS synchronization, events/queries and Lua have not
-yet been integrated.
+**Status:** in progress. Fixed-step timing, the initial Box3D world/body
+adapter, serializable scene physics components, and ECS synchronization are
+implemented. Events/queries and Lua have not yet been integrated.
 
 ## Roadmap scope
 
@@ -31,7 +31,7 @@ tests. This gate is not yet met.
 - Interpolation is presentation-only and must not be written back into the
   simulation state.
 
-### Box3D backend and initial world adapter
+### Box3D backend and world adapter
 
 - ADR-0004 selects exact dependency boxddd 0.4.0, with all backend-specific
   types contained in z-ideal-physics.
@@ -53,9 +53,30 @@ tests. This gate is not yet met.
 - The Box3D Foundation freezes process-wide length_units_per_meter at first
   initialization. Conflicting later configurations are returned as errors.
 
-The adapter does not yet own ECS Transform synchronization, collision/sensor
-event delivery, ray/shape queries, joints, mesh/compound/height-field colliders,
-or runtime lifecycle integration.
+### Scene components and ECS synchronization
+
+- z-ideal-scene provides serializable, validated RigidBody and Collider
+  components with stable IDs and strict unknown-field rejection.
+- RigidBody captures body type, gravity/damping, sleep and bullet settings,
+  and initial linear velocity.
+- Collider captures sphere/box geometry, material properties, sensor state
+  and event-generation flags.
+- PhysicsScene owns a PhysicsWorld and a generation-safe mapping from scene
+  Entity handles to physics body handles.
+- synchronize creates bodies for entities with both components, updates
+  static/kinematic transforms, recreates bodies after descriptor changes,
+  and destroys bodies after component removal or entity despawn.
+- writeback_dynamic_transforms copies simulated dynamic poses into scene
+  Transform components after fixed simulation steps. Presentation
+  interpolation remains separate.
+- Physics entities are currently required to be root entities with unit local
+  scale. Parent transforms and scaled colliders return explicit errors; they
+  are not silently approximated.
+- Entities with only one of RigidBody or Collider do not participate.
+
+The scene synchronizer does not yet deliver collision/sensor events, expose
+ray/shape queries, support parented transforms or collider scaling, or provide
+joints, mesh/compound/height-field colliders.
 
 ## Backend evaluation
 
@@ -69,9 +90,8 @@ supported desktop targets.
 
 ## Remaining work
 
-- Add validated rigid-body and collider scene components, synchronization with
-  scene transforms, collision filtering, queries and ordered event delivery.
-- Specify and test physics event ordering at the world/runtime boundary.
+- Add collision filtering, ray/shape queries and deterministic ordered
+  collision/sensor event delivery; specify and test event ordering.
 - Add Lua VM, bounded execution and diagnostics, script asset contract,
   lifecycle and pause/reload behavior.
 - Bind entity/component access through validated handles and deferred scene

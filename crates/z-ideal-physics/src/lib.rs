@@ -5,11 +5,13 @@
 #![forbid(unsafe_code)]
 
 mod fixed_step;
+mod scene;
 mod world;
 
 pub use fixed_step::{
     FixedStepAccumulator, FixedStepConfig, FixedStepConfigError, FixedStepError, FixedStepPlan,
 };
+pub use scene::{PhysicsScene, PhysicsSceneError};
 pub use world::{
     ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyState, PhysicsBodyType,
     PhysicsConfigError, PhysicsError, PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,

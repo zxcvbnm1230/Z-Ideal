@@ -26,11 +26,11 @@ scale. A conflicting scale is reported by the backend and is never silently
 converted.
 
 The initial adapter supports static, kinematic and dynamic rigid bodies with
-sphere or box colliders. Body creation is transactional: if collider creation
-fails after body creation, the adapter destroys the partially created body.
-If rollback also fails, both errors are returned. Destroying a body invalidates
-its handle; reusing a slot increments its generation. Handles from another
-PhysicsWorld are rejected.
+sphere or box colliders. Body creation is transactional: if shape creation
+fails after native body creation, the adapter destroys the partially created
+body. If rollback also fails, both errors are returned. Destroying a body
+invalidates its handle; reusing a slot increments its generation. Handles
+from another PhysicsWorld are rejected.
 
 PhysicsWorld::step advances exactly one configured fixed step and uses the
 configured Box3D solver substep count. The separate FixedStepAccumulator
@@ -38,13 +38,32 @@ decides how many such calls the runtime should make for a rendered frame.
 Bodies can also have their world transform and linear velocity updated through
 validated engine-facing methods.
 
+## ECS scene synchronization
+
+The scene crate provides serializable, validated RigidBody and Collider
+components. PhysicsScene owns a PhysicsWorld and maps live scene Entity
+handles to generation-safe physics handles.
+
+Call synchronize before stepping to create bodies for entities carrying both
+components, update static/kinematic poses, recreate bodies when descriptors
+change, and destroy bodies after component removal or entity despawn. After
+one or more fixed steps, call writeback_dynamic_transforms to copy dynamic
+poses into scene Transform components. It does not perform presentation
+interpolation.
+
+Current transform contract: physics entities must be root entities and have
+unit local scale. Parent transforms, shear, and scaled colliders are rejected
+rather than approximated. Dynamic scene transforms are written in world space
+because parented physics entities are not yet supported. Scene entities with
+only one of RigidBody or Collider do not participate.
+
 ## Current scope boundaries
 
-The adapter does not yet synchronize ECS Transform components, process
-collision/sensor events, expose ray/shape queries, or support joints, mesh
-colliders, compound colliders, or height fields. These are later Phase 5
-increments, not implemented capabilities. Box3D-specific IDs and types remain
-private to this crate.
+Collision/sensor event delivery, ray/shape queries, joints, mesh colliders,
+compound colliders, height fields, parented physics transforms and collider
+scaling are not implemented. These are later Phase 5 increments, not
+implemented capabilities. Box3D-specific IDs and types remain private to
+this crate.
 
 The pinned backend is boxddd 0.4.0, an experimental 0.x safe wrapper around
 Box3D. It builds the vendored native C engine for supported desktop targets.
