@@ -188,8 +188,8 @@ until those additional controls and a formal trust policy are in place.
 
 ## Remaining Phase 5 work
 
-- Runtime/editor diagnostics integration and build-system invocation of the
-  script package pipeline.
+- Runtime/editor diagnostics integration and automatic package rebuild
+  scheduling when source files change.
 - Hard deadlines for native host calls and native API quotas, plus a documented trusted/untrusted script policy.
 - Automatic hot reload of running scripts with explicit state migration.
 - Broader integration into the packaged runtime loop and editor play mode.

@@ -8,8 +8,11 @@ and bounded instruction, elapsed-time and Lua-VM memory execution are
 implemented. Script filesystem discovery and transactional package cooking
 are implemented. The runtime simulation coordinator now drives script
 lifecycle, fixed-step physics, physics event delivery and diagnostics.
-Packaged application/editor integration, hard deadlines for native host calls
-and host API quotas remain outstanding. The VM allocator
+The editor CLI can cook script packages. RuntimeScriptPackage verifies and
+loads them, and RuntimeSimulation mounts packages and synchronizes serializable
+ScriptSet components into ordered, entity-bound script attachments. Editor
+diagnostics, packaged window/render loop integration, hard deadlines for
+native host calls and host API quotas remain outstanding. The VM allocator
 quota does not include Rust-side component snapshots or other host allocations.
 
 ## Roadmap scope
@@ -151,9 +154,8 @@ Joints, mesh/compound colliders and height fields are not implemented.
 - Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
-- Current focused coverage: 62 scripting tests, 46 scene tests, 45 physics,
-  53 asset and 30 runtime tests pass on the development host. These are
-  focused results, not the full workspace gate.
+- Focused test counts are maintained by the crate test suites and CI rather
+  than frozen here; run the full workspace validation gate for current totals.
 
 ### Runtime simulation orchestration
 
@@ -195,7 +197,18 @@ Joints, mesh/compound colliders and height fields are not implemented.
   Every source is re-imported and checked against its recorded content hash.
   Symlinked package roots, manifests and sources are rejected.
 - ScriptBuildManifest::load_script_asset loads and re-verifies an individual
-  source for ScriptInstance::load_asset.
+  source for ScriptInstance::load_asset. The editor executable exposes
+  cook-scripts --source <directory> --output <new-directory>.
+- RuntimeScriptPackage::open validates the manifest and all source hashes;
+  load_asset re-verifies each selected source. RuntimeSimulation can attach a
+  verified package asset explicitly or mount a package for scene-driven
+  attachment.
+- Runtime registers ScriptSet as a scene component. Its ScriptReference values
+  store up to 64 unique logical URIs in deterministic attachment order; disabled
+  references are ignored. advance attaches newly referenced scripts and
+  orderly detaches removed, disabled or replaced references. Package-managed
+  scripts are distinct from direct ScriptHost attachments. Missing packages,
+  missing URIs, source tampering and shutdown failures are explicit errors.
 - Portable standard filesystem APIs cannot provide a race-free directory walk
   against a concurrently hostile writer. Source and package trees must remain
   stable while discovery/loading runs; symlinks are rejected.
@@ -215,8 +228,8 @@ supported desktop targets.
 - Add joints, mesh/compound colliders and height fields only when their public
   scene/physics contracts are specified.
 - Connect RuntimeSimulation to packaged startup, PlatformEventLoop, renderer
-  frame submission and editor play mode; invoke the script package pipeline
-  from the project build workflow.
+  frame submission and editor play mode; add automatic package rebuild
+  scheduling and editor diagnostics integration.
 - Add hard deadlines for native host calls, native API quotas and a documented
   trusted/untrusted script policy.
 - Add running hot reload with explicit state migration, if required by product

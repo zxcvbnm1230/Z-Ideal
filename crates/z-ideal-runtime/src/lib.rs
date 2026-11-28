@@ -6,6 +6,8 @@ mod gltf_pbr;
 mod gltf_scene;
 mod render_scene;
 mod scene_renderer;
+mod script_component;
+mod script_package;
 mod shadow;
 mod simulation;
 mod ssao;
@@ -27,6 +29,8 @@ pub use z_ideal_assets::{
     ScriptAssetImportError,
 };
 
+pub use script_component::{MAX_SCRIPT_REFERENCES_PER_ENTITY, ScriptReference, ScriptSet};
+pub use script_package::{RuntimeScriptPackage, RuntimeScriptPackageError};
 pub use simulation::{
     RuntimeFrameReport, RuntimePhysicsOperation, RuntimeSimulation, RuntimeSimulationConfig,
     RuntimeSimulationError,

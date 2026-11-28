@@ -9,4 +9,5 @@ license.workspace = true
 [dependencies]
 z-ideal-editor = { path = "../../crates/z-ideal-editor" }
 z-ideal-core = { path = "../../crates/z-ideal-core" }
+z-ideal-assets = { path = "../../crates/z-ideal-assets" }
 tracing.workspace = true

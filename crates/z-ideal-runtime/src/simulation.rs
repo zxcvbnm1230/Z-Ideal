@@ -1,8 +1,13 @@
 //! Fixed-step orchestration for scene scripts and physics.
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
+use super::ScriptSet;
 use serde_json::{Value as JsonValue, json};
 use thiserror::Error;
+use z_ideal_assets::AssetUri;
 use z_ideal_math::Transform;
 use z_ideal_physics::{
     FixedStepAccumulator, FixedStepConfig, FixedStepError, PhysicsScene, PhysicsSceneError,
@@ -70,6 +75,15 @@ pub enum RuntimeSimulationError {
     ScriptRegistry(#[from] ScriptRegistryError),
     #[error(transparent)]
     ScriptLoad(#[from] ScriptError),
+    #[error(transparent)]
+    ScriptPackage(#[from] super::RuntimeScriptPackageError),
+    #[error("entity {entity:?} references script {uri}, but no script package is mounted")]
+    MissingScriptPackage {
+        /// Entity with the script reference.
+        entity: Entity,
+        /// Missing package script URI.
+        uri: AssetUri,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +105,8 @@ pub struct RuntimeSimulation {
     physics: PhysicsScene,
     scripts: ScriptHost,
     fixed_steps: FixedStepAccumulator,
+    script_package: Option<super::RuntimeScriptPackage>,
+    package_attachments: HashMap<(Entity, AssetUri), ScriptId>,
 }
 
 impl RuntimeSimulation {
@@ -105,6 +121,7 @@ impl RuntimeSimulation {
         world.register_component::<Transform>()?;
         world.register_component::<RigidBody>()?;
         world.register_component::<Collider>()?;
+        world.register_component::<ScriptSet>()?;
         let physics = PhysicsScene::new(config.physics)
             .map_err(RuntimeSimulationError::PhysicsInitialization)?;
         Ok(Self {
@@ -112,6 +129,8 @@ impl RuntimeSimulation {
             physics,
             scripts: ScriptHost::new(),
             fixed_steps: FixedStepAccumulator::new(config.fixed_step),
+            script_package: None,
+            package_attachments: HashMap::new(),
         })
     }
 
@@ -163,6 +182,129 @@ impl RuntimeSimulation {
         Ok(self.scripts.attach(&self.world, entity, instance)?)
     }
 
+    /// Loads a verified source asset from a cooked package and attaches it.
+    ///
+    /// The package manifest and every source file are verified when the package
+    /// is opened; the selected source is re-verified immediately before loading.
+    pub fn attach_script_from_package(
+        &mut self,
+        entity: Entity,
+        package: &super::RuntimeScriptPackage,
+        uri: &AssetUri,
+        config: ScriptConfig,
+    ) -> Result<ScriptId, RuntimeSimulationError> {
+        let asset = package.load_asset(uri)?;
+        self.attach_script_asset(entity, &asset, config)
+    }
+
+    /// Mounts a verified script package for scene-driven ScriptSet components.
+    ///
+    /// Existing package-managed scripts are shut down and detached before the
+    /// new package becomes active. Direct ScriptHost attachments are unaffected.
+    pub fn mount_script_package(
+        &mut self,
+        package: super::RuntimeScriptPackage,
+    ) -> Result<(), RuntimeSimulationError> {
+        self.detach_package_attachments()?;
+        self.script_package = Some(package);
+        Ok(())
+    }
+
+    /// Unmounts the package after orderly shutdown of its managed attachments.
+    pub fn unmount_script_package(&mut self) -> Result<(), RuntimeSimulationError> {
+        self.detach_package_attachments()?;
+        self.script_package = None;
+        Ok(())
+    }
+
+    fn detach_package_attachments(&mut self) -> Result<(), RuntimeSimulationError> {
+        let mut attachments: Vec<_> = self
+            .package_attachments
+            .iter()
+            .map(|(key, id)| (key.clone(), *id))
+            .collect();
+        attachments.sort_by(
+            |((left_entity, left_uri), _), ((right_entity, right_uri), _)| {
+                left_entity
+                    .index()
+                    .cmp(&right_entity.index())
+                    .then_with(|| left_entity.generation().cmp(&right_entity.generation()))
+                    .then_with(|| left_uri.cmp(right_uri))
+            },
+        );
+        for (key, id) in attachments {
+            let (entity, _) = &key;
+            if self.world.is_alive(*entity) && self.scripts.attached_entity(id).is_some() {
+                self.scripts.detach(&mut self.world, id)?;
+            }
+            self.package_attachments.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn synchronize_script_attachments(&mut self) -> Result<(), RuntimeSimulationError> {
+        let mut desired = Vec::new();
+        let mut desired_set = HashSet::new();
+        for entity in self.world.entities_with::<ScriptSet>() {
+            if let Some(set) = self.world.get::<ScriptSet>(entity) {
+                for reference in &set.scripts {
+                    if reference.enabled {
+                        let key = (entity, reference.uri.clone());
+                        if desired_set.insert(key.clone()) {
+                            desired.push(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let stale: Vec<_> = self
+            .package_attachments
+            .keys()
+            .filter(|key| !desired_set.contains(*key))
+            .cloned()
+            .collect();
+        let mut stale = stale;
+        stale.sort_by(|(left_entity, left_uri), (right_entity, right_uri)| {
+            left_entity
+                .index()
+                .cmp(&right_entity.index())
+                .then_with(|| left_entity.generation().cmp(&right_entity.generation()))
+                .then_with(|| left_uri.cmp(right_uri))
+        });
+        for key in stale {
+            if let Some(id) = self.package_attachments.get(&key).copied() {
+                let (entity, _) = &key;
+                if self.world.is_alive(*entity) && self.scripts.attached_entity(id).is_some() {
+                    self.scripts.detach(&mut self.world, id)?;
+                }
+                self.package_attachments.remove(&key);
+            }
+        }
+
+        for (entity, uri) in desired {
+            if let Some(id) = self
+                .package_attachments
+                .get(&(entity, uri.clone()))
+                .copied()
+                && self.scripts.attached_entity(id) == Some(entity)
+            {
+                continue;
+            }
+            self.package_attachments.remove(&(entity, uri.clone()));
+            let package = self.script_package.as_ref().ok_or_else(|| {
+                RuntimeSimulationError::MissingScriptPackage {
+                    entity,
+                    uri: uri.clone(),
+                }
+            })?;
+            let asset = package.load_asset(&uri)?;
+            let id = self.attach_script_asset(entity, &asset, ScriptConfig::default())?;
+            self.package_attachments.insert((entity, uri), id);
+        }
+        Ok(())
+    }
+
     pub fn set_paused(&mut self, paused: bool) {
         self.fixed_steps.set_paused(paused);
         self.scripts.set_paused(paused);
@@ -185,6 +327,7 @@ impl RuntimeSimulation {
         &mut self,
         frame_delta: Duration,
     ) -> Result<RuntimeFrameReport, RuntimeSimulationError> {
+        self.synchronize_script_attachments()?;
         let mut diagnostics = Vec::new();
         append_script_diagnostics(&mut diagnostics, self.scripts.start_all(&mut self.world));
         let plan = self.fixed_steps.advance(frame_delta)?;
@@ -703,5 +846,410 @@ mod tests {
                 .map(|collider| collider.shape),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod package_attachment_tests {
+    use super::*;
+    use crate::{RuntimeScriptPackage, RuntimeScriptPackageError};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use z_ideal_assets::{AssetUri, ScriptBuildPipeline};
+    use z_ideal_scripting::ScriptState;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTree(PathBuf);
+
+    impl TestTree {
+        fn new() -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "z-ideal-runtime-package-attach-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test tree");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn attaches_and_runs_a_verified_cooked_script() {
+        let tree = TestTree::new();
+        let source = tree.0.join("source");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(
+            source.join("player.lua"),
+            "return { update = function(self, dt, engine) assert(engine.entity ~= nil) end }",
+        )
+        .expect("write script");
+        let package_dir = tree.0.join("package");
+        ScriptBuildPipeline::default()
+            .cook(&source, &package_dir)
+            .expect("cook package");
+        let package = RuntimeScriptPackage::open(&package_dir).expect("open package");
+
+        let mut simulation = RuntimeSimulation::new(RuntimeSimulationConfig {
+            physics: PhysicsWorldConfig {
+                fixed_step: Duration::from_millis(10),
+                ..PhysicsWorldConfig::default()
+            },
+            fixed_step: FixedStepConfig::new(Duration::from_millis(10), 8).expect("fixed step"),
+        })
+        .expect("simulation");
+        let entity = simulation.world_mut().spawn().expect("spawn entity");
+        let script_id = simulation
+            .attach_script_from_package(
+                entity,
+                &package,
+                &AssetUri::new("player.lua").expect("script URI"),
+                ScriptConfig::default(),
+            )
+            .expect("attach package script");
+        assert_eq!(simulation.scripts().len(), 1);
+        assert_eq!(
+            simulation.scripts().attached_entity(script_id),
+            Some(entity)
+        );
+
+        let report = simulation.advance(Duration::ZERO).expect("run script");
+        assert!(report.script_diagnostics.is_empty());
+        assert_eq!(
+            simulation.scripts().script_state(script_id),
+            Some(ScriptState::Started)
+        );
+        assert!(simulation.shutdown().is_empty());
+    }
+
+    #[test]
+    fn rejects_tampered_package_source_before_script_attachment() {
+        let tree = TestTree::new();
+        let source = tree.0.join("source");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(source.join("player.lua"), "return {}").expect("write script");
+        let package_dir = tree.0.join("package");
+        ScriptBuildPipeline::default()
+            .cook(&source, &package_dir)
+            .expect("cook package");
+        let package = RuntimeScriptPackage::open(&package_dir).expect("open package");
+        fs::write(
+            package_dir.join("scripts/player.lua"),
+            "return { update = function() end }",
+        )
+        .expect("tamper source");
+
+        let mut simulation = RuntimeSimulation::new(RuntimeSimulationConfig {
+            physics: PhysicsWorldConfig {
+                fixed_step: Duration::from_millis(10),
+                ..PhysicsWorldConfig::default()
+            },
+            fixed_step: FixedStepConfig::new(Duration::from_millis(10), 8).expect("fixed step"),
+        })
+        .expect("simulation");
+        let entity = simulation.world_mut().spawn().expect("spawn entity");
+        assert!(matches!(
+            simulation.attach_script_from_package(
+                entity,
+                &package,
+                &AssetUri::new("player.lua").expect("script URI"),
+                ScriptConfig::default(),
+            ),
+            Err(RuntimeSimulationError::ScriptPackage(
+                RuntimeScriptPackageError::Build(
+                    z_ideal_assets::ScriptBuildError::SourceMetadataMismatch { .. }
+                )
+            ))
+        ));
+        assert!(simulation.scripts().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scene_script_attachment_tests {
+    use super::*;
+    use crate::{RuntimeScriptPackage, ScriptReference, ScriptSet};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use z_ideal_assets::{AssetUri, ScriptBuildPipeline};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTree(PathBuf);
+
+    impl TestTree {
+        fn new() -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "z-ideal-runtime-scene-script-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test tree");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn simulation() -> RuntimeSimulation {
+        RuntimeSimulation::new(RuntimeSimulationConfig {
+            physics: PhysicsWorldConfig {
+                fixed_step: Duration::from_millis(10),
+                ..PhysicsWorldConfig::default()
+            },
+            fixed_step: FixedStepConfig::new(Duration::from_millis(10), 8).expect("fixed step"),
+        })
+        .expect("simulation")
+    }
+
+    fn package(tree: &TestTree, source_text: &str) -> RuntimeScriptPackage {
+        let source = tree.0.join("source");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(source.join("actor.lua"), source_text).expect("write source");
+        let package = tree.0.join("package");
+        ScriptBuildPipeline::default()
+            .cook(&source, &package)
+            .expect("cook package");
+        RuntimeScriptPackage::open(package).expect("open package")
+    }
+
+    #[test]
+    fn scene_script_set_attaches_in_order_and_shutdown_detaches_resources() {
+        let tree = TestTree::new();
+        let package = package(
+            &tree,
+            r#"
+                return {
+                    start = function(self, engine)
+                        self.spawned = engine.entities.spawn()
+                    end,
+                    shutdown = function(self, engine)
+                        engine.entities.destroy(self.spawned)
+                    end
+                }
+            "#,
+        );
+        let mut simulation = simulation();
+        simulation
+            .mount_script_package(package)
+            .expect("mount package");
+        let entity = simulation.world_mut().spawn().expect("spawn owner");
+        simulation
+            .world_mut()
+            .insert(
+                entity,
+                ScriptSet::new(vec![ScriptReference::new(
+                    AssetUri::new("actor.lua").expect("URI"),
+                )])
+                .expect("script set"),
+            )
+            .expect("insert ScriptSet");
+
+        let started = simulation.advance(Duration::ZERO).expect("start script");
+        assert!(started.script_diagnostics.is_empty());
+        assert_eq!(simulation.scripts().len(), 1);
+        assert_eq!(simulation.world().entities().len(), 2);
+
+        simulation
+            .world_mut()
+            .remove::<ScriptSet>(entity)
+            .expect("remove ScriptSet");
+        let detached = simulation
+            .advance(Duration::ZERO)
+            .expect("detach removed script");
+        assert!(detached.script_diagnostics.is_empty());
+        assert!(simulation.scripts().is_empty());
+        assert_eq!(simulation.world().entities(), vec![entity]);
+    }
+
+    #[test]
+    fn enabled_scene_script_requires_a_mounted_package() {
+        let mut simulation = simulation();
+        let entity = simulation.world_mut().spawn().expect("spawn");
+        simulation
+            .world_mut()
+            .insert(
+                entity,
+                ScriptSet::new(vec![ScriptReference::new(
+                    AssetUri::new("actor.lua").expect("URI"),
+                )])
+                .expect("script set"),
+            )
+            .expect("insert ScriptSet");
+        assert!(matches!(
+            simulation.advance(Duration::ZERO),
+            Err(RuntimeSimulationError::MissingScriptPackage {
+                entity: missing_entity,
+                ..
+            }) if missing_entity == entity
+        ));
+        assert!(simulation.scripts().is_empty());
+    }
+
+    #[test]
+    fn disabled_scene_script_does_not_require_a_package_or_attach() {
+        let mut simulation = simulation();
+        let entity = simulation.world_mut().spawn().expect("spawn");
+        simulation
+            .world_mut()
+            .insert(
+                entity,
+                ScriptSet::new(vec![ScriptReference::with_enabled(
+                    AssetUri::new("actor.lua").expect("URI"),
+                    false,
+                )])
+                .expect("script set"),
+            )
+            .expect("insert ScriptSet");
+        let report = simulation.advance(Duration::ZERO).expect("advance");
+        assert!(report.script_diagnostics.is_empty());
+        assert!(simulation.scripts().is_empty());
+    }
+
+    #[test]
+    fn changing_scene_script_reference_detaches_previous_instance() {
+        let tree = TestTree::new();
+        let package = package(
+            &tree,
+            "return { start = function(self, engine) self.started = true end }",
+        );
+        let mut simulation = simulation();
+        simulation.mount_script_package(package).expect("mount");
+        let entity = simulation.world_mut().spawn().expect("spawn");
+        let reference = |uri: &str| {
+            ScriptSet::new(vec![ScriptReference::new(AssetUri::new(uri).expect("URI"))])
+                .expect("script set")
+        };
+        simulation
+            .world_mut()
+            .insert(entity, reference("actor.lua"))
+            .expect("insert script set");
+        simulation.advance(Duration::ZERO).expect("attach");
+        assert_eq!(simulation.scripts().len(), 1);
+
+        simulation
+            .world_mut()
+            .insert(entity, ScriptSet::default())
+            .expect("clear script references");
+        simulation.advance(Duration::ZERO).expect("detach");
+        assert!(simulation.scripts().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod script_set_order_tests {
+    use super::*;
+    use crate::{RuntimeScriptPackage, ScriptReference, ScriptSet};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use z_ideal_assets::ScriptBuildPipeline;
+    use z_ideal_math::Vec3;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn scripts_execute_in_scene_reference_order() {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "z-ideal-script-order-{}-{sequence}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let package_dir = root.join("package");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(
+            source.join("first.lua"),
+            r#"
+                return {
+                    update = function(self, dt, engine)
+                        engine.transforms.set(engine.entity, {
+                            translation = {1, 0, 0},
+                            rotation = {0, 0, 0, 1},
+                            scale = {1, 1, 1}
+                        })
+                    end
+                }
+            "#,
+        )
+        .expect("write first script");
+        fs::write(
+            source.join("second.lua"),
+            r#"
+                return {
+                    update = function(self, dt, engine)
+                        local transform = engine.transforms.get(engine.entity)
+                        assert(transform.translation[1] == 1)
+                        transform.translation[1] = 2
+                        engine.transforms.set(engine.entity, transform)
+                    end
+                }
+            "#,
+        )
+        .expect("write second script");
+        ScriptBuildPipeline::default()
+            .cook(&source, &package_dir)
+            .expect("cook scripts");
+        let package = RuntimeScriptPackage::open(&package_dir).expect("open package");
+        let mut simulation = RuntimeSimulation::new(RuntimeSimulationConfig {
+            physics: PhysicsWorldConfig {
+                fixed_step: Duration::from_millis(10),
+                ..PhysicsWorldConfig::default()
+            },
+            fixed_step: FixedStepConfig::new(Duration::from_millis(10), 8).expect("fixed step"),
+        })
+        .expect("simulation");
+        simulation
+            .mount_script_package(package)
+            .expect("mount package");
+        let entity = simulation.world_mut().spawn().expect("spawn entity");
+        simulation
+            .world_mut()
+            .insert(entity, Transform::default())
+            .expect("insert transform");
+        simulation
+            .world_mut()
+            .insert(
+                entity,
+                ScriptSet::new(vec![
+                    ScriptReference::new(
+                        z_ideal_assets::AssetUri::new("first.lua").expect("first URI"),
+                    ),
+                    ScriptReference::new(
+                        z_ideal_assets::AssetUri::new("second.lua").expect("second URI"),
+                    ),
+                ])
+                .expect("script set"),
+            )
+            .expect("insert script set");
+
+        let report = simulation.advance(Duration::ZERO).expect("advance scripts");
+        assert!(report.script_diagnostics.is_empty());
+        assert_eq!(
+            simulation
+                .world()
+                .get::<Transform>(entity)
+                .expect("updated transform")
+                .translation(),
+            Vec3::new(2.0, 0.0, 0.0)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

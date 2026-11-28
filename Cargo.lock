@@ -2420,6 +2420,7 @@ name = "z-ideal-editor-app"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "z-ideal-assets",
  "z-ideal-core",
  "z-ideal-editor",
 ]

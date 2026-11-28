@@ -33,7 +33,10 @@ cargo test -p z-ideal-assets --all-features covers bounded HDRI decoding, linear
 Place source files under a project script directory, for example assets/scripts/.
 Call ScriptBuildPipeline::discover to import sources without executing them,
 or cook to create a package in a destination directory that does not already
-exist. The package contains the original source under scripts/ and a
+exist. The editor executable exposes the same pipeline as
+z-ideal-editor-app cook-scripts --source assets/scripts --output build/scripts
+(or cargo run -p z-ideal-editor-app -- cook-scripts --source assets/scripts
+--output build/scripts). The package contains the original source under scripts/ and a
 versioned manifest.json. The default limits are 1 MiB per source, 16,384
 scripts, 256 MiB combined source and 16 MiB for the manifest.
 
