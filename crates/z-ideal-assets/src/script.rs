@@ -87,6 +87,12 @@ impl LuaScriptImporter {
         Ok(Self { max_source_bytes })
     }
 
+    /// Returns the configured maximum source size in bytes.
+    #[must_use]
+    pub const fn max_source_bytes(&self) -> usize {
+        self.max_source_bytes
+    }
+
     /// Imports a .lua asset without executing or compiling its source.
     ///
     /// An optional first-line header of the form

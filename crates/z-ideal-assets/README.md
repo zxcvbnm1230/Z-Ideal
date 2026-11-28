@@ -11,6 +11,9 @@ Renderer-independent asset identity, metadata, dependency tracking, cache owners
 - AssetCache<T> owns strong references. Handles remain valid after cache eviction; duplicate insertion is an explicit error, not an implicit reload.
 - GltfImporter reads glTF 2.0 JSON and GLB documents, external/data-URI buffers and images, indexed/non-indexed mesh primitives, optional normals/tangents and UV0/UV1, validated node hierarchies with local TRS transforms and mesh references, scene roots/default scene, texture samplers, and metallic-roughness material factors, all five standard texture slots, per-slot UV-set indices, normal scale, occlusion strength, alpha mode/cutoff, and double-sided state. Core factors are checked for finite values and glTF ranges before import succeeds. Parser-specific types are converted into engine-facing enums and structures.
 - GltfImporter::import_with_options enforces source-document, per-external-file, and aggregate external-resource byte limits (64 MiB, 256 MiB, and 512 MiB by default), plus strict image dimensions (16,384 by 16,384), decoded bytes per image (256 MiB), and aggregate decoded image bytes (512 MiB).
+- LuaScriptImporter validates bounded UTF-8 Lua source, API version headers and script metadata.
+- ScriptBuildPipeline recursively discovers Lua files in deterministic URI order, rejects symbolic links and invalid logical paths, and enforces per-file, script-count and aggregate-source limits (1 MiB, 16,384 scripts and 256 MiB by default). It cooks source files and a versioned JSON manifest into a new package directory using a sibling staging directory and rename.
+- ScriptBuildManifest validates schema/API versions, script metadata, sorted unique URIs and package-relative source paths. Loading a manifest verifies every source file against its recorded content fingerprint and rejects symlinked or out-of-package paths. load_script_asset rechecks an individual source before returning it for ScriptInstance::load_asset.
 - HdrEnvironmentImporter decodes Radiance RGBE `.hdr` equirectangular maps to scene-linear RGB32F, preserves radiance above one, requires a 2:1 projection, rejects invalid samples, and enforces encoded-file, dimension, and decoded-storage budgets. Defaults are 256 MiB encoded, 16,384x8,192 pixels, and 512 MiB decoded.
 
 ## Import boundaries
@@ -23,4 +26,22 @@ The HDRI importer currently supports Radiance RGBE `.hdr` equirectangular files 
 
 ## Tests
 
-cargo test -p z-ideal-assets --all-features covers bounded HDRI decoding, linear-radiance preservation, projection validation, and encoded/decoded resource budgets, URI validation, stable identities, cache eviction/handle lifetime, metadata round trips, missing dependencies, dependency cycles, glTF and GLB import, decoded image/material texture references, external dependency reporting, path-traversal rejection, source/per-file/aggregate external byte budgets, strict image dimensions, per-image and aggregate decoded-image byte budgets, truncated external buffers, accessors exceeding buffer views, traversal/symlink escapes, malformed images, invalid indices, malformed primitives, and topology-specific index counts.
+cargo test -p z-ideal-assets --all-features covers bounded HDRI decoding, linear-radiance preservation, projection validation, and encoded/decoded resource budgets, URI validation, stable identities, cache eviction/handle lifetime, metadata round trips, missing dependencies, dependency cycles, glTF and GLB import, decoded image/material texture references, external dependency reporting, path-traversal rejection, source/per-file/aggregate external byte budgets, strict image dimensions, per-image and aggregate decoded-image byte budgets, truncated external buffers, accessors exceeding buffer views, traversal/symlink escapes, malformed images, invalid indices, malformed primitives, topology-specific index counts, deterministic Lua discovery, per-file and aggregate source limits, transactional script package cooking, manifest validation, cooked-source verification, and symlink rejection.
+
+## Lua script package workflow
+
+Place source files under a project script directory, for example assets/scripts/.
+Call ScriptBuildPipeline::discover to import sources without executing them,
+or cook to create a package in a destination directory that does not already
+exist. The package contains the original source under scripts/ and a
+versioned manifest.json. The default limits are 1 MiB per source, 16,384
+scripts, 256 MiB combined source and 16 MiB for the manifest.
+
+ScriptBuildManifest::load validates the manifest and verifies all packaged
+source hashes and API versions. Use load_script_asset to retrieve one
+verified ScriptAsset, then pass it to ScriptInstance::load_asset in
+z-ideal-scripting. Source trees and package directories must remain stable
+while they are being read; symlinks are rejected, but portable standard
+filesystem APIs do not provide a race-free directory-handle walk against a
+concurrently hostile writer. Cooking creates a fresh package and does not
+perform incremental updates or overwrite existing packages.

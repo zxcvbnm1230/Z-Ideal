@@ -5,8 +5,9 @@ serializable scene physics components, ECS synchronization, collision filters,
 ray/shape queries, overlap queries, contact/sensor event delivery, Lua source
 import, and a Lua VM with scene bindings, lifecycle, events, prefab commands
 and bounded instruction, elapsed-time and Lua-VM memory execution are
-implemented. Filesystem cooking, runtime/editor integration, hard deadlines
-for native host calls and host API quotas remain outstanding. The VM allocator
+implemented. Script filesystem discovery and transactional package cooking are
+implemented. Runtime/editor integration, hard deadlines for native host calls
+and host API quotas remain outstanding. The VM allocator
 quota does not include Rust-side component snapshots or other host allocations.
 
 ## Roadmap scope
@@ -146,8 +147,29 @@ colliders are not implemented.
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
 - Current focused coverage: 62 scripting tests, 46 scene tests, 40 physics
-  tests and 22 asset tests pass on the development host. These are focused
+  tests and 53 asset tests pass on the development host. These are focused
   results, not the full workspace gate.
+
+### Script asset discovery and cooking
+
+- ScriptBuildPipeline recursively discovers Lua sources and sorts them by
+  normalized project-relative URI. Symbolic links, invalid UTF-8 paths,
+  malformed/unsupported API headers and invalid source are errors.
+- Per-file source reads are bounded to the importer limit (1 MiB by default),
+  and packages are capped at 16,384 scripts and 256 MiB combined source.
+- Cooking writes original source files plus a versioned manifest.json into a
+  unique sibling staging directory, then publishes the completed directory
+  with a rename. The destination must not already exist; incremental updates
+  and overwrite are intentionally unsupported.
+- Manifest loading validates schema/API versions, script-kind/importer metadata,
+  sorted unique URIs, dependency closure and exact package-relative paths.
+  Every source is re-imported and checked against its recorded content hash.
+  Symlinked package roots, manifests and sources are rejected.
+- ScriptBuildManifest::load_script_asset loads and re-verifies an individual
+  source for ScriptInstance::load_asset.
+- Portable standard filesystem APIs cannot provide a race-free directory walk
+  against a concurrently hostile writer. Source and package trees must remain
+  stable while discovery/loading runs; symlinks are rejected.
 
 ## Backend evaluation
 
@@ -163,8 +185,8 @@ supported desktop targets.
 
 - Add joints, mesh/compound/height-field colliders, parent-transform support and
   collider scaling only when the public scene/physics contracts are specified.
-- Add filesystem discovery/build cooking for imported script source and
-  connect script diagnostics to editor tooling and the engine logging pipeline.
+- Connect script diagnostics to editor tooling and the engine logging pipeline;
+  invoke the script package pipeline from the project build workflow.
 - Add hard deadlines for native host calls, native API quotas and a documented
   trusted/untrusted script policy.
 - Drive the runtime-exposed ScriptHost from packaged startup, fixed-step

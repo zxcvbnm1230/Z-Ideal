@@ -18,8 +18,11 @@ registered as AssetKind::Script with importer ID z-ideal-lua/1 and no implicit
 dependencies. The fingerprint is non-cryptographic and must not be used for
 authenticity decisions. Import does not compile or execute Lua. The runtime
 compiles an imported asset through ScriptInstance::load_asset before attaching
-it to ScriptHost. Filesystem discovery, build cooking and bytecode generation
-are not implemented; the caller supplies source bytes to the importer.
+it to ScriptHost. ScriptBuildPipeline in the assets crate discovers and cooks
+these assets into a versioned package. ScriptBuildManifest::load verifies
+package metadata and source fingerprints; load_script_asset retrieves an
+individual verified asset for ScriptInstance::load_asset. Bytecode generation
+is not implemented; the runtime compiles source when loading an instance.
 
 ## Runtime and lifecycle
 
@@ -185,8 +188,8 @@ until those additional controls and a formal trust policy are in place.
 
 ## Remaining Phase 5 work
 
-- Filesystem discovery/build cooking for imported script source and
-  runtime/editor diagnostics integration.
+- Runtime/editor diagnostics integration and build-system invocation of the
+  script package pipeline.
 - Hard deadlines for native host calls and native API quotas, plus a documented trusted/untrusted script policy.
 - Automatic hot reload of running scripts with explicit state migration.
 - Broader integration into the packaged runtime loop and editor play mode.
