@@ -54,5 +54,7 @@ jobs:
         run: cargo test -p z-ideal-renderer --all-features --test vulkan_environment -- --ignored --nocapture
       - name: Run runtime scene mesh upload validation
         run: cargo test -p z-ideal-runtime --all-features --test vulkan_scene -- --ignored --nocapture
+      - name: Run runtime SSAO compute and readback validation
+        run: cargo test -p z-ideal-runtime --all-features --test vulkan_ssao -- --ignored --nocapture
       - name: Run X11 swapchain presentation and depth-attachment validation
         run: xvfb-run -a cargo test -p z-ideal-renderer --all-features --test vulkan_swapchain -- --ignored --nocapture

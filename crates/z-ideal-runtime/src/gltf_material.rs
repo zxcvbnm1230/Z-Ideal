@@ -136,6 +136,8 @@ fn validate_scene_uniform(scene: GltfPbrSceneUniform) -> Result<(), GltfMaterial
         || scene.shadow_parameters[1] < 0.0
         || scene.shadow_parameters[2] < 0.0
         || scene.shadow_parameters[2] > 1.0
+        || scene.shadow_parameters[3] < 0.0
+        || scene.shadow_parameters[3] > 1.0
         || scene.local_light_count as usize > MAX_GLTF_PBR_LOCAL_LIGHTS
     {
         return Err(GltfMaterialError::InvalidSceneValues);
@@ -284,7 +286,7 @@ pub struct GltfPbrSceneUniform {
     pub environment_max_lod: f32,
     /// Column-major light view-projection matrix used for the directional shadow map.
     pub light_view_projection: [[f32; 4]; 4],
-    /// Shadow enable (0 or 1), depth bias, strength (0..=1), and reserved value.
+    /// Shadow enable (0 or 1), depth bias, shadow strength (0..=1), and SSAO strength (0..=1).
     pub shadow_parameters: [f32; 4],
     /// Fixed-capacity local-light storage. Only the first `local_light_count` entries are active.
     pub local_lights: [GltfPbrLocalLight; MAX_GLTF_PBR_LOCAL_LIGHTS],
@@ -447,13 +449,16 @@ pub struct GltfPbrEnvironmentResources<'resource, 'image, 'device> {
     pub prefiltered_specular: GltfMaterialTextureResource<'resource, 'image, 'device>,
     /// Directional-light depth image with a comparison sampler.
     pub directional_shadow: GltfMaterialTextureResource<'resource, 'image, 'device>,
+    /// Screen-space ambient-occlusion output with a regular sampler.
+    pub screen_space_ao: GltfMaterialTextureResource<'resource, 'image, 'device>,
 }
 
 /// Writes the PBR scene uniform and image-based lighting resources to descriptor set 1.
 ///
 /// Binding 0 is the 432-byte std140 scene block; bindings 1 and 2 are combined
 /// cube samplers for diffuse irradiance and roughness-prefiltered specular radiance;
-/// binding 3 is a comparison sampler for the directional-light depth map.
+/// binding 3 is a comparison sampler for the directional-light depth map, and
+/// binding 4 is the screen-space ambient-occlusion map.
 /// The caller owns the views, images, samplers, buffer, and descriptor set. The
 /// returned lease borrows all referenced resources for the duration of GPU use.
 pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 'device>(
@@ -467,14 +472,14 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
 > {
     validate_scene_uniform(scene)?;
     let bindings = &descriptor_set.layout().config().bindings;
-    if bindings.len() != 4
+    if bindings.len() != 5
         || bindings.iter().any(|binding| {
             let expected_type = if binding.binding == 0 {
                 vk::DescriptorType::UNIFORM_BUFFER
             } else {
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER
             };
-            binding.binding > 3
+            binding.binding > 4
                 || binding.descriptor_type != expected_type
                 || binding.descriptor_count != 1
                 || !binding.stage_flags.contains(vk::ShaderStageFlags::FRAGMENT)
@@ -514,6 +519,13 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
             view: environment.directional_shadow.view,
             sampler: Some(environment.directional_shadow.sampler),
             image_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        }),
+        DescriptorResourceWrite::Image(ImageDescriptorWrite {
+            binding: 4,
+            array_element: 0,
+            view: environment.screen_space_ao.view,
+            sampler: Some(environment.screen_space_ao.sampler),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }),
     ])?)
 }
@@ -863,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn std140_payload_is_exactly_six_aligned_vectors() {
+    fn scene_uniform_payload_has_expected_std140_layout() {
         let uniform = GltfMaterialUniform::from(&material());
         let bytes = uniform.to_std140_bytes();
         assert_eq!(bytes.len(), 96);

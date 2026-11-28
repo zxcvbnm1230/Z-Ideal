@@ -7,6 +7,7 @@ mod gltf_scene;
 mod render_scene;
 mod scene_renderer;
 mod shadow;
+mod ssao;
 mod vulkan_scene;
 
 pub use gltf_material::{
@@ -29,6 +30,10 @@ pub use scene_renderer::{VulkanSceneRenderer, VulkanSceneRendererError, VulkanSc
 pub use shadow::{
     SHADOW_FRAGMENT_SHADER, SHADOW_VERTEX_SHADER, VulkanShadowRenderer, VulkanShadowRendererError,
     compile_shadow_shaders,
+};
+pub use ssao::{
+    SSAO_COMPUTE_SHADER, SsaoDescriptorResources, SsaoParameters, VulkanSsaoRenderer,
+    VulkanSsaoRendererError, compile_ssao_shader, write_ssao_descriptors,
 };
 pub use vulkan_scene::{
     GltfMaterialTextureBinding, GltfMaterialTextureSlot, VulkanSceneMeshes, VulkanSceneMeshesError,

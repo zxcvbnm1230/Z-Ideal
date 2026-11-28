@@ -44,6 +44,7 @@ layout(set = 1, binding = 0, std140) uniform SceneData {
 layout(set = 1, binding = 1) uniform samplerCube diffuse_irradiance_map;
 layout(set = 1, binding = 2) uniform samplerCube prefiltered_specular_map;
 layout(set = 1, binding = 3) uniform sampler2DShadow directional_shadow_map;
+layout(set = 1, binding = 4) uniform sampler2D screen_space_ao_map;
 
 vec2 material_uv(uint set_index) {
     return set_index == 1u ? uv1 : uv0;
@@ -197,7 +198,13 @@ void main() {
                                      material_uv(material.texture_coordinates_0.w)).r;
     float occlusion = mix(1.0, occlusion_sample,
                           material.metallic_roughness_normal_occlusion.w);
-    vec3 ambient = scene.ambient_color.rgb * base.rgb * environment_diffuse_weight * occlusion;
+    float screen_space_ao = 1.0;
+    if (scene.shadow_parameters.w > 0.0) {
+        vec2 ao_uv = gl_FragCoord.xy / vec2(textureSize(screen_space_ao_map, 0));
+        screen_space_ao = texture(screen_space_ao_map, ao_uv).r;
+    }
+    float combined_occlusion = occlusion * mix(1.0, screen_space_ao, scene.shadow_parameters.w);
+    vec3 ambient = scene.ambient_color.rgb * base.rgb * environment_diffuse_weight * combined_occlusion;
     float environment_intensity = scene.environment_intensity_max_lod.x;
     float max_specular_lod = scene.environment_intensity_max_lod.y;
     vec3 irradiance = texture(diffuse_irradiance_map, n).rgb;
@@ -211,7 +218,7 @@ void main() {
     float split_sum_b = 0.04 * roughness;
     vec3 specular_ibl = prefiltered
                       * (f0 * split_sum_a + vec3(split_sum_b));
-    vec3 environment = (diffuse_ibl + specular_ibl) * environment_intensity * occlusion;
+    vec3 environment = (diffuse_ibl + specular_ibl) * environment_intensity * combined_occlusion;
     vec3 emissive = texture(emissive_texture,
                             material_uv(material.texture_coordinates_1.x)).rgb
                   * material.emissive_alpha_cutoff.rgb;

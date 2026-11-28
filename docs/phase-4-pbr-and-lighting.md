@@ -1,13 +1,13 @@
 # Phase 4 — PBR and lighting
 
-**Status:** in progress. Implemented foundations include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, GGX roughness-prefiltered specular mip generation/upload, and runtime PBR image-based lighting using both environment maps.
+**Status:** in progress. Implemented foundations include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, GGX roughness-prefiltered specular mip generation/upload, runtime PBR image-based lighting, directional PCF shadows, and depth-based SSAO compute/compositing.
 
 ## Roadmap scope
 
 - Metallic-roughness materials and texture slots (the baseline PBR path was introduced in Phase 3).
 - HDRI import, irradiance maps, and prefiltered environment maps.
 - Directional, point, and spot lighting as scoped.
-- Filtered shadow maps and screen-space ambient occlusion (SSAO).
+- Directional filtered shadow maps and screen-space ambient occlusion (SSAO); point/spot shadow maps and cascades are not currently selected.
 
 **Exit gate:** reference scenes and deterministic image-regression tests with documented tolerances. Phase 4 remains open until all selected lighting paths and regression scenes meet this gate.
 
@@ -34,9 +34,9 @@
 ## Remaining work
 
 - Directional-light PBR shadow sampling is integrated through a caller-owned depth comparison image, light view-projection matrix, depth bias, and 3x3 PCF. The depth-only render stage records scene meshes with a dedicated 64-byte MVP path. Point/spot shadow maps and cascades remain out of scope.
-- Implement SSAO as an independently testable render stage.
+- `VulkanSsaoRenderer` dispatches a bounded 8x8 compute pass using depth reconstruction, eight deterministic screen-space directions, caller-provided inverse projection, pixel/world radii, bias, and intensity. It writes `R32_SFLOAT` AO, transitions it for fragment sampling, and the PBR shader consumes it through set 1 binding 4 with an explicit strength control.
 - Add reference scenes and image regression comparisons with documented tolerances on supported Vulkan CI and hardware runners.
 
 ## Current validation
 
-HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. The runtime PBR shader/descriptor path now samples both environment maps and evaluates one directional plus up to four bounded point/spot lights. Its specular IBL uses an analytic split-sum approximation, not a BRDF LUT. The depth-only shadow pass is implemented for one light-camera view (directional or spot). Directional PBR shadow sampling and 3x3 PCF are implemented and covered by a Vulkan readback/validation regression. Point/spot shadow maps, cascades, SSAO, and reference-scene image regression remain outstanding.
+HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. The runtime PBR shader/descriptor path now samples both environment maps and evaluates one directional plus up to four bounded point/spot lights. Its specular IBL uses an analytic split-sum approximation, not a BRDF LUT. The depth-only shadow pass is implemented for one light-camera view (directional or spot). Directional PBR shadow sampling and 3x3 PCF are covered by a Vulkan readback/validation regression. SSAO is covered by a Vulkan compute/readback regression using a synthetic depth discontinuity and is consumed by the PBR shader. Point/spot shadow maps, cascades, and reference-scene image regression remain outstanding.

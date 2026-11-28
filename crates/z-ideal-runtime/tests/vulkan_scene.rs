@@ -733,6 +733,70 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 ..ImageViewConfig::default()
             })
             .expect("create directional shadow depth view");
+        let ao_image = VulkanImage::new(
+            &device,
+            ImageConfig {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D {
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                },
+                format: vk::Format::R32_SFLOAT,
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+                tiling: vk::ImageTiling::OPTIMAL,
+                usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                flags: vk::ImageCreateFlags::empty(),
+            },
+        )
+        .expect("create neutral screen-space AO image");
+        let ao_view = ao_image
+            .create_view(ImageViewConfig::default())
+            .expect("create screen-space AO view");
+        let ao_render_pass = VulkanRenderPass::new(
+            &device,
+            RenderPassConfig {
+                attachments: vec![RenderPassAttachmentConfig {
+                    format: vk::Format::R32_SFLOAT,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: vk::ImageLayout::UNDEFINED,
+                    final_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }],
+                subpasses: vec![RenderPassSubpassConfig {
+                    color_attachments: vec![RenderPassAttachmentReference {
+                        attachment: 0,
+                        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    }],
+                    ..RenderPassSubpassConfig::default()
+                }],
+                dependencies: vec![RenderPassDependency {
+                    source_subpass: 0,
+                    destination_subpass: vk::SUBPASS_EXTERNAL,
+                    source_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    destination_stage_mask: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    source_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    destination_access_mask: vk::AccessFlags::SHADER_READ,
+                    flags: vk::DependencyFlags::BY_REGION,
+                }],
+            },
+        )
+        .expect("create neutral AO clear render pass");
+        let ao_framebuffer = VulkanFramebuffer::new(
+            &ao_render_pass,
+            &[&ao_view],
+            vk::Extent2D {
+                width: 32,
+                height: 32,
+            },
+            1,
+        )
+        .expect("create neutral AO framebuffer");
         let shadow_sampler = VulkanSampler::new(
             &device,
             SamplerConfig {
@@ -749,6 +813,20 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             },
         )
         .expect("create directional shadow comparison sampler");
+        let ao_sampler = VulkanSampler::new(
+            &device,
+            SamplerConfig {
+                mag_filter: vk::Filter::NEAREST,
+                min_filter: vk::Filter::NEAREST,
+                mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+                address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                max_lod: 0.0,
+                ..SamplerConfig::default()
+            },
+        )
+        .expect("create non-comparison AO sampler");
         let shadow_render_pass = VulkanRenderPass::new(
             &device,
             RenderPassConfig {
@@ -867,6 +945,12 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                         descriptor_count: 1,
                         stage_flags: vk::ShaderStageFlags::FRAGMENT,
                     },
+                    DescriptorBinding {
+                        binding: 4,
+                        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    },
                 ],
             },
         )
@@ -882,7 +966,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                     },
                     DescriptorPoolSize {
                         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 8,
+                        descriptor_count: 9,
                     },
                 ],
             },
@@ -961,6 +1045,10 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 directional_shadow: z_ideal_runtime::GltfMaterialTextureResource {
                     view: &shadow_view,
                     sampler: &shadow_sampler,
+                },
+                screen_space_ao: z_ideal_runtime::GltfMaterialTextureResource {
+                    view: &ao_view,
+                    sampler: &ao_sampler,
                 },
             },
         )
@@ -1117,6 +1205,17 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         recording
             .end_render_pass()
             .expect("finish directional shadow-map pass");
+        let ao_clear = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [1.0, 1.0, 1.0, 1.0],
+            },
+        }];
+        recording
+            .begin_render_pass(&ao_render_pass, &ao_framebuffer, &ao_clear)
+            .expect("begin neutral AO clear pass");
+        recording
+            .end_render_pass()
+            .expect("finish neutral AO clear pass");
         recording
             .begin_render_pass(&render_pass, &framebuffer, &clear)
             .expect("begin PBR render pass");
