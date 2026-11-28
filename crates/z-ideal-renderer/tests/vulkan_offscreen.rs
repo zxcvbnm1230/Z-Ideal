@@ -474,10 +474,16 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     assert_eq!(pixels, second_pixels, "pooled readback buffers disagree");
     let center = &pixels[((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize..][..4];
     assert_eq!(
-        center,
-        &[0, 255, 127, 255],
+        &center[..2],
+        &[0, 255],
         "farther mesh overwrote the nearer mesh: {center:?}"
     );
+    // R8G8B8A8_UNORM implementations may round 0.5 to either adjacent value.
+    assert!(
+        (127..=128).contains(&center[2]),
+        "unexpected UNORM blue channel for shader output 0.5: {center:?}"
+    );
+    assert_eq!(center[3], 255, "unexpected alpha channel: {center:?}");
     let corner = &pixels[0..4];
     assert_eq!(
         corner,
