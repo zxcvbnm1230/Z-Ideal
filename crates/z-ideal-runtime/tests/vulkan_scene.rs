@@ -24,8 +24,8 @@ use z_ideal_runtime::{
     GltfMaterialTextureBinding, GltfMaterialTextureSet, GltfMaterialTextureSlot, GltfMeshInstance,
     GltfPbrLocalLight, GltfPbrLocalLightKind, GltfPbrSceneUniform, RenderMeshInstance,
     RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError, VulkanSceneRenderer,
-    VulkanSceneViewport, compile_gltf_pbr_shaders, extract_render_scene,
-    instantiate_default_gltf_scene, write_gltf_material_descriptors,
+    VulkanSceneViewport, VulkanShadowRenderer, compile_gltf_pbr_shaders, compile_shadow_shaders,
+    extract_render_scene, instantiate_default_gltf_scene, write_gltf_material_descriptors,
     write_gltf_pbr_scene_descriptor,
 };
 use z_ideal_scene::World;
@@ -1338,4 +1338,81 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
         validation_errors.is_empty(),
         "Vulkan validation reported errors: {validation_errors:#?}"
     );
+}
+
+#[test]
+#[ignore = "requires a Vulkan ICD and Khronos validation layer; run with --ignored on a Vulkan host"]
+fn depth_only_shadow_pipeline_creation_is_validation_clean() {
+    let instance = Arc::new(
+        VulkanInstance::new(&VulkanConfig {
+            application_name: "Z Ideal depth-only shadow pipeline validation".to_owned(),
+            enable_validation: true,
+        })
+        .expect("create validation-enabled Vulkan instance"),
+    );
+    let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan device");
+    let (vertex_artifact, fragment_artifact) =
+        compile_shadow_shaders().expect("compile depth-only shadow shaders");
+    let vertex_shader =
+        VulkanShaderModule::new(&device, vertex_artifact).expect("create shadow vertex module");
+    let fragment_shader =
+        VulkanShaderModule::new(&device, fragment_artifact).expect("create shadow fragment module");
+    let push_constants = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64)];
+    let pipeline_layout = VulkanPipelineLayout::new(&device, &[], &push_constants)
+        .expect("create depth-only shadow pipeline layout");
+    let depth_format = vk::Format::D32_SFLOAT;
+    let render_pass = VulkanRenderPass::new(
+        &device,
+        RenderPassConfig {
+            attachments: vec![RenderPassAttachmentConfig {
+                format: depth_format,
+                samples: vk::SampleCountFlags::TYPE_1,
+                load_op: vk::AttachmentLoadOp::CLEAR,
+                store_op: vk::AttachmentStoreOp::STORE,
+                stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                final_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            }],
+            subpasses: vec![RenderPassSubpassConfig {
+                depth_stencil_attachment: Some(RenderPassAttachmentReference {
+                    attachment: 0,
+                    layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                }),
+                ..RenderPassSubpassConfig::default()
+            }],
+            dependencies: Vec::new(),
+        },
+    )
+    .expect("create depth-only shadow render pass");
+    let pipeline_config = GraphicsPipelineConfig {
+        vertex_bindings: vec![z_ideal_renderer::MeshGpu::vertex_binding()],
+        vertex_attributes: vec![z_ideal_renderer::MeshGpu::vertex_attributes()[0]],
+        depth_test_enable: true,
+        depth_write_enable: true,
+        depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+        ..GraphicsPipelineConfig::default()
+    };
+    let _shadow_renderer = VulkanShadowRenderer::new(
+        &pipeline_layout,
+        &vertex_shader,
+        &fragment_shader,
+        &render_pass,
+        &pipeline_config,
+    )
+    .expect("create depth-only shadow pipeline");
+    let errors: Vec<_> = instance
+        .validation_messages()
+        .expect("read shadow validation messages")
+        .into_iter()
+        .filter(|message| {
+            message
+                .severity
+                .contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+        })
+        .collect();
+    assert!(errors.is_empty(), "Vulkan validation errors: {errors:#?}");
 }

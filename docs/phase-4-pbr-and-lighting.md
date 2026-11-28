@@ -33,9 +33,10 @@
 
 ## Remaining work
 
-- Implement filtered shadow maps and SSAO as independently testable render stages.
+- Add PBR shadow-map sampling and filtered PCF integration; the depth-only shadow render stage is implemented.
+- Implement SSAO as an independently testable render stage.
 - Add reference scenes and image regression comparisons with documented tolerances on supported Vulkan CI and hardware runners.
 
 ## Current validation
 
-HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. The runtime PBR shader/descriptor path now samples both environment maps and evaluates one directional plus up to four bounded point/spot lights. Its specular IBL uses an analytic split-sum approximation, not a BRDF LUT. Filtered shadows, SSAO, and reference-scene image regression remain outstanding.
+HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. The runtime PBR shader/descriptor path now samples both environment maps and evaluates one directional plus up to four bounded point/spot lights. Its specular IBL uses an analytic split-sum approximation, not a BRDF LUT. The depth-only shadow pass is implemented for one light-camera view (directional or spot), but PBR shadow-map sampling/filtered PCF integration, point-light cubemap shadows, SSAO, and reference-scene image regression remain outstanding.

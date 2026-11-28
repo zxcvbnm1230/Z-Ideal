@@ -6,6 +6,7 @@ mod gltf_pbr;
 mod gltf_scene;
 mod render_scene;
 mod scene_renderer;
+mod shadow;
 mod vulkan_scene;
 
 pub use gltf_material::{
@@ -25,6 +26,10 @@ pub use render_scene::{
     extract_render_scene, sort_transparent_mesh_instances_back_to_front,
 };
 pub use scene_renderer::{VulkanSceneRenderer, VulkanSceneRendererError, VulkanSceneViewport};
+pub use shadow::{
+    SHADOW_FRAGMENT_SHADER, SHADOW_VERTEX_SHADER, VulkanShadowRenderer, VulkanShadowRendererError,
+    compile_shadow_shaders,
+};
 pub use vulkan_scene::{
     GltfMaterialTextureBinding, GltfMaterialTextureSlot, VulkanSceneMeshes, VulkanSceneMeshesError,
 };
