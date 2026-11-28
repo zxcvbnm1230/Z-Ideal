@@ -1,6 +1,6 @@
 //! Renderer-neutral extraction of camera and mesh state from an ECS world.
 
-use z_ideal_math::{Mat4, PerspectiveCamera};
+use z_ideal_math::{Mat4, PerspectiveCamera, Vec3};
 use z_ideal_scene::{Entity, World, WorldError};
 
 use crate::GltfMeshInstance;
@@ -27,6 +27,50 @@ pub struct RenderMeshInstance {
     pub source: GltfMeshInstance,
     /// Object-to-world transform.
     pub model: Mat4,
+}
+
+/// Errors while sorting transparent mesh instances for conventional alpha blending.
+#[derive(Debug, thiserror::Error)]
+pub enum TransparentSortError {
+    /// The supplied view matrix is non-finite.
+    #[error("transparent sorting requires a finite camera view matrix")]
+    InvalidView,
+    /// One mesh model transform or its camera-space origin is non-finite.
+    #[error("transparent sorting encountered a non-finite mesh transform")]
+    InvalidMeshTransform,
+}
+
+/// Sorts a caller-selected transparent instance slice back-to-front by camera-space origin.
+///
+/// This is a deterministic object-origin approximation, not a bounds-aware order.
+/// Large intersecting transparent meshes may require application-specific sorting.
+/// Equal-depth instances preserve their input order.
+pub fn sort_transparent_mesh_instances_back_to_front(
+    view: Mat4,
+    instances: &mut [RenderMeshInstance],
+) -> Result<(), TransparentSortError> {
+    if !view.is_finite() {
+        return Err(TransparentSortError::InvalidView);
+    }
+    for instance in instances.iter() {
+        if !instance.model.is_finite()
+            || !view
+                .transform_point3(instance.model.transform_point3(Vec3::ZERO))
+                .is_finite()
+        {
+            return Err(TransparentSortError::InvalidMeshTransform);
+        }
+    }
+    instances.sort_by(|left, right| {
+        let left_depth = view
+            .transform_point3(left.model.transform_point3(Vec3::ZERO))
+            .z;
+        let right_depth = view
+            .transform_point3(right.model.transform_point3(Vec3::ZERO))
+            .z;
+        left_depth.total_cmp(&right_depth)
+    });
+    Ok(())
 }
 
 /// Errors while extracting render data from a world.
@@ -104,10 +148,13 @@ pub fn extract_render_scene(
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderSceneExtractionError, extract_render_scene};
+    use super::{
+        RenderMeshInstance, RenderSceneExtractionError, extract_render_scene,
+        sort_transparent_mesh_instances_back_to_front,
+    };
     use crate::GltfMeshInstance;
     use z_ideal_assets::AssetUri;
-    use z_ideal_math::{PerspectiveCamera, Quat, Transform, Vec3};
+    use z_ideal_math::{Mat4, PerspectiveCamera, Quat, Transform, Vec3};
     use z_ideal_scene::World;
 
     fn world_with_render_components() -> World {
@@ -189,6 +236,48 @@ mod tests {
             Vec3::new(2.0, 3.0, 0.0)
         );
         assert_eq!(snapshot.meshes[0].source.mesh_index, 4);
+    }
+
+    #[test]
+    fn sorts_transparent_instances_from_far_to_near_and_rejects_invalid_transforms() {
+        let mut world = world_with_render_components();
+        let entities = [
+            world.spawn().expect("far entity"),
+            world.spawn().expect("near entity"),
+            world.spawn().expect("middle entity"),
+        ];
+        let uri = AssetUri::new("models/transparent.gltf").expect("asset URI");
+        let mut instances = [-2.0_f32, -1.0, -5.0]
+            .into_iter()
+            .zip(entities)
+            .map(|(z, entity)| RenderMeshInstance {
+                entity,
+                source: GltfMeshInstance {
+                    source_uri: uri.clone(),
+                    mesh_index: 0,
+                    source_node_index: 0,
+                },
+                model: Mat4::from_translation(Vec3::new(0.0, 0.0, z)),
+            })
+            .collect::<Vec<_>>();
+        sort_transparent_mesh_instances_back_to_front(Mat4::IDENTITY, &mut instances)
+            .expect("sort transparent instances");
+        assert_eq!(
+            instances
+                .iter()
+                .map(|instance| instance.model.w_axis.z)
+                .collect::<Vec<_>>(),
+            vec![-5.0, -2.0, -1.0]
+        );
+        assert!(matches!(
+            sort_transparent_mesh_instances_back_to_front(Mat4::NAN, &mut instances),
+            Err(super::TransparentSortError::InvalidView)
+        ));
+        instances[0].model = Mat4::NAN;
+        assert!(matches!(
+            sort_transparent_mesh_instances_back_to_front(Mat4::IDENTITY, &mut instances),
+            Err(super::TransparentSortError::InvalidMeshTransform)
+        ));
     }
 
     #[test]

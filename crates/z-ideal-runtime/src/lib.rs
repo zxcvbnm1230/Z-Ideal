@@ -1,17 +1,29 @@
 //! Packaged game startup, scene loading, and runtime loop; no editor dependency.
 #![forbid(unsafe_code)]
 
+mod gltf_material;
+mod gltf_pbr;
 mod gltf_scene;
 mod render_scene;
+mod scene_renderer;
 mod vulkan_scene;
 
+pub use gltf_material::{
+    GltfMaterialError, GltfMaterialTextureResource, GltfMaterialTextureResources,
+    GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform, GltfPbrSceneUniform,
+    apply_gltf_material_pipeline_state, write_gltf_material_descriptors,
+    write_gltf_pbr_scene_descriptor,
+};
+pub use gltf_pbr::{GLTF_PBR_FRAGMENT_SHADER, GLTF_PBR_VERTEX_SHADER, compile_gltf_pbr_shaders};
 pub use gltf_scene::{
     GltfMeshInstance, GltfNodeName, GltfSceneInstance, GltfSceneInstantiationError,
     ImportedNodeEntity, instantiate_default_gltf_scene, instantiate_gltf_scene,
 };
 pub use render_scene::{
-    RenderMeshInstance, RenderSceneExtractionError, RenderSceneSnapshot, extract_render_scene,
+    RenderMeshInstance, RenderSceneExtractionError, RenderSceneSnapshot, TransparentSortError,
+    extract_render_scene, sort_transparent_mesh_instances_back_to_front,
 };
+pub use scene_renderer::{VulkanSceneRenderer, VulkanSceneRendererError, VulkanSceneViewport};
 pub use vulkan_scene::{
     GltfMaterialTextureBinding, GltfMaterialTextureSlot, VulkanSceneMeshes, VulkanSceneMeshesError,
 };

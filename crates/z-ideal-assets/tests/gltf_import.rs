@@ -149,6 +149,22 @@ fn rejects_out_of_range_imported_material_factors() {
 }
 
 #[test]
+fn rejects_vertex_texture_coordinate_sets_above_uv1() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read glTF fixture");
+    fs::write(
+        &path,
+        document.replace("\"POSITION\":0", "\"POSITION\":0,\"TEXCOORD_2\":0"),
+    )
+    .expect("write unsupported UV-set fixture");
+    assert!(matches!(
+        GltfImporter::import(&path),
+        Err(GltfImportError::InvalidPrimitive { .. })
+    ));
+}
+
+#[test]
 fn imports_glb_with_embedded_binary_buffer() {
     let fixture = FixtureDir::new();
     let json_path = fixture.write_triangle(false);

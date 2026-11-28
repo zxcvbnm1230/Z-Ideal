@@ -123,7 +123,9 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         mode: PrimitiveTopology::Triangles,
         positions: vec![[-0.8, -0.8, 0.2], [0.8, -0.8, 0.2], [0.0, 0.8, 0.2]],
         normals: None,
+        tangents: None,
         tex_coords_0: Some(vec![[0.0, 1.0]; 3]),
+        tex_coords_1: None,
         indices: vec![0, 1, 2],
         material_index: None,
     };
@@ -131,7 +133,9 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         mode: PrimitiveTopology::Triangles,
         positions: vec![[-0.8, -0.8, 0.8], [0.8, -0.8, 0.8], [0.0, 0.8, 0.8]],
         normals: None,
+        tangents: None,
         tex_coords_0: Some(vec![[1.0, 0.0]; 3]),
+        tex_coords_1: None,
         indices: vec![0, 1, 2],
         material_index: None,
     };

@@ -19,9 +19,11 @@ use z_ideal_renderer::{
     compile_glsl,
 };
 use z_ideal_runtime::{
-    GltfMaterialTextureBinding, GltfMaterialTextureSlot, GltfMeshInstance, RenderMeshInstance,
-    RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError, extract_render_scene,
-    instantiate_default_gltf_scene,
+    GltfMaterialTextureBinding, GltfMaterialTextureSet, GltfMaterialTextureSlot, GltfMeshInstance,
+    GltfPbrSceneUniform, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
+    VulkanSceneMeshesError, VulkanSceneRenderer, VulkanSceneViewport, compile_gltf_pbr_shaders,
+    extract_render_scene, instantiate_default_gltf_scene, write_gltf_material_descriptors,
+    write_gltf_pbr_scene_descriptor,
 };
 use z_ideal_scene::World;
 
@@ -35,7 +37,9 @@ fn triangle_import(mode: PrimitiveTopology) -> GltfImport {
                 mode,
                 positions: vec![[-0.8, -0.8, 0.5], [0.8, -0.8, 0.5], [0.0, 0.8, 0.5]],
                 normals: None,
+                tangents: None,
                 tex_coords_0: Some(vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]),
+                tex_coords_1: None,
                 indices: vec![0, 1, 2],
                 material_index: None,
             }],
@@ -598,6 +602,398 @@ fn record_scene_draws(
         .read(0, &mut pixels)
         .expect("read rendered scene pixels");
     (draw_count, pixels)
+}
+
+#[test]
+#[ignore = "requires a Vulkan ICD and Khronos validation layer; run with --ignored on a Vulkan host"]
+fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
+    let source_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_scene.gltf");
+    let imported = GltfImporter::import(&source_path).expect("import glTF PBR fixture");
+    let source_uri = AssetUri::new("fixtures/sample_scene.gltf").expect("valid source URI");
+    let material = imported.materials.first().expect("fixture material");
+    let mut cache = AssetCache::new();
+    cache
+        .insert(
+            AssetId::from_uri(AssetKind::Mesh, &source_uri),
+            imported.clone(),
+        )
+        .expect("cache imported PBR asset");
+    let scene = snapshot(source_uri.clone(), 0);
+
+    let instance = Arc::new(
+        VulkanInstance::new(&VulkanConfig {
+            application_name: "Z Ideal glTF PBR descriptor validation".to_owned(),
+            enable_validation: true,
+        })
+        .expect("create validation-enabled Vulkan instance"),
+    );
+    let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan device");
+
+    {
+        let gpu_scene =
+            VulkanSceneMeshes::upload(&device, &cache, &scene).expect("upload PBR scene mesh");
+
+        let material_textures = GltfMaterialTextureSet::from_import(&device, &imported, material)
+            .expect("create semantic material textures and neutral fallbacks");
+        let mut untextured_material = material.clone();
+        untextured_material.base_color_texture = None;
+        untextured_material.metallic_roughness_texture = None;
+        untextured_material.normal_texture = None;
+        untextured_material.occlusion_texture = None;
+        untextured_material.emissive_texture = None;
+        let fallback_textures =
+            GltfMaterialTextureSet::from_import(&device, &imported, &untextured_material)
+                .expect("create all five neutral fallback textures");
+        let upload_pool = VulkanCommandPool::new(&device, CommandPoolConfig::default())
+            .expect("create material texture upload pool");
+        let mut upload_buffer = upload_pool
+            .allocate_primary()
+            .expect("allocate material texture upload command buffer");
+        let mut upload_recording = upload_buffer
+            .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+            .expect("begin material texture upload");
+        material_textures
+            .record_upload(&mut upload_recording)
+            .expect("record all five semantic texture uploads");
+        fallback_textures
+            .record_upload(&mut upload_recording)
+            .expect("record all five neutral fallback texture uploads");
+        let upload_executable = upload_recording.end().expect("finish material uploads");
+        let mut upload_submission = VulkanQueue::graphics(&device)
+            .submit(upload_executable, &[], &[], &[])
+            .expect("submit material texture uploads");
+        assert_eq!(
+            upload_submission
+                .wait(u64::MAX)
+                .expect("wait for texture uploads"),
+            FenceWaitResult::Signaled
+        );
+        drop(upload_submission);
+        let texture_views = material_textures
+            .create_views()
+            .expect("create all five material texture views");
+        let _fallback_views = fallback_textures
+            .create_views()
+            .expect("create all five neutral fallback texture views");
+
+        let material_layout = VulkanDescriptorSetLayout::new(
+            &device,
+            DescriptorSetLayoutConfig {
+                bindings: std::iter::once(DescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                })
+                .chain((1..=5).map(|binding| DescriptorBinding {
+                    binding,
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                }))
+                .collect(),
+            },
+        )
+        .expect("create material descriptor layout");
+        let scene_layout = VulkanDescriptorSetLayout::new(
+            &device,
+            DescriptorSetLayoutConfig {
+                bindings: vec![DescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                }],
+            },
+        )
+        .expect("create scene descriptor layout");
+        let descriptor_pool = VulkanDescriptorPool::new(
+            &device,
+            DescriptorPoolConfig {
+                max_sets: 2,
+                pool_sizes: vec![
+                    DescriptorPoolSize {
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 2,
+                    },
+                    DescriptorPoolSize {
+                        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 5,
+                    },
+                ],
+            },
+        )
+        .expect("create PBR descriptor pool");
+        let mut material_set = descriptor_pool
+            .allocate_set(&material_layout)
+            .expect("allocate material descriptor set");
+        let mut scene_set = descriptor_pool
+            .allocate_set(&scene_layout)
+            .expect("allocate scene descriptor set");
+        let mut material_buffer = VulkanBuffer::new(
+            &device,
+            BufferConfig {
+                size: 96,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                memory: BufferMemoryLocation::Upload,
+            },
+        )
+        .expect("create material uniform buffer");
+        let mut scene_buffer = VulkanBuffer::new(
+            &device,
+            BufferConfig {
+                size: 64,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                memory: BufferMemoryLocation::Upload,
+            },
+        )
+        .expect("create scene uniform buffer");
+        let material_lease = write_gltf_material_descriptors(
+            &mut material_set,
+            &mut material_buffer,
+            material,
+            texture_views.descriptor_resources(&material_textures),
+        )
+        .expect("write complete glTF material descriptor set");
+        let scene_lease = write_gltf_pbr_scene_descriptor(
+            &mut scene_set,
+            &mut scene_buffer,
+            GltfPbrSceneUniform {
+                camera_position: [0.0, 0.0, 5.0],
+                light_direction: [0.0, 0.0, -1.0],
+                light_intensity: 2.0,
+                light_color: [1.0, 1.0, 1.0],
+                ambient_color: [0.1, 0.1, 0.1],
+            },
+        )
+        .expect("write scene lighting descriptor");
+
+        let (vertex_artifact, fragment_artifact) =
+            compile_gltf_pbr_shaders().expect("compile standard glTF PBR shader pair");
+        let vertex_shader =
+            VulkanShaderModule::new(&device, vertex_artifact).expect("create PBR vertex module");
+        let fragment_shader = VulkanShaderModule::new(&device, fragment_artifact)
+            .expect("create PBR fragment module");
+        let push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(128)];
+        let pipeline_layout =
+            VulkanPipelineLayout::new(&device, &[&material_layout, &scene_layout], &push_constants)
+                .expect("create reflected PBR pipeline layout");
+        let color_config = ImageConfig {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D {
+                width: 32,
+                height: 32,
+                depth: 1,
+            },
+            format: vk::Format::R8G8B8A8_UNORM,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            flags: vk::ImageCreateFlags::empty(),
+        };
+        let color_image =
+            VulkanImage::new(&device, color_config).expect("create PBR readback color image");
+        let color_view = color_image
+            .create_view(ImageViewConfig::default())
+            .expect("create PBR readback color view");
+        let render_pass = VulkanRenderPass::new(
+            &device,
+            RenderPassConfig {
+                attachments: vec![RenderPassAttachmentConfig {
+                    format: color_config.format,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: vk::ImageLayout::UNDEFINED,
+                    final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                }],
+                subpasses: vec![RenderPassSubpassConfig {
+                    color_attachments: vec![RenderPassAttachmentReference {
+                        attachment: 0,
+                        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    }],
+                    ..RenderPassSubpassConfig::default()
+                }],
+                dependencies: vec![RenderPassDependency {
+                    source_subpass: 0,
+                    destination_subpass: vk::SUBPASS_EXTERNAL,
+                    source_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    destination_stage_mask: vk::PipelineStageFlags::TRANSFER,
+                    source_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    destination_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    flags: vk::DependencyFlags::BY_REGION,
+                }],
+            },
+        )
+        .expect("create PBR render pass");
+        let framebuffer = VulkanFramebuffer::new(
+            &render_pass,
+            &[&color_view],
+            vk::Extent2D {
+                width: 32,
+                height: 32,
+            },
+            1,
+        )
+        .expect("create PBR framebuffer");
+        let pipeline_config = GraphicsPipelineConfig {
+            vertex_bindings: vec![z_ideal_renderer::MeshGpu::vertex_binding()],
+            vertex_attributes: z_ideal_renderer::MeshGpu::vertex_attributes().to_vec(),
+            ..GraphicsPipelineConfig::default()
+        };
+        let scene_renderer = VulkanSceneRenderer::new(
+            &pipeline_layout,
+            &vertex_shader,
+            &fragment_shader,
+            &render_pass,
+            &pipeline_config,
+        )
+        .expect("create four-variant runtime PBR scene renderer");
+
+        let mut readback = VulkanBuffer::new(
+            &device,
+            BufferConfig {
+                size: 32 * 32 * 4,
+                usage: vk::BufferUsageFlags::TRANSFER_DST,
+                memory: BufferMemoryLocation::Readback,
+            },
+        )
+        .expect("create PBR pixel readback buffer");
+        let command_pool = VulkanCommandPool::new(&device, CommandPoolConfig::default())
+            .expect("create PBR draw command pool");
+        let mut command_buffer = command_pool
+            .allocate_primary()
+            .expect("allocate PBR draw command buffer");
+        let clear = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let mut recording = command_buffer
+            .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+            .expect("begin PBR command recording");
+        gpu_scene
+            .record_upload_barriers(&mut recording)
+            .expect("synchronize PBR mesh uploads");
+        recording
+            .begin_render_pass(&render_pass, &framebuffer, &clear)
+            .expect("begin PBR render pass");
+        let draws = scene_renderer
+            .record(
+                &gpu_scene,
+                &scene,
+                &mut recording,
+                scene_lease.as_ref(),
+                VulkanSceneViewport {
+                    viewport: vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 32.0,
+                        height: 32.0,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    },
+                    scissor: vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: 32,
+                            height: 32,
+                        },
+                    },
+                },
+                |_, recording, layout| {
+                    recording.bind_descriptor_sets(
+                        vk::PipelineBindPoint::GRAPHICS,
+                        layout,
+                        0,
+                        &[material_lease.as_ref()],
+                        &[],
+                    )
+                },
+            )
+            .expect("record material-bound runtime PBR scene");
+        assert_eq!(draws, 1);
+        recording.end_render_pass().expect("end PBR render pass");
+        let copy_region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(color_config.extent)];
+        recording
+            .copy_image_to_buffer(
+                &color_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                &readback,
+                &copy_region,
+            )
+            .expect("copy PBR output to host readback");
+        recording
+            .pipeline_barrier(
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[BufferBarrier {
+                    buffer: &readback,
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::HOST_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                }],
+                &[],
+            )
+            .expect("make PBR pixels visible to host");
+        let executable = recording.end().expect("finish PBR draw command buffer");
+        let mut submission = VulkanQueue::graphics(&device)
+            .submit(executable, &[], &[], &[])
+            .expect("submit PBR material draw");
+        assert_eq!(
+            submission.wait(u64::MAX).expect("wait for PBR draw"),
+            FenceWaitResult::Signaled
+        );
+        drop(submission);
+        let mut pixels = vec![0_u8; 32 * 32 * 4];
+        readback
+            .read(0, &mut pixels)
+            .expect("read PBR output pixels");
+        let center = &pixels[(16 * 32 + 16) * 4..][..4];
+        let clear = &pixels[(31 * 32 + 31) * 4..][..4];
+        assert!(
+            center[0] > 25 || center[1] > 51 || center[2] > 76,
+            "PBR direct/ambient lighting did not contribute beyond emissive: {center:?}"
+        );
+        assert_eq!(clear, &[0, 0, 0, 255], "PBR clear pixel changed: {clear:?}");
+
+        drop(material_lease);
+        drop(scene_lease);
+    } // All device-owned resources are dropped before the logical device.
+    drop(device);
+    let errors: Vec<_> = instance
+        .validation_messages()
+        .expect("read PBR validation messages")
+        .into_iter()
+        .filter(|message| {
+            message
+                .severity
+                .contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+        })
+        .collect();
+    assert!(errors.is_empty(), "Vulkan validation errors: {errors:#?}");
 }
 
 #[test]

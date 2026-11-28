@@ -141,8 +141,12 @@ pub struct ImportedPrimitive {
     pub positions: Vec<[f32; 3]>,
     /// Optional vertex normals.
     pub normals: Option<Vec<[f32; 3]>>,
+    /// Optional vertex tangents in glTF XYZW convention.
+    pub tangents: Option<Vec<[f32; 4]>>,
     /// Optional first texture coordinate set.
     pub tex_coords_0: Option<Vec<[f32; 2]>>,
+    /// Optional second texture coordinate set.
+    pub tex_coords_1: Option<Vec<[f32; 2]>>,
     /// Triangle/line/point indices; non-indexed primitives receive sequential indices.
     pub indices: Vec<u32>,
     /// Explicit material index, if supplied by the document.
@@ -552,6 +556,16 @@ impl GltfImporter {
             let mesh_index = source_mesh.index();
             let mut primitives = Vec::new();
             for (primitive_index, primitive) in source_mesh.primitives().enumerate() {
+                if primitive.attributes().any(
+                    |(semantic, _)| matches!(semantic, gltf::Semantic::TexCoords(set) if set > 1),
+                ) {
+                    return Err(invalid_primitive(
+                        &source_path,
+                        mesh_index,
+                        primitive_index,
+                        "texture coordinate sets above TEXCOORD_1 are not supported",
+                    ));
+                }
                 let reader = primitive
                     .reader(|buffer| buffers.get(buffer.index()).map(|data| data.0.as_slice()));
                 let positions = reader
@@ -589,8 +603,25 @@ impl GltfImporter {
                         "normals must be finite and match the position count",
                     ));
                 }
+                let tangents = reader
+                    .read_tangents()
+                    .map(|values| values.collect::<Vec<_>>());
+                if tangents.as_ref().is_some_and(|values| {
+                    values.len() != positions.len()
+                        || values.iter().flatten().any(|value| !value.is_finite())
+                }) {
+                    return Err(invalid_primitive(
+                        &source_path,
+                        mesh_index,
+                        primitive_index,
+                        "tangents must be finite and match the position count",
+                    ));
+                }
                 let tex_coords_0 = reader
                     .read_tex_coords(0)
+                    .map(|values| values.into_f32().collect::<Vec<_>>());
+                let tex_coords_1 = reader
+                    .read_tex_coords(1)
                     .map(|values| values.into_f32().collect::<Vec<_>>());
                 if tex_coords_0.as_ref().is_some_and(|values| {
                     values.len() != positions.len()
@@ -601,6 +632,17 @@ impl GltfImporter {
                         mesh_index,
                         primitive_index,
                         "texture coordinates must be finite and match the position count",
+                    ));
+                }
+                if tex_coords_1.as_ref().is_some_and(|values| {
+                    values.len() != positions.len()
+                        || values.iter().flatten().any(|value| !value.is_finite())
+                }) {
+                    return Err(invalid_primitive(
+                        &source_path,
+                        mesh_index,
+                        primitive_index,
+                        "second texture coordinates must be finite and match the position count",
                     ));
                 }
                 let mode = map_primitive_mode(primitive.mode());
@@ -649,7 +691,9 @@ impl GltfImporter {
                     mode,
                     positions,
                     normals,
+                    tangents,
                     tex_coords_0,
+                    tex_coords_1,
                     indices,
                     material_index,
                 });

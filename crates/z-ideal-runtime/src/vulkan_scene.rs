@@ -258,6 +258,71 @@ impl<'device> VulkanSceneMeshes<'device> {
         Ok(draw_count)
     }
 
+    /// Records PBR draws with a caller-provided material binder for each primitive.
+    ///
+    /// The active pipeline must use MeshGpu's five-attribute vertex layout and a
+    /// 128-byte vertex push-constant range containing MVP followed by model matrix.
+    /// The caller binds the scene descriptor set before invoking this method and
+    /// binds each material descriptor set in the callback. Transparent instances
+    /// must be ordered back-to-front by the caller; this adapter preserves snapshot order.
+    pub fn record_pbr_draws_with_materials<'recording, 'pool, 'layouts, F>(
+        &'recording self,
+        snapshot: &RenderSceneSnapshot,
+        recording: &mut CommandBufferRecording<'recording, 'pool, 'device>,
+        layout: &'recording VulkanPipelineLayout<'layouts, 'device>,
+        mut bind_material: F,
+    ) -> Result<usize, VulkanSceneMeshesError>
+    where
+        F: FnMut(
+            Option<&'recording ImportedMaterial>,
+            &mut CommandBufferRecording<'recording, 'pool, 'device>,
+            &'recording VulkanPipelineLayout<'layouts, 'device>,
+        ) -> Result<(), VulkanError>,
+    {
+        let view_projection = snapshot.projection * snapshot.view;
+        if !view_projection.is_finite() {
+            return Err(VulkanSceneMeshesError::NonFiniteViewProjection);
+        }
+        let mut draw_count = 0;
+        for instance in &snapshot.meshes {
+            let mesh_key = (
+                instance.source.source_uri.clone(),
+                instance.source.mesh_index,
+            );
+            let primitive_count =
+                self.primitive_counts
+                    .get(&mesh_key)
+                    .copied()
+                    .ok_or_else(|| VulkanSceneMeshesError::MeshNotUploaded {
+                        uri: instance.source.source_uri.clone(),
+                        mesh_index: instance.source.mesh_index,
+                    })?;
+            for primitive_index in 0..primitive_count {
+                let key = (
+                    instance.source.source_uri.clone(),
+                    instance.source.mesh_index,
+                    primitive_index,
+                );
+                let mesh = self.meshes.get(&key).ok_or_else(|| {
+                    VulkanSceneMeshesError::PrimitiveNotUploaded {
+                        uri: key.0.clone(),
+                        mesh_index: key.1,
+                        primitive_index,
+                    }
+                })?;
+                let material = self.material_for_primitive(
+                    &instance.source.source_uri,
+                    instance.source.mesh_index,
+                    primitive_index,
+                )?;
+                bind_material(material, recording, layout)?;
+                mesh.record_draw_pbr(recording, layout, view_projection, instance.model)?;
+                draw_count += 1;
+            }
+        }
+        Ok(draw_count)
+    }
+
     /// Returns the imported CPU asset pinned for a project-relative source URI.
     #[must_use]
     pub fn imported_asset(&self, uri: &AssetUri) -> Option<&GltfImport> {
@@ -389,7 +454,7 @@ fn resolve_material_texture_bindings(
         let Some(texture_index) = texture_index else {
             continue;
         };
-        if tex_coord != 0 {
+        if tex_coord > 1 {
             return Err(VulkanSceneMeshesError::UnsupportedTextureCoordinateSet {
                 uri: uri.clone(),
                 mesh_index,
@@ -480,7 +545,7 @@ pub enum VulkanSceneMeshesError {
         mesh_index: usize,
         primitive_index: usize,
     },
-    /// A material texture uses a UV set not currently imported by MeshGpu.
+    /// A material texture uses a UV set beyond the UV0/UV1 attributes carried by MeshGpu.
     #[error(
         "asset {uri} mesh {mesh_index} primitive {primitive_index} uses unsupported texCoord {tex_coord} for {slot:?}"
     )]
@@ -608,16 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_material_uv_sets_not_carried_by_the_mesh_vertex_format() {
+    fn accepts_uv1_and_rejects_uv_sets_beyond_the_mesh_vertex_format() {
         let asset = imported_asset();
         let mut material = imported_material();
         material.normal_tex_coord = 1;
         let uri = AssetUri::new("models/material.gltf").expect("valid asset URI");
+        assert!(resolve_material_texture_bindings(&asset, &material, &uri, 0, 0).is_ok());
+        material.normal_tex_coord = 2;
         assert!(matches!(
             resolve_material_texture_bindings(&asset, &material, &uri, 0, 0),
             Err(VulkanSceneMeshesError::UnsupportedTextureCoordinateSet {
                 slot: GltfMaterialTextureSlot::Normal,
-                tex_coord: 1,
+                tex_coord: 2,
                 ..
             })
         ));
