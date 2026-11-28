@@ -628,8 +628,10 @@ mod tests {
         assert_eq!(imported.pixels.len(), 32);
         let decoded: Vec<f32> = imported
             .pixels
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte float")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect();
         assert_eq!(decoded, [1.0, 0.5, 0.25, 1.0, 4.0, 2.0, 8.0, 1.0]);
     }

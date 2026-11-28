@@ -355,13 +355,13 @@ fn validate_image_view_config(
             image.image_type == vk::ImageType::TYPE_2D
                 && image.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
                 && view.layer_count == 6
-                && view.base_array_layer % 6 == 0
+                && view.base_array_layer.is_multiple_of(6)
         }
         vk::ImageViewType::CUBE_ARRAY => {
             image.image_type == vk::ImageType::TYPE_2D
                 && image.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
-                && view.layer_count % 6 == 0
-                && view.base_array_layer % 6 == 0
+                && view.layer_count.is_multiple_of(6)
+                && view.base_array_layer.is_multiple_of(6)
         }
         _ => false,
     };

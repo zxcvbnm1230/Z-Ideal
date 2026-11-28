@@ -156,6 +156,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxddd"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed52289a4c0846b97fefb5f56abbf4c959e93c9d326c77c95b46387d6337e838"
+dependencies = [
+ "boxddd-sys",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "boxddd-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "006ff267cb31e21b22d9aee39914e075b0f0de8af0d9aa8a2bd38ea5197648a3"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2246,7 +2265,9 @@ dependencies = [
 name = "z-ideal-physics"
 version = "0.1.0"
 dependencies = [
+ "boxddd",
  "thiserror 2.0.21",
+ "z-ideal-math",
 ]
 
 [[package]]

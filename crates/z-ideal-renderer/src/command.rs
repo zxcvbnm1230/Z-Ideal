@@ -753,8 +753,8 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
             || !buffer.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
             || offset >= buffer.size()
             || !matches!(index_type, vk::IndexType::UINT16 | vk::IndexType::UINT32)
-            || (index_type == vk::IndexType::UINT16 && offset % 2 != 0)
-            || (index_type == vk::IndexType::UINT32 && offset % 4 != 0)
+            || (index_type == vk::IndexType::UINT16 && !offset.is_multiple_of(2))
+            || (index_type == vk::IndexType::UINT32 && !offset.is_multiple_of(4))
         {
             return Err(VulkanError::InvalidCommandBufferState);
         }
@@ -1488,7 +1488,7 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         if !std::ptr::eq(self.buffer_mut().pool.device, layout.device)
             || expected_layout != Some(layout.handle())
             || !queue_supports_shader_stages(self.buffer_mut().pool.queue_flags, stages)
-            || offset % 4 != 0
+            || !offset.is_multiple_of(4)
             || size == 0
             || size % 4 != 0
             || !push_constant_range_covers(layout.push_constant_ranges(), stages, offset, end)
@@ -1600,15 +1600,14 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
 
 impl Drop for CommandBufferRecording<'_, '_, '_> {
     fn drop(&mut self) {
-        if let Some(command_buffer) = self.command_buffer.as_deref_mut() {
-            if command_buffer.state == CommandBufferState::Recording {
-                if let Err(error) = command_buffer.abort_recording() {
-                    tracing::warn!(
-                        ?error,
-                        "failed to abort unfinished Vulkan command-buffer recording"
-                    );
-                }
-            }
+        if let Some(command_buffer) = self.command_buffer.as_deref_mut()
+            && command_buffer.state == CommandBufferState::Recording
+            && let Err(error) = command_buffer.abort_recording()
+        {
+            tracing::warn!(
+                ?error,
+                "failed to abort unfinished Vulkan command-buffer recording"
+            );
         }
     }
 }
@@ -1921,9 +1920,9 @@ fn validate_buffer_copy_region(
     destination_size: vk::DeviceSize,
 ) -> bool {
     region.size > 0
-        && region.src_offset % 4 == 0
-        && region.dst_offset % 4 == 0
-        && region.size % 4 == 0
+        && region.src_offset.is_multiple_of(4)
+        && region.dst_offset.is_multiple_of(4)
+        && region.size.is_multiple_of(4)
         && region
             .src_offset
             .checked_add(region.size)
@@ -2186,10 +2185,11 @@ fn validate_buffer_image_copy_region(
         || offset.z < 0
         || (region.buffer_row_length != 0 && region.buffer_row_length < extent.width)
         || (region.buffer_image_height != 0 && region.buffer_image_height < extent.height)
-        || (region.buffer_row_length != 0 && region.buffer_row_length % block.width != 0)
-        || (region.buffer_image_height != 0 && region.buffer_image_height % block.height != 0)
-        || region.buffer_offset % 4 != 0
-        || region.buffer_offset % block.bytes != 0
+        || (region.buffer_row_length != 0 && !region.buffer_row_length.is_multiple_of(block.width))
+        || (region.buffer_image_height != 0
+            && !region.buffer_image_height.is_multiple_of(block.height))
+        || !region.buffer_offset.is_multiple_of(4)
+        || !region.buffer_offset.is_multiple_of(block.bytes)
     {
         return Err(VulkanError::InvalidCopyRegion);
     }
@@ -2230,12 +2230,12 @@ fn validate_buffer_image_copy_region(
     if end_x > mip_extent.width
         || end_y > mip_extent.height
         || end_z > mip_extent.depth
-        || (offset.x as u32) % block.width != 0
-        || (offset.y as u32) % block.height != 0
-        || (offset.z as u32) % block.depth != 0
-        || (extent.width % block.width != 0 && end_x != mip_extent.width)
-        || (extent.height % block.height != 0 && end_y != mip_extent.height)
-        || (extent.depth % block.depth != 0 && end_z != mip_extent.depth)
+        || !(offset.x as u32).is_multiple_of(block.width)
+        || !(offset.y as u32).is_multiple_of(block.height)
+        || !(offset.z as u32).is_multiple_of(block.depth)
+        || (!extent.width.is_multiple_of(block.width) && end_x != mip_extent.width)
+        || (!extent.height.is_multiple_of(block.height) && end_y != mip_extent.height)
+        || (!extent.depth.is_multiple_of(block.depth) && end_z != mip_extent.depth)
     {
         return Err(VulkanError::InvalidCopyRegion);
     }

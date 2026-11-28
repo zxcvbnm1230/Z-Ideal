@@ -98,13 +98,13 @@ impl<'device> VulkanFence<'device> {
 
 impl Drop for VulkanFence<'_> {
     fn drop(&mut self) {
-        if !matches!(self.is_signaled(), Ok(true)) {
-            if let Err(error) = self.device.wait_idle() {
-                tracing::warn!(
-                    ?error,
-                    "Vulkan device idle wait failed before unsignaled fence destruction"
-                );
-            }
+        if !matches!(self.is_signaled(), Ok(true))
+            && let Err(error) = self.device.wait_idle()
+        {
+            tracing::warn!(
+                ?error,
+                "Vulkan device idle wait failed before unsignaled fence destruction"
+            );
         }
         // SAFETY: This owner uniquely owns the fence and retains its parent device.
         unsafe { self.device.handle().destroy_fence(self.handle, None) };

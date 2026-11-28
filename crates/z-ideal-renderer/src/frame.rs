@@ -224,18 +224,18 @@ impl<'device> VulkanFrameScheduler<'device> {
         {
             return Err(VulkanError::FrameSchedulerPoisoned);
         }
-        if let Some(previous_frame) = self.image_tracker.owner(image_index as usize) {
-            if previous_frame != slot_index {
-                let previous = &self.slots[previous_frame];
-                if previous.fence.wait(u64::MAX)? == FenceWaitResult::Timeout {
-                    return Err(VulkanError::Api {
-                        operation: "wait for prior swapchain image owner",
-                        result: vk::Result::TIMEOUT,
-                    });
-                }
-                if previous.submission_live.load(Ordering::Acquire) {
-                    return Ok(FrameStart::Pending);
-                }
+        if let Some(previous_frame) = self.image_tracker.owner(image_index as usize)
+            && previous_frame != slot_index
+        {
+            let previous = &self.slots[previous_frame];
+            if previous.fence.wait(u64::MAX)? == FenceWaitResult::Timeout {
+                return Err(VulkanError::Api {
+                    operation: "wait for prior swapchain image owner",
+                    result: vk::Result::TIMEOUT,
+                });
+            }
+            if previous.submission_live.load(Ordering::Acquire) {
+                return Ok(FrameStart::Pending);
             }
         }
 

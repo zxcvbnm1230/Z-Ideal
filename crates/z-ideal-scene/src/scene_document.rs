@@ -154,13 +154,13 @@ impl SceneDocument {
         }
 
         for entity in &self.entities {
-            if let Some(parent) = entity.parent {
-                if !ids.contains(&parent) {
-                    return Err(SceneError::MissingParent {
-                        entity: entity.id,
-                        parent,
-                    });
-                }
+            if let Some(parent) = entity.parent
+                && !ids.contains(&parent)
+            {
+                return Err(SceneError::MissingParent {
+                    entity: entity.id,
+                    parent,
+                });
             }
         }
         Ok(())

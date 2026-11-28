@@ -99,13 +99,13 @@ impl<T> SparseSet<T> {
 
     fn insert(&mut self, entity: Entity, value: T) -> Option<T> {
         let slot_index = entity.index() as usize;
-        if let Some(dense_index) = self.sparse.get(slot_index).copied().flatten() {
-            if self.dense_entities.get(dense_index).copied() == Some(entity) {
-                return Some(std::mem::replace(
-                    &mut self.dense_values[dense_index],
-                    value,
-                ));
-            }
+        if let Some(dense_index) = self.sparse.get(slot_index).copied().flatten()
+            && self.dense_entities.get(dense_index).copied() == Some(entity)
+        {
+            return Some(std::mem::replace(
+                &mut self.dense_values[dense_index],
+                value,
+            ));
         }
 
         if self.sparse.len() <= slot_index {
@@ -444,10 +444,10 @@ impl World {
         if !self.is_alive(child) {
             return Err(WorldError::StaleEntity(child));
         }
-        if let Some(parent) = parent {
-            if !self.is_alive(parent) {
-                return Err(WorldError::StaleEntity(parent));
-            }
+        if let Some(parent) = parent
+            && !self.is_alive(parent)
+        {
+            return Err(WorldError::StaleEntity(parent));
         }
         self.hierarchy.set_parent(child, parent)?;
         Ok(())

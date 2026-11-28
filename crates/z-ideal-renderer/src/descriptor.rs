@@ -806,7 +806,8 @@ fn validate_buffer_descriptor_write(
     if !metadata.usage.contains(required_usage) {
         return Err(VulkanError::BufferDescriptorUsageMismatch);
     }
-    if metadata.offset > metadata.buffer_size || (alignment > 1 && metadata.offset % alignment != 0)
+    if metadata.offset > metadata.buffer_size
+        || (alignment > 1 && !metadata.offset.is_multiple_of(alignment))
     {
         return Err(VulkanError::InvalidBufferDescriptorRange);
     }

@@ -171,11 +171,11 @@ fn imports_glb_with_embedded_binary_buffer() {
     let mut document = fs::read_to_string(&json_path).expect("read glTF fixture");
     document = document.replace(r#""uri":"mesh.bin","#, "");
     let mut json = document.into_bytes();
-    while json.len() % 4 != 0 {
+    while !json.len().is_multiple_of(4) {
         json.push(b' ');
     }
     let mut binary = fs::read(fixture.0.join("mesh.bin")).expect("read binary fixture");
-    while binary.len() % 4 != 0 {
+    while !binary.len().is_multiple_of(4) {
         binary.push(0);
     }
 

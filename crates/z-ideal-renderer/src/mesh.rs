@@ -46,7 +46,7 @@ impl<'device> MeshGpu<'device> {
             return Err(MeshUploadError::UnsupportedTopology(primitive.mode));
         }
         let vertices = build_vertices(primitive)?;
-        if primitive.indices.is_empty() || primitive.indices.len() % 3 != 0 {
+        if primitive.indices.is_empty() || !primitive.indices.len().is_multiple_of(3) {
             return Err(MeshUploadError::InvalidPrimitive(
                 "triangle indices must be non-empty and divisible by three".to_owned(),
             ));
@@ -239,7 +239,7 @@ fn build_vertices(primitive: &ImportedPrimitive) -> Result<Vec<MeshVertex>, Mesh
         ));
     }
     if primitive.indices.is_empty()
-        || primitive.indices.len() % 3 != 0
+        || !primitive.indices.len().is_multiple_of(3)
         || primitive
             .indices
             .iter()
@@ -351,13 +351,13 @@ fn generate_normals(
     positions: &[[f32; 3]],
     indices: &[u32],
 ) -> Result<Vec<[f32; 3]>, MeshUploadError> {
-    if indices.is_empty() || indices.len() % 3 != 0 {
+    if indices.is_empty() || !indices.len().is_multiple_of(3) {
         return Err(MeshUploadError::InvalidPrimitive(
             "normal generation requires triangle indices".to_owned(),
         ));
     }
     let mut accumulated = vec![[0.0_f32; 3]; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let a = positions[triangle[0] as usize];
         let b = positions[triangle[1] as usize];
         let c = positions[triangle[2] as usize];
@@ -390,7 +390,7 @@ fn generate_tangents(
     };
     let mut accumulated_tangents = vec![[0.0_f32; 3]; positions.len()];
     let mut accumulated_bitangents = vec![[0.0_f32; 3]; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let i0 = triangle[0] as usize;
         let i1 = triangle[1] as usize;
         let i2 = triangle[2] as usize;
@@ -693,11 +693,8 @@ mod tests {
         ]);
         let bytes = encode_matrix(matrix);
         assert_eq!(bytes.len(), 64);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-            assert_eq!(
-                f32::from_ne_bytes(chunk.try_into().expect("four bytes")),
-                index as f32 + 1.0
-            );
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(f32::from_ne_bytes(*chunk), index as f32 + 1.0);
         }
     }
 

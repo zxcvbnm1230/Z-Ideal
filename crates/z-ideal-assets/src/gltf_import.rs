@@ -413,23 +413,21 @@ impl GltfImporter {
         let mut external_dependencies = BTreeSet::new();
         let mut external_resources = BTreeMap::new();
         for buffer in document.buffers() {
-            if let buffer::Source::Uri(uri) = buffer.source() {
-                if let Some((uri, resolved)) =
+            if let buffer::Source::Uri(uri) = buffer.source()
+                && let Some((uri, resolved)) =
                     validate_external_uri(&source_directory, &source_path, uri)?
-                {
-                    external_dependencies.insert(uri.clone());
-                    external_resources.insert(resolved, uri);
-                }
+            {
+                external_dependencies.insert(uri.clone());
+                external_resources.insert(resolved, uri);
             }
         }
         for image in document.images() {
-            if let gltf_image::Source::Uri { uri, .. } = image.source() {
-                if let Some((uri, resolved)) =
+            if let gltf_image::Source::Uri { uri, .. } = image.source()
+                && let Some((uri, resolved)) =
                     validate_external_uri(&source_directory, &source_path, uri)?
-                {
-                    external_dependencies.insert(uri.clone());
-                    external_resources.insert(resolved, uri);
-                }
+            {
+                external_dependencies.insert(uri.clone());
+                external_resources.insert(resolved, uri);
             }
         }
         validate_external_resource_budgets(&source_path, &external_resources, options)?;
@@ -860,9 +858,9 @@ fn validate_node_graph(
 fn valid_index_count(mode: PrimitiveTopology, count: usize) -> bool {
     match mode {
         PrimitiveTopology::Points => count >= 1,
-        PrimitiveTopology::Lines => count >= 2 && count % 2 == 0,
+        PrimitiveTopology::Lines => count >= 2 && count.is_multiple_of(2),
         PrimitiveTopology::LineLoop | PrimitiveTopology::LineStrip => count >= 2,
-        PrimitiveTopology::Triangles => count >= 3 && count % 3 == 0,
+        PrimitiveTopology::Triangles => count >= 3 && count.is_multiple_of(3),
         PrimitiveTopology::TriangleStrip | PrimitiveTopology::TriangleFan => count >= 3,
     }
 }

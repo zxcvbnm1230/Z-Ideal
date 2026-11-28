@@ -422,8 +422,8 @@ fn ssao_compute_dispatch_detects_nearby_depth_occluder() {
 
     let mut bytes = vec![0_u8; PIXELS * 4];
     readback.read(0, &mut bytes).expect("read SSAO output");
-    for pixel in bytes.chunks_exact(4) {
-        let ao = f32::from_ne_bytes(pixel.try_into().expect("four-byte float"));
+    for pixel in bytes.as_chunks::<4>().0 {
+        let ao = f32::from_ne_bytes(*pixel);
         assert!(
             (ao - 1.0).abs() <= 1.0e-5,
             "flat unoccluded depth plane must produce AO=1, got {ao}"

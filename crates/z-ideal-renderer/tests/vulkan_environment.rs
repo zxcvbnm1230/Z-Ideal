@@ -309,8 +309,10 @@ fn hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean() {
         .read(0, &mut bytes)
         .expect("read back uploaded HDR radiance");
     let samples: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte float")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect();
     assert_eq!(samples, [1.0, 0.5, 0.25, 1.0, 4.0, 2.0, 8.0, 1.0]);
     let mut cube_bytes = vec![0_u8; 96];
@@ -318,8 +320,10 @@ fn hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean() {
         .read(0, &mut cube_bytes)
         .expect("read back all six cube faces");
     let cube_samples: Vec<f32> = cube_bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte float")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect();
     let expected_cube_samples: Vec<f32> = EnvironmentCubeFace::ALL
         .into_iter()
@@ -331,8 +335,10 @@ fn hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean() {
         .read(0, &mut prefiltered_bytes)
         .expect("read back GGX-prefiltered mip chain");
     let prefiltered_samples: Vec<f32> = prefiltered_bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte float")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect();
     let expected_prefiltered: Vec<f32> = lighting
         .specular_mips()

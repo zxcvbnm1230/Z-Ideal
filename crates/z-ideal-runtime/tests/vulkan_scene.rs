@@ -1390,8 +1390,10 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         const MAX_OUTLIER_PIXELS: usize = 16;
         let mut outlier_pixels = 0;
         for (pixel_index, (actual, expected)) in pixels
-            .chunks_exact(4)
-            .zip(REFERENCE.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(REFERENCE.as_chunks::<4>().0.iter())
             .enumerate()
         {
             assert_eq!(

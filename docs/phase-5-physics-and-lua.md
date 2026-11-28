@@ -1,7 +1,8 @@
 # Phase 5 — Physics and Lua
 
-**Status:** in progress. The first increment establishes the fixed-step timing
-contract. The Box3D backend and Lua VM/bindings have not yet been integrated.
+**Status:** in progress. Fixed-step timing and the initial Box3D world/body
+adapter are implemented. ECS synchronization, events/queries and Lua have not
+yet been integrated.
 
 ## Roadmap scope
 
@@ -17,7 +18,7 @@ tests. This gate is not yet met.
 
 ### Fixed-step accumulator
 
-- `FixedStepAccumulator` converts frame durations into a bounded count of
+- FixedStepAccumulator converts frame durations into a bounded count of
   fixed simulation steps.
 - The default policy is 16,666,667 ns per step (nearest-nanosecond 60 Hz) and
   at most eight catch-up steps per frame.
@@ -30,35 +31,48 @@ tests. This gate is not yet met.
 - Interpolation is presentation-only and must not be written back into the
   simulation state.
 
-The accumulator is independent of the physics backend. It does not yet own a
-physics world, collider/body handles, scene synchronization, or event queues.
+### Box3D backend and initial world adapter
+
+- ADR-0004 selects exact dependency boxddd 0.4.0, with all backend-specific
+  types contained in z-ideal-physics.
+- Workspace MSRV is raised from Rust 1.85 to 1.92 to satisfy boxddd's
+  documented MSRV. The physics crate's full test suite passes on Rust 1.92;
+  the development machine uses Rust 1.100.
+- PhysicsWorld owns a native Box3D world and exposes engine math types,
+  validated world/body/collider descriptors and world-unique, generation-safe
+  body handles.
+- Initial primitive colliders are spheres and boxes; body types are static,
+  kinematic and dynamic.
+- Body plus collider creation is transactional. A failed collider creation
+  triggers body rollback, and a rollback failure preserves both errors.
+- Stale handles and handles from another PhysicsWorld are rejected.
+- PhysicsWorld::step advances one configured fixed step with an explicit
+  Box3D solver substep count.
+- Body world transforms and linear velocities can be updated through
+  validated engine-facing methods.
+- The Box3D Foundation freezes process-wide length_units_per_meter at first
+  initialization. Conflicting later configurations are returned as errors.
+
+The adapter does not yet own ECS Transform synchronization, collision/sensor
+event delivery, ray/shape queries, joints, mesh/compound/height-field colliders,
+or runtime lifecycle integration.
 
 ## Backend evaluation
 
-The accepted physics boundary keeps Box3D-specific types inside
-`z-ideal-physics`. Candidate evaluation is ongoing:
-
-- `boxddd` provides a safe, ergonomic wrapper over Box3D's C API, including
-  owner-scoped IDs and fallible operations. Its current documented native
-  support covers Windows, Linux, and macOS; its documented Rust MSRV is 1.92,
-  above this workspace's current 1.85 declaration.
-- `box3d-rust` is a pure-Rust port and documents a direct C-mirror API rather
-  than an ergonomic wrapper. Its determinism claims and API surface require
-  integration-level verification before adoption.
-
-No backend dependency has been added yet. Selection requires a reproducible
-build and behavior check on all supported desktop targets, a license and
-dependency audit, and a deliberate decision about the workspace MSRV.
+boxddd is an experimental 0.x safe wrapper over Box3D. Its documented native
+desktop support covers Windows, Linux and macOS; its safe API uses opaque
+owner-scoped IDs and fallible operations. The competing box3d-rust crate is a
+pure-Rust port with a direct C-mirror API. The selected integration prioritizes
+the safe, ergonomic wrapper boundary. Exact dependency versions are pinned.
+Native build and runtime behavior must continue to be verified by CI on all
+supported desktop targets.
 
 ## Remaining work
 
-- Select and pin a Box3D implementation; isolate it behind backend-neutral
-  engine types and validate world/body/shape ownership.
-- Add validated rigid-body and collider components, synchronization with
-  scene transforms, collision filtering, queries, and ordered event delivery.
+- Add validated rigid-body and collider scene components, synchronization with
+  scene transforms, collision filtering, queries and ordered event delivery.
 - Specify and test physics event ordering at the world/runtime boundary.
-- Add the Lua VM, bounded execution and diagnostics, script asset contract,
+- Add Lua VM, bounded execution and diagnostics, script asset contract,
   lifecycle and pause/reload behavior.
 - Bind entity/component access through validated handles and deferred scene
   commands, including prefab spawn and entity create/destroy.
-- Cover all public API paths and malformed/stale inputs with automated tests.

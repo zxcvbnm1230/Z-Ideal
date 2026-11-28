@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -40,6 +40,8 @@ toml = "1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = "=0.30.13"
+boxddd = "=0.4.0"
+z-ideal-math = { path = "crates/z-ideal-math" }
 
 [profile.dev]
 debug = "line-tables-only"

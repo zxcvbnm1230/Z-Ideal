@@ -249,7 +249,9 @@ impl HdrEnvironmentImporter {
             });
         }
         let pixels: Vec<[f32; 3]> = raw_pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|channels| [channels[0], channels[1], channels[2]])
             .collect();
         for (pixel_index, pixel) in pixels.iter().enumerate() {
