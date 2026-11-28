@@ -22,9 +22,10 @@ use z_ideal_renderer::{
 };
 use z_ideal_runtime::{
     GltfMaterialTextureBinding, GltfMaterialTextureSet, GltfMaterialTextureSlot, GltfMeshInstance,
-    GltfPbrSceneUniform, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
-    VulkanSceneMeshesError, VulkanSceneRenderer, VulkanSceneViewport, compile_gltf_pbr_shaders,
-    extract_render_scene, instantiate_default_gltf_scene, write_gltf_material_descriptors,
+    GltfPbrLocalLight, GltfPbrLocalLightKind, GltfPbrSceneUniform, RenderMeshInstance,
+    RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError, VulkanSceneRenderer,
+    VulkanSceneViewport, compile_gltf_pbr_shaders, extract_render_scene,
+    instantiate_default_gltf_scene, write_gltf_material_descriptors,
     write_gltf_pbr_scene_descriptor,
 };
 use z_ideal_scene::World;
@@ -788,7 +789,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let mut scene_buffer = VulkanBuffer::new(
             &device,
             BufferConfig {
-                size: 80,
+                size: 352,
                 usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
                 memory: BufferMemoryLocation::Upload,
             },
@@ -812,6 +813,22 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 ambient_color: [0.0, 0.0, 0.0],
                 environment_intensity: 1.0,
                 environment_max_lod: (specular_cube.mip_levels() - 1) as f32,
+                local_lights: [
+                    GltfPbrLocalLight {
+                        position: [0.0, 0.0, 2.0],
+                        range: 10.0,
+                        color: [0.2, 0.3, 0.4],
+                        intensity: 0.5,
+                        direction: [0.0, 0.0, -1.0],
+                        inner_cone_cos: 0.9,
+                        outer_cone_cos: 0.8,
+                        kind: GltfPbrLocalLightKind::Spot,
+                    },
+                    GltfPbrLocalLight::default(),
+                    GltfPbrLocalLight::default(),
+                    GltfPbrLocalLight::default(),
+                ],
+                local_light_count: 1,
             },
             &irradiance_view,
             irradiance_cube.sampler(),

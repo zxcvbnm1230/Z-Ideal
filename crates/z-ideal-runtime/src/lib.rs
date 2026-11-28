@@ -10,7 +10,8 @@ mod vulkan_scene;
 
 pub use gltf_material::{
     GltfMaterialError, GltfMaterialTextureResource, GltfMaterialTextureResources,
-    GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform, GltfPbrSceneUniform,
+    GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform, GltfPbrLocalLight,
+    GltfPbrLocalLightKind, GltfPbrSceneUniform, MAX_GLTF_PBR_LOCAL_LIGHTS,
     apply_gltf_material_pipeline_state, write_gltf_material_descriptors,
     write_gltf_pbr_scene_descriptor,
 };

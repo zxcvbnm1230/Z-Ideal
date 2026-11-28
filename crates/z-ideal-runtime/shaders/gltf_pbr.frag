@@ -22,12 +22,21 @@ layout(set = 0, binding = 3) uniform sampler2D normal_texture;
 layout(set = 0, binding = 4) uniform sampler2D occlusion_texture;
 layout(set = 0, binding = 5) uniform sampler2D emissive_texture;
 
+struct LocalLight {
+    vec4 position_range;
+    vec4 color_intensity;
+    vec4 direction_outer_cos;
+    vec4 type_inner_cos;
+};
+
 layout(set = 1, binding = 0, std140) uniform SceneData {
     vec4 camera_position;
     vec4 light_direction_intensity;
     vec4 light_color;
     vec4 ambient_color;
     vec4 environment_intensity_max_lod;
+    uvec4 local_light_count;
+    LocalLight local_lights[4];
 } scene;
 
 layout(set = 1, binding = 1) uniform samplerCube diffuse_irradiance_map;
@@ -85,6 +94,25 @@ vec3 fresnel_schlick_roughness(float cosine, vec3 f0, float roughness) {
          * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
 }
 
+vec3 evaluate_direct_brdf(vec3 n, vec3 v, vec3 l, vec3 base_color,
+                          vec3 f0, float metallic, float roughness,
+                          vec3 radiance) {
+    float n_dot_l = max(dot(n, l), 0.0);
+    float n_dot_v = max(dot(n, v), 0.0);
+    if (n_dot_l <= 0.0 || n_dot_v <= 0.0) {
+        return vec3(0.0);
+    }
+    vec3 h = normalize(v + l);
+    vec3 f = fresnel_schlick(max(dot(h, v), 0.0), f0);
+    float d = distribution_ggx(n, h, roughness);
+    float g = geometry_schlick_ggx(n_dot_v, roughness)
+            * geometry_schlick_ggx(n_dot_l, roughness);
+    vec3 specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-5);
+    vec3 diffuse_weight = (1.0 - f) * (1.0 - metallic);
+    vec3 diffuse = diffuse_weight * base_color / 3.14159265;
+    return (diffuse + specular) * radiance * n_dot_l;
+}
+
 void main() {
     vec4 base = texture(base_color_texture, material_uv(material.texture_coordinates_0.x))
               * material.base_color_factor;
@@ -101,31 +129,46 @@ void main() {
         n = -n;
     }
     vec3 v = normalize(scene.camera_position.xyz - world_position);
-    vec3 l = normalize(-scene.light_direction_intensity.xyz);
-    vec3 h = normalize(v + l);
-    float n_dot_l = max(dot(n, l), 0.0);
-    float n_dot_v = max(dot(n, v), 0.0);
-
     vec3 f0 = mix(vec3(0.04), base.rgb, metallic);
-    vec3 f = fresnel_schlick(max(dot(h, v), 0.0), f0);
-    float d = distribution_ggx(n, h, roughness);
-    float g = geometry_schlick_ggx(n_dot_v, roughness)
-            * geometry_schlick_ggx(n_dot_l, roughness);
-    vec3 specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-5);
-    vec3 diffuse_weight = (1.0 - f) * (1.0 - metallic);
-    vec3 diffuse = diffuse_weight * base.rgb / 3.14159265;
-    vec3 direct = (diffuse + specular) * scene.light_color.rgb
-                * scene.light_direction_intensity.w * n_dot_l;
+    vec3 directional_l = normalize(-scene.light_direction_intensity.xyz);
+    vec3 direct = evaluate_direct_brdf(
+        n, v, directional_l, base.rgb, f0, metallic, roughness,
+        scene.light_color.rgb * scene.light_direction_intensity.w);
+
+    // The fixed-capacity array preserves caller order and bounds fragment work.
+    for (uint index = 0u; index < min(scene.local_light_count.x, 4u); ++index) {
+        LocalLight light = scene.local_lights[index];
+        vec3 to_light = light.position_range.xyz - world_position;
+        float distance_to_light = length(to_light);
+        float range = light.position_range.w;
+        if (distance_to_light > 1e-4 && distance_to_light < range) {
+            vec3 local_l = to_light / distance_to_light;
+            float normalized_distance = distance_to_light / range;
+            float range_fade = pow(max(1.0 - pow(normalized_distance, 4.0), 0.0), 2.0);
+            float attenuation = range_fade / max(distance_to_light * distance_to_light, 0.01);
+            float spot_factor = 1.0;
+            if (light.type_inner_cos.x > 0.5) {
+                float cone_cosine = dot(normalize(light.direction_outer_cos.xyz), -local_l);
+                spot_factor = smoothstep(light.direction_outer_cos.w,
+                                         light.type_inner_cos.y, cone_cosine);
+            }
+            vec3 radiance = light.color_intensity.rgb
+                          * light.color_intensity.w * attenuation * spot_factor;
+            direct += evaluate_direct_brdf(
+                n, v, local_l, base.rgb, f0, metallic, roughness, radiance);
+        }
+    }
+    float n_dot_v = max(dot(n, v), 0.0);
+    vec3 environment_fresnel = fresnel_schlick_roughness(n_dot_v, f0, roughness);
+    vec3 environment_diffuse_weight = (1.0 - environment_fresnel) * (1.0 - metallic);
 
     float occlusion_sample = texture(occlusion_texture,
                                      material_uv(material.texture_coordinates_0.w)).r;
     float occlusion = mix(1.0, occlusion_sample,
                           material.metallic_roughness_normal_occlusion.w);
-    vec3 ambient = scene.ambient_color.rgb * base.rgb * diffuse_weight * occlusion;
+    vec3 ambient = scene.ambient_color.rgb * base.rgb * environment_diffuse_weight * occlusion;
     float environment_intensity = scene.environment_intensity_max_lod.x;
     float max_specular_lod = scene.environment_intensity_max_lod.y;
-    vec3 environment_fresnel = fresnel_schlick_roughness(n_dot_v, f0, roughness);
-    vec3 environment_diffuse_weight = (1.0 - environment_fresnel) * (1.0 - metallic);
     vec3 irradiance = texture(diffuse_irradiance_map, n).rgb;
     vec3 diffuse_ibl = irradiance * base.rgb * environment_diffuse_weight
                      / 3.14159265;

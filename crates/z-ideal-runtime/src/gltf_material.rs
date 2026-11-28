@@ -129,8 +129,37 @@ fn validate_scene_uniform(scene: GltfPbrSceneUniform) -> Result<(), GltfMaterial
         || scene.ambient_color.iter().any(|value| *value < 0.0)
         || scene.environment_intensity < 0.0
         || scene.environment_max_lod < 0.0
+        || scene.local_light_count as usize > MAX_GLTF_PBR_LOCAL_LIGHTS
     {
         return Err(GltfMaterialError::InvalidSceneValues);
+    }
+    for light in scene
+        .local_lights
+        .iter()
+        .take(scene.local_light_count as usize)
+    {
+        let finite = light
+            .position
+            .into_iter()
+            .chain([light.range])
+            .chain(light.color)
+            .chain([light.intensity])
+            .chain(light.direction)
+            .chain([light.inner_cone_cos, light.outer_cone_cos])
+            .all(f32::is_finite);
+        let direction_length_squared = light.direction.iter().map(|v| v * v).sum::<f32>();
+        if !finite
+            || light.range <= 0.0
+            || light.intensity < 0.0
+            || light.color.iter().any(|value| *value < 0.0)
+            || (light.kind == GltfPbrLocalLightKind::Spot
+                && (direction_length_squared <= 1.0e-8
+                    || !(-1.0..=1.0).contains(&light.outer_cone_cos)
+                    || !(-1.0..=1.0).contains(&light.inner_cone_cos)
+                    || light.inner_cone_cos < light.outer_cone_cos))
+        {
+            return Err(GltfMaterialError::InvalidSceneValues);
+        }
     }
     Ok(())
 }
@@ -181,6 +210,54 @@ impl GltfMaterialUniform {
     }
 }
 
+/// Maximum number of point or spot lights evaluated by the standard glTF PBR shader.
+pub const MAX_GLTF_PBR_LOCAL_LIGHTS: usize = 4;
+
+/// Local-light shape supported by the standard PBR scene contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GltfPbrLocalLightKind {
+    /// Omnidirectional point source.
+    Point,
+    /// Cone-shaped source whose direction points from the light into the scene.
+    Spot,
+}
+
+/// One bounded point or spot light encoded in the PBR scene uniform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GltfPbrLocalLight {
+    /// World-space light position.
+    pub position: [f32; 3],
+    /// Positive influence radius in world units.
+    pub range: f32,
+    /// Linear-light RGB radiance multiplier.
+    pub color: [f32; 3],
+    /// Non-negative intensity multiplier.
+    pub intensity: f32,
+    /// World-space direction for spot lights; ignored for point lights.
+    pub direction: [f32; 3],
+    /// Cosine of the inner spotlight cone angle; must be >= outer cone cosine.
+    pub inner_cone_cos: f32,
+    /// Cosine of the outer spotlight cone angle.
+    pub outer_cone_cos: f32,
+    /// Point or spot attenuation model.
+    pub kind: GltfPbrLocalLightKind,
+}
+
+impl Default for GltfPbrLocalLight {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            range: 1.0,
+            color: [0.0; 3],
+            intensity: 0.0,
+            direction: [0.0, -1.0, 0.0],
+            inner_cone_cos: 1.0,
+            outer_cone_cos: 0.0,
+            kind: GltfPbrLocalLightKind::Point,
+        }
+    }
+}
+
 /// Scene-wide values consumed by the PBR fragment shader.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GltfPbrSceneUniform {
@@ -198,12 +275,16 @@ pub struct GltfPbrSceneUniform {
     pub environment_intensity: f32,
     /// Maximum roughness-prefiltered specular mip level.
     pub environment_max_lod: f32,
+    /// Fixed-capacity local-light storage. Only the first `local_light_count` entries are active.
+    pub local_lights: [GltfPbrLocalLight; MAX_GLTF_PBR_LOCAL_LIGHTS],
+    /// Number of active entries in `local_lights`, at most four.
+    pub local_light_count: u32,
 }
 
 impl GltfPbrSceneUniform {
-    /// Encodes five std140 vec4 values (80 bytes).
+    /// Encodes five global std140 vectors, a light count vector, and four 64-byte light records.
     #[must_use]
-    pub fn to_std140_bytes(self) -> [u8; 80] {
+    pub fn to_std140_bytes(self) -> [u8; 352] {
         let vectors = [
             [
                 self.camera_position[0],
@@ -236,10 +317,48 @@ impl GltfPbrSceneUniform {
                 0.0,
             ],
         ];
-        let mut bytes = [0_u8; 80];
+        let mut bytes = [0_u8; 352];
         for (index, value) in vectors.into_iter().flatten().enumerate() {
             let offset = index * 4;
             bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes[80..84].copy_from_slice(&self.local_light_count.to_ne_bytes());
+        for (index, light) in self.local_lights.into_iter().enumerate() {
+            let base = 96 + index * 64;
+            let light_vectors = [
+                [
+                    light.position[0],
+                    light.position[1],
+                    light.position[2],
+                    light.range,
+                ],
+                [
+                    light.color[0],
+                    light.color[1],
+                    light.color[2],
+                    light.intensity,
+                ],
+                [
+                    light.direction[0],
+                    light.direction[1],
+                    light.direction[2],
+                    light.outer_cone_cos,
+                ],
+                [
+                    if light.kind == GltfPbrLocalLightKind::Spot {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    light.inner_cone_cos,
+                    0.0,
+                    0.0,
+                ],
+            ];
+            for (vector_index, value) in light_vectors.into_iter().flatten().enumerate() {
+                let offset = base + vector_index * 4;
+                bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            }
         }
         bytes
     }
@@ -302,7 +421,7 @@ pub(crate) fn apply_gltf_material_pipeline_variant(
 
 /// Writes the PBR scene uniform and image-based lighting resources to descriptor set 1.
 ///
-/// Binding 0 is the 80-byte std140 scene block; bindings 1 and 2 are combined
+/// Binding 0 is the 352-byte std140 scene block; bindings 1 and 2 are combined
 /// cube samplers for diffuse irradiance and roughness-prefiltered specular radiance.
 /// The caller owns the views, images, samplers, buffer, and descriptor set. The
 /// returned lease borrows all referenced resources for the duration of GPU use.
@@ -335,7 +454,7 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
     {
         return Err(GltfMaterialError::DescriptorLayoutMismatch);
     }
-    if uniform_buffer.size() < 80 {
+    if uniform_buffer.size() < 352 {
         return Err(GltfMaterialError::UniformBufferTooSmall);
     }
     uniform_buffer.write(0, &scene.to_std140_bytes())?;
@@ -345,7 +464,7 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
             array_element: 0,
             buffer: uniform_buffer,
             offset: 0,
-            range: 80,
+            range: 352,
         }),
         DescriptorResourceWrite::Image(ImageDescriptorWrite {
             binding: 1,
@@ -583,7 +702,7 @@ impl<'resource, 'image, 'device> GltfMaterialTextureResources<'resource, 'image,
 pub enum GltfMaterialError {
     /// A descriptor layout does not match the documented material or PBR scene contract.
     #[error(
-        "glTF material descriptor layout must contain binding 0 uniform-buffer and bindings 1-5 combined-image-sampler, all fragment-visible"
+        "glTF material or PBR scene descriptor layout does not match its documented binding contract"
     )]
     DescriptorLayoutMismatch,
     /// A supplied uniform buffer is smaller than its std140 payload.
@@ -753,6 +872,8 @@ mod tests {
             ambient_color: [0.1; 3],
             environment_intensity: 1.0,
             environment_max_lod: 2.0,
+            local_lights: [GltfPbrLocalLight::default(); MAX_GLTF_PBR_LOCAL_LIGHTS],
+            local_light_count: 0,
         };
         assert!(matches!(
             validate_scene_uniform(scene),
@@ -764,10 +885,28 @@ mod tests {
             validate_scene_uniform(scene),
             Err(GltfMaterialError::InvalidSceneValues)
         ));
+        scene.light_intensity = 1.0;
+        scene.local_light_count = (MAX_GLTF_PBR_LOCAL_LIGHTS as u32) + 1;
+        assert!(matches!(
+            validate_scene_uniform(scene),
+            Err(GltfMaterialError::InvalidSceneValues)
+        ));
+        scene.local_light_count = 1;
+        scene.local_lights[0] = GltfPbrLocalLight {
+            kind: GltfPbrLocalLightKind::Spot,
+            direction: [0.0; 3],
+            inner_cone_cos: 0.5,
+            outer_cone_cos: 0.8,
+            ..GltfPbrLocalLight::default()
+        };
+        assert!(matches!(
+            validate_scene_uniform(scene),
+            Err(GltfMaterialError::InvalidSceneValues)
+        ));
     }
 
     #[test]
-    fn scene_uniform_is_exactly_five_std140_vectors() {
+    fn scene_uniform_encodes_fixed_capacity_local_light_records() {
         let scene = GltfPbrSceneUniform {
             camera_position: [1.0, 2.0, 3.0],
             light_direction: [0.0, -1.0, 0.0],
@@ -776,9 +915,11 @@ mod tests {
             ambient_color: [0.1, 0.2, 0.3],
             environment_intensity: 0.75,
             environment_max_lod: 4.0,
+            local_lights: [GltfPbrLocalLight::default(); MAX_GLTF_PBR_LOCAL_LIGHTS],
+            local_light_count: 0,
         };
         let bytes = scene.to_std140_bytes();
-        assert_eq!(bytes.len(), 80);
+        assert_eq!(bytes.len(), 352);
         assert_eq!(
             f32::from_ne_bytes(bytes[28..32].try_into().expect("float")),
             4.0
@@ -794,6 +935,14 @@ mod tests {
         assert_eq!(
             f32::from_ne_bytes(bytes[68..72].try_into().expect("float")),
             4.0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(bytes[80..84].try_into().expect("count")),
+            0
+        );
+        assert_eq!(
+            f32::from_ne_bytes(bytes[96..100].try_into().expect("light position")),
+            0.0
         );
     }
 
