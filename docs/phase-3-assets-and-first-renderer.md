@@ -33,7 +33,8 @@
 - PerspectiveCamera is registered as a validated scene component with stable ID z_ideal.camera.perspective.
 - The runtime crate extracts an owned, renderer-neutral render snapshot from a caller-selected perspective camera. It includes view/projection matrices and deterministic mesh-instance records with composed world transforms and logical asset references. Camera selection is explicit; singular/non-finite camera transforms and non-finite mesh transforms are rejected.
 - The runtime crate instantiates selected glTF scenes transactionally into ECS entities. It preserves local transforms, parent/child relationships, optional node names, source node indices, and mesh-instance references to a project-relative source URI and imported mesh index. It supports explicit scene selection and the declared default scene. Malformed reachable hierarchy data is rejected before entities are created; ECS failures trigger rollback of entities created by the operation. Runtime components participate in versioned scene serialization.
-- MeshGpu validates triangle-list geometry and uploads interleaved position/UV vertices plus 32-bit indices into explicitly owned Vulkan upload buffers. Its vertex layout is exposed as matching Vulkan binding/attribute descriptions. `MeshGpu::record_draw` now composes view-projection and model matrices, writes a validated 64-byte column-major vertex push constant, binds the mesh buffers, and records an indexed draw.
+- MeshGpu validates triangle-list geometry and uploads interleaved position/UV vertices plus 32-bit indices into explicitly owned Vulkan upload buffers. Its vertex layout is exposed as matching Vulkan binding/attribute descriptions. MeshGpu::record_draw composes view-projection and model matrices, writes a validated 64-byte column-major vertex push constant, binds the mesh buffers, and records an indexed draw.
+- VulkanSceneMeshes is a runtime-side Vulkan adapter. It resolves each distinct logical mesh reference against AssetCache<GltfImport>, uploads all primitives through MeshGpu, pins strong CPU asset handles, and reports missing/ambiguous/empty mesh references or upload errors explicitly. Construction is transactional. `record_upload_barriers` records HOST_WRITE -> VERTEX_INPUT synchronization before the consuming render pass; `record_draws` records one indexed draw per primitive instance inside the pass. The caller binds a compatible pipeline and owns render-pass, framebuffer, viewport/scissor, queue submission, and frame synchronization.
 
 ## Known limitations and next work
 
@@ -41,21 +42,20 @@
 - Image channel formats and decoded bytes are preserved; color-space interpretation, GPU texture upload, mip generation, and sampler creation from imported texture state are not yet integrated.
 - ECS instantiation preserves node transforms, hierarchy, names, and mesh references, but does not yet instantiate skinning, morph targets, animation channels, tangents, or extension-defined material behavior.
 - Asset catalog registration is currently an explicit API; the importer does not yet compute a complete transitive content fingerprint or automatically populate metadata and dependency records.
-- MeshGpu supports indexed triangle-list upload and camera/model-matrix draw recording. It uses host-visible upload memory and leaves host/GPU barriers, render-pass setup, pipeline binding, and viewport/scissor state to the caller. There is not yet an end-to-end runtime snapshot-to-renderer adapter, automatic asset resolution, material/texture binding, or production scene renderer.
-- The renderer now has a camera/model matrix draw helper and an offscreen GPU test that draws overlapping meshes with depth testing; the nearer mesh wins regardless of draw order. A runtime snapshot-to-renderer adapter, asset resolution, imported material/texture binding, HDR color targets, tone mapping, and deterministic end-to-end sample-scene image regression remain outstanding.
+- VulkanSceneMeshes uploads geometry only. Imported material/texture binding, shader material contracts, HDR color targets, tone mapping, and a complete runtime-owned scene renderer remain outstanding.
 - Malformed-resource testing must be expanded to truncated buffers, invalid accessors, malformed images, unsupported encodings/extensions, symlink race conditions, and configured resource budgets.
+- The Vulkan CI workflow runs lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation under Xvfb. Hardware-specific driver coverage remains separate.
 
 ## Current validation
 
-Full workspace checks passed on the connected Linux host:
+Local validation after the runtime Vulkan adapter changes:
 
-- cargo fmt --all -- --check — passed.
-- cargo clippy --workspace --all-targets --all-features -- -D warnings — passed.
-- cargo test --workspace --all-features — 207 passed, 2 GPU integration tests ignored by default, 0 failed.
-- RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps — passed.
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed.
+- `cargo test --workspace --all-features` — 207 passed, 3 GPU integration tests ignored by default, 0 failed.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps` — passed.
+- `git diff --check` — passed.
 
-The asset tests cover identity, metadata, cache lifetime, dependency graph behavior, glTF/GLB mesh and node import, embedded image decoding, material texture references, external dependency reporting, path-traversal rejection, malformed primitives, invalid indices, and topology-specific index counts. Runtime tests cover default-scene selection, entity/node mapping, transforms, hierarchy, mesh-instance references, transactional validation failures, scene serialization round trips, camera extraction, composed view/model matrices, deterministic mesh ordering, and singular-camera rejection. The renderer has CPU-side mesh-layout and matrix-encoding tests; its manually executed offscreen Vulkan test exercises the GPU draw/depth path.
+The runtime Vulkan integration test was run manually on the connected NVIDIA Vulkan host with Khronos validation enabled. It verifies explicit missing-asset, missing-mesh, and unsupported-topology errors; shared-mesh upload deduplication; retained asset-handle lifetime after cache eviction; upload barriers recorded before the render pass; and indexed draw recording for two instances. It completed with no Vulkan validation errors.
 
-The ignored offscreen Vulkan integration test was run manually with VK_LAYER_KHRONOS_validation on an NVIDIA GeForce 940MX. It uploads two indexed MeshGpu triangles, pushes the camera/model matrix, uses a D32 depth attachment and depth-tested pipeline, verifies that the farther triangle cannot overwrite the nearer one, exercises the graphics-family-0 / transfer-family-1 ownership path, performs image readback and deterministic pixel checks, and passes without validation errors.
-
-No complete glTF-to-renderer sample-scene path, HDR target, or tone mapping is claimed yet.
+The preceding GitHub run on commit `a100c02` passed the lavapipe offscreen and X11 presentation workflow. The current uncommitted changes add the runtime scene-mesh integration test to that workflow; this new CI step still needs a GitHub run after these changes are committed and pushed.

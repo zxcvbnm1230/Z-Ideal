@@ -10,5 +10,7 @@ license.workspace = true
 z-ideal-assets = { path = "../z-ideal-assets" }
 z-ideal-math = { path = "../z-ideal-math" }
 z-ideal-scene = { path = "../z-ideal-scene" }
+z-ideal-renderer = { path = "../z-ideal-renderer" }
+ash.workspace = true
 serde.workspace = true
 thiserror.workspace = true

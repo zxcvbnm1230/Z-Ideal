@@ -3,6 +3,7 @@
 
 mod gltf_scene;
 mod render_scene;
+mod vulkan_scene;
 
 pub use gltf_scene::{
     GltfMeshInstance, GltfNodeName, GltfSceneInstance, GltfSceneInstantiationError,
@@ -11,6 +12,7 @@ pub use gltf_scene::{
 pub use render_scene::{
     RenderMeshInstance, RenderSceneExtractionError, RenderSceneSnapshot, extract_render_scene,
 };
+pub use vulkan_scene::{VulkanSceneMeshes, VulkanSceneMeshesError};
 
 /// Returns the crate's stable package name for diagnostics and tooling.
 pub const CRATE_NAME: &str = "z-ideal-runtime";

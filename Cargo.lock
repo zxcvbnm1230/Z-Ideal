@@ -2271,10 +2271,12 @@ dependencies = [
 name = "z-ideal-runtime"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "serde",
  "thiserror 2.0.21",
  "z-ideal-assets",
  "z-ideal-math",
+ "z-ideal-renderer",
  "z-ideal-scene",
 ]
 
