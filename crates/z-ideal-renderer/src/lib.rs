@@ -13,6 +13,7 @@ use winit::window::Window;
 mod buffer;
 mod command;
 mod descriptor;
+mod environment;
 mod frame;
 mod graphics_pipeline;
 mod hdr;
@@ -40,6 +41,9 @@ pub use descriptor::{
     DescriptorResourceLease, DescriptorResourceWrite, DescriptorSetLayoutConfig,
     DescriptorSetLeaseRef, ImageDescriptorWrite, SamplerDescriptorWrite, VulkanDescriptorPool,
     VulkanDescriptorSet, VulkanDescriptorSetLayout,
+};
+pub use environment::{
+    EnvironmentCubeError, EnvironmentCubeFace, EnvironmentCubeMap, VulkanEnvironmentCube,
 };
 pub use frame::{FrameStart, FrameTicket, VulkanFrameScheduler};
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
