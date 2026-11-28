@@ -1,8 +1,11 @@
 use std::{
     fs,
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use z_ideal_assets::{GltfImportError, GltfImporter};
 
@@ -10,16 +13,22 @@ struct FixtureDir(PathBuf);
 
 impl FixtureDir {
     fn new() -> Self {
-        let nonce = SystemTime::now()
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "z-ideal-gltf-fixture-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create fixture directory");
-        Self(path)
+        loop {
+            let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "z-ideal-gltf-fixture-{}-{timestamp}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create unique fixture directory {path:?}: {error}"),
+            }
+        }
     }
 
     fn write_triangle(&self, invalid_index: bool) -> PathBuf {
