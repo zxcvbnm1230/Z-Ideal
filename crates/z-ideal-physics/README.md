@@ -91,3 +91,14 @@ Box3D-specific IDs and types remain private to this crate.
 The pinned backend is boxddd 0.4.0, an experimental 0.x safe wrapper around
 Box3D. It builds the vendored native C engine for supported desktop targets.
 The workspace Rust MSRV is 1.92 to satisfy the backend's documented MSRV.
+
+## Queries
+
+The world adapter supports ray casts, convex shape casts and convex overlap
+queries. Shape queries accept sphere, box and Y-aligned capsule proxies with
+world-space origins, orientations and displacements. Query category/mask bits
+use Box3D filtering. Cast results are sorted by hit fraction and stable body
+handle; overlap results are sorted by stable body handle. PhysicsScene provides
+matching methods that translate results to ECS Entity handles. Query dimensions
+are expressed in engine world units; collider scaling and parent transforms are
+not applied.

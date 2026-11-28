@@ -11,7 +11,8 @@ use z_ideal_scene::{
 
 use crate::{
     ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyType, PhysicsError, PhysicsEvent,
-    PhysicsRayCast, PhysicsRayHit, PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,
+    PhysicsOverlapHit, PhysicsRayCast, PhysicsRayHit, PhysicsShapeCast, PhysicsShapeCastHit,
+    PhysicsShapeOverlap, PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,
 };
 
 /// Errors produced while synchronizing a scene with its physics world.
@@ -61,6 +62,26 @@ pub struct PhysicsSceneRayHit {
     pub normal: Vec3,
     /// Fraction along the ray displacement.
     pub fraction: f32,
+}
+
+/// A shape-cast hit translated into a scene entity reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsSceneShapeCastHit {
+    /// Entity whose collider was hit.
+    pub entity: Entity,
+    /// World-space intersection point.
+    pub point: Vec3,
+    /// Surface normal at the intersection point.
+    pub normal: Vec3,
+    /// Fraction along the shape-cast translation.
+    pub fraction: f32,
+}
+
+/// A shape-overlap result translated into a scene entity reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicsSceneOverlapHit {
+    /// Entity whose collider overlaps the query shape.
+    pub entity: Entity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,19 +341,56 @@ impl PhysicsScene {
             .cast_ray(ray)?
             .into_iter()
             .map(|hit: PhysicsRayHit| {
-                let entity = self
-                    .bindings
-                    .iter()
-                    .find_map(|(entity, binding)| (binding.handle == hit.body).then_some(*entity))
-                    .ok_or(PhysicsSceneError::UnmappedBody(hit.body))?;
                 Ok(PhysicsSceneRayHit {
-                    entity,
+                    entity: self.entity_for_body(hit.body)?,
                     point: hit.point,
                     normal: hit.normal,
                     fraction: hit.fraction,
                 })
             })
             .collect()
+    }
+
+    /// Sweeps a convex primitive through the physics scene and resolves hits to entities.
+    pub fn cast_shape(
+        &self,
+        query: PhysicsShapeCast,
+    ) -> Result<Vec<PhysicsSceneShapeCastHit>, PhysicsSceneError> {
+        self.physics
+            .cast_shape(query)?
+            .into_iter()
+            .map(|hit: PhysicsShapeCastHit| {
+                Ok(PhysicsSceneShapeCastHit {
+                    entity: self.entity_for_body(hit.body)?,
+                    point: hit.point,
+                    normal: hit.normal,
+                    fraction: hit.fraction,
+                })
+            })
+            .collect()
+    }
+
+    /// Finds scene colliders overlapping a convex query primitive.
+    pub fn overlap_shape(
+        &self,
+        query: PhysicsShapeOverlap,
+    ) -> Result<Vec<PhysicsSceneOverlapHit>, PhysicsSceneError> {
+        self.physics
+            .overlap_shape(query)?
+            .into_iter()
+            .map(|hit: PhysicsOverlapHit| {
+                Ok(PhysicsSceneOverlapHit {
+                    entity: self.entity_for_body(hit.body)?,
+                })
+            })
+            .collect()
+    }
+
+    fn entity_for_body(&self, handle: PhysicsBodyHandle) -> Result<Entity, PhysicsSceneError> {
+        self.bindings
+            .iter()
+            .find_map(|(entity, binding)| (binding.handle == handle).then_some(*entity))
+            .ok_or(PhysicsSceneError::UnmappedBody(handle))
     }
 
     /// Returns the number of scene entities currently mapped to physics bodies.
@@ -695,5 +753,83 @@ mod query_event_tests {
                 .expect("scene events")
                 .contains(&PhysicsSceneEvent::SensorBegin { sensor, visitor })
         );
+    }
+}
+
+#[cfg(test)]
+mod scene_shape_query_tests {
+    use super::*;
+    use crate::PhysicsQueryShape;
+    use z_ideal_math::{Quat, Transform, Vec3};
+
+    fn scene_with_physics_components() -> SceneWorld {
+        let mut scene = SceneWorld::new();
+        scene.register_component::<Transform>().expect("transform");
+        scene.register_component::<RigidBody>().expect("rigid body");
+        scene.register_component::<Collider>().expect("collider");
+        scene
+    }
+
+    #[test]
+    fn scene_shape_cast_and_overlap_queries_resolve_entity_handles() {
+        let mut scene = scene_with_physics_components();
+        let entity = scene.spawn().expect("entity");
+        scene
+            .insert(
+                entity,
+                RigidBody {
+                    body_type: RigidBodyType::Static,
+                    ..RigidBody::default()
+                },
+            )
+            .expect("rigid body");
+        scene
+            .insert(entity, Collider::cuboid(Vec3::splat(0.5)))
+            .expect("collider");
+
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig {
+            gravity: Vec3::ZERO,
+            ..PhysicsWorldConfig::default()
+        })
+        .expect("physics scene");
+        physics.synchronize(&mut scene).expect("sync");
+
+        let overlap = physics
+            .overlap_shape(PhysicsShapeOverlap::new(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                PhysicsQueryShape::Sphere { radius: 1.0 },
+            ))
+            .expect("overlap");
+        assert_eq!(overlap, vec![PhysicsSceneOverlapHit { entity }]);
+
+        let cast = physics
+            .cast_shape(PhysicsShapeCast::new(
+                Vec3::new(-3.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                Vec3::new(6.0, 0.0, 0.0),
+                PhysicsQueryShape::Sphere { radius: 0.25 },
+            ))
+            .expect("cast");
+        assert_eq!(cast.len(), 1);
+        assert_eq!(cast[0].entity, entity);
+        assert!(cast[0].fraction.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod scene_world_access_tests {
+    use super::*;
+    use z_ideal_math::Vec3;
+
+    #[test]
+    fn scene_exposes_its_physics_world_with_mutable_configuration() {
+        let mut scene = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics scene");
+        scene
+            .physics_world_mut()
+            .set_gravity(Vec3::ZERO)
+            .expect("set gravity");
+        assert_eq!(scene.physics_world().config().gravity, Vec3::ZERO);
+        assert_eq!(scene.body_count(), 0);
     }
 }

@@ -331,9 +331,10 @@ mod tests {
 
         assert!(matches!(
             schedule.run(&mut world),
-            Err(ScheduleError::Command(
-                crate::CommandError::UnresolvedPendingEntity(_)
-            ))
+            Err(ScheduleError::Command(crate::CommandError::PartialApplication {
+                cause,
+                ..
+            })) if matches!(*cause, crate::CommandError::UnresolvedPendingEntity(_))
         ));
         let entities = world.entities_with::<Marker>();
         assert_eq!(entities.len(), 1);

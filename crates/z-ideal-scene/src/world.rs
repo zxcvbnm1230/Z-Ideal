@@ -3,6 +3,7 @@
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
+    sync::Arc,
 };
 
 use serde_json::Value;
@@ -193,11 +194,27 @@ fn decode_component<T: Component>(
     Ok(())
 }
 
+/// Opaque identity token for one World allocation.
+///
+/// Clones retain the same identity. Distinct worlds never compare equal, even
+/// if their entity slot indices and generations happen to match.
+#[derive(Debug, Clone)]
+pub struct WorldIdentity(Arc<()>);
+
+impl PartialEq for WorldIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for WorldIdentity {}
+
 /// A single owned ECS world.
 ///
 /// Structural operations require mutable world access. Systems use the
 /// scheduler command buffer to defer structural changes to synchronization points.
 pub struct World {
+    identity: WorldIdentity,
     slots: Vec<EntitySlot>,
     free_slots: Vec<u32>,
     next_scene_id: u64,
@@ -214,10 +231,17 @@ impl Default for World {
 }
 
 impl World {
+    /// Returns an opaque token identifying this exact world instance.
+    #[must_use]
+    pub fn identity(&self) -> WorldIdentity {
+        self.identity.clone()
+    }
+
     /// Creates an empty world with no registered component types.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            identity: WorldIdentity(Arc::new(())),
             slots: Vec::new(),
             free_slots: Vec::new(),
             next_scene_id: 1,
@@ -565,6 +589,24 @@ impl World {
     /// The existing world is replaced only after all entities, components,
     /// migrations, and hierarchy relationships have been validated.
     pub fn load_scene_document(&mut self, document: &SceneDocument) -> Result<(), SceneError> {
+        self.load_scene_document_internal(document, false)
+    }
+
+    /// Rebuilds scene storage while retaining runtime handles for persistent
+    /// scene IDs that already exist in this World. Used by transactional prefab
+    /// merge so unrelated live script/entity handles remain valid.
+    pub(crate) fn load_scene_document_preserving_handles(
+        &mut self,
+        document: &SceneDocument,
+    ) -> Result<(), SceneError> {
+        self.load_scene_document_internal(document, true)
+    }
+
+    fn load_scene_document_internal(
+        &mut self,
+        document: &SceneDocument,
+        preserve_existing_handles: bool,
+    ) -> Result<(), SceneError> {
         document.validate_entity_references()?;
 
         let mut staging = self.empty_with_registry();
@@ -572,7 +614,20 @@ impl World {
         let mut entities_by_id = HashMap::with_capacity(document.entities.len());
 
         for record in &document.entities {
-            let entity = staging.spawn_with_scene_id(record.id)?;
+            let entity = if preserve_existing_handles
+                && let Some(existing) = self.entity_for_scene_id(record.id)
+            {
+                let slot = &mut staging.slots[existing.index() as usize];
+                slot.generation = existing.generation();
+                slot.alive = true;
+                slot.scene_id = record.id;
+                staging
+                    .free_slots
+                    .retain(|index| *index != existing.index());
+                existing
+            } else {
+                staging.spawn_with_scene_id(record.id)?
+            };
             entities_by_id.insert(record.id, entity);
         }
 
@@ -626,6 +681,20 @@ impl World {
 
     fn empty_with_registry(&self) -> Self {
         let mut world = Self::new();
+        world.identity = self.identity.clone();
+        world.slots = self.slots.clone();
+        world.free_slots = self.free_slots.clone();
+        for (index, slot) in world.slots.iter_mut().enumerate() {
+            if slot.alive {
+                slot.alive = false;
+                if let Some(next_generation) = slot.generation.checked_add(1) {
+                    slot.generation = next_generation;
+                    // Every previously live handle is invalidated before any
+                    // scene entity is allowed to reuse its slot.
+                    world.free_slots.push(index as u32);
+                }
+            }
+        }
         world.component_by_type = self.component_by_type.clone();
         world.component_by_id = self.component_by_id.clone();
         for (type_id, descriptor) in &world.component_by_type {

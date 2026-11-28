@@ -7,3 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+mlua = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+z-ideal-math.workspace = true
+z-ideal-scene = { path = "../z-ideal-scene" }

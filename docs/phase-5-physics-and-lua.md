@@ -2,15 +2,17 @@
 
 **Status:** in progress. Fixed-step timing, the Box3D world/body adapter,
 serializable scene physics components, ECS synchronization, collision filters,
-ray queries, and contact/sensor event delivery are implemented. Lua has not
-yet been integrated.
+ray/shape queries, overlap queries, contact/sensor event delivery, and a Lua VM with scene bindings,
+lifecycle, events, prefab commands and bounded instruction execution are
+implemented. Script asset cooking, runtime/editor integration and resource
+quotas remain outstanding.
 
 ## Roadmap scope
 
 - Box3D adapter, collider/body components, queries and events.
 - Fixed-step simulation.
-- Lua VM, script assets, lifecycle, entity/component API.
-- Prefab spawn and entity create/destroy commands.
+- Lua VM, lifecycle, typed component API, event dispatch and reload-after-shutdown.
+- Deferred entity and prefab commands with generation-safe script handles.
 
 **Exit gate:** every public physics and Lua API path is covered by automated
 tests. This gate is not yet met.
@@ -85,6 +87,10 @@ tests. This gate is not yet met.
 - PhysicsRayCast supports world-space origin/displacement and query category
   and mask bitsets. PhysicsWorld::cast_ray returns world-space points/normals
   and hit fractions, sorted by fraction and then stable engine body handle.
+- Convex shape casts and overlap queries support sphere, box and Y-aligned
+  capsule proxies with world-space pose, displacement and query filters.
+  Casts sort by fraction/handle; overlaps sort by handle. PhysicsScene maps both
+  result types to scene entities.
 - Contact and sensor begin/end events are copied into owned engine-facing
   snapshots after each successful fixed step.
 - Contact pairs are canonicalized by engine body handle. Event ordering is
@@ -92,13 +98,49 @@ tests. This gate is not yet met.
   sensor end), then by handle pair. Sensor/visitor roles remain explicit.
 - Shape-to-body mappings preserve retired handles for one step, allowing
   end events after body destruction to retain their original identity.
-- PhysicsScene translates physics body handles to scene entities for ray hits
-  and event snapshots, including the entity identity for a body removed during
-  the immediately preceding synchronization.
+- PhysicsScene translates physics body handles to scene entities for ray and
+  shape-query hits and event snapshots, including the entity identity for a
+  body removed during the immediately preceding synchronization.
 
-Shape casts and overlap queries are not implemented. Parent transforms,
-collider scaling, joints, mesh/compound/height-field colliders are also not
-implemented.
+Parent transforms, collider scaling, joints, mesh/compound/height-field
+colliders are not implemented.
+
+### Lua VM, lifecycle and scene API
+
+- ADR-0007 keeps the VM and all bindings in z-ideal-scripting. The runtime pins
+  mlua 0.12.3 with vendored Lua 5.4; no host Lua library is required.
+- Each ScriptInstance owns one VM and one script table. The lifecycle is
+  load, start, fixed_update, update, on_event and shutdown. Callbacks are
+  optional; fixed updates are host-driven. Pausing suppresses fixed and
+  variable updates while allowing events and shutdown.
+- The VM loads table, string, math and UTF-8 libraries. OS, IO, package,
+  debug and coroutine libraries are not loaded; dynamic/file loading,
+  protected-call helpers, explicit GC controls and console output globals are
+  removed. Source is limited to 1 MiB; each chunk/callback has a default
+  100,000-instruction budget checked every 1,000 instructions.
+- This is not yet a hostile-code sandbox: there is no VM memory quota or
+  wall-clock deadline. Run trusted project scripts until those controls exist.
+- Engine API tables are callback-scoped and become invalid after callback
+  return. Script instances bind to one opaque World identity; use of another
+  World is rejected.
+- Scripts can queue entity spawn/destroy/parent changes, read/write validated
+  Transform values, and read/write/remove serde-backed registered components.
+  Component reads are callback-entry snapshots; writes/removals are deferred.
+- Host-registered validated prefabs can be instantiated and destroyed through
+  deferred commands. A prefab ticket resolves to its source-entity mapping
+  after the callback commits; it cannot be resolved in the same callback.
+- A failed Lua callback discards its command buffer. Command application is
+  FIFO and sequential, not transactional; a later command failure preserves
+  earlier changes and returns partial entity/prefab creation results.
+- ScriptHost owns instances attached to live entities, assigns engine.entity,
+  supports multiple scripts per entity in insertion order, isolates failures
+  into diagnostics and prunes despawned attachments. The runtime crate
+  re-exports the host API.
+- Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
+  bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
+  running hot reload and state migration are not implemented.
+- Current focused coverage: 57 scripting tests, 46 scene tests and 40 physics
+  tests pass on the development host. These are focused results, not the full workspace gate.
 
 ## Backend evaluation
 
@@ -112,9 +154,13 @@ supported desktop targets.
 
 ## Remaining work
 
-- Add shape casts and overlap queries, and continue validating event ordering
-  and lifecycle behavior across mutation edge cases.
-- Add Lua VM, bounded execution and diagnostics, script asset contract,
-  lifecycle and pause/reload behavior.
-- Bind entity/component access through validated handles and deferred scene
-  commands, including prefab spawn and entity create/destroy.
+- Add joints, mesh/compound/height-field colliders, parent-transform support and
+  collider scaling only when the public scene/physics contracts are specified.
+- Add script asset import/cooking and connect script diagnostics to editor
+  tooling and the engine logging pipeline.
+- Add memory/resource quotas and a documented trusted/untrusted script policy.
+- Drive the runtime-exposed ScriptHost from packaged startup, fixed-step
+  scheduling and editor play mode; the packaged app has no complete game-loop
+  scheduler yet.
+- Add running hot reload with explicit state migration, if required by product
+  behavior.

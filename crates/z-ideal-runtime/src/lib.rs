@@ -1,4 +1,4 @@
-//! Packaged game startup, scene loading, and runtime loop; no editor dependency.
+//! Packaged game startup, scene loading, script ownership, and runtime loop; no editor dependency.
 #![forbid(unsafe_code)]
 
 mod gltf_material;
@@ -9,6 +9,11 @@ mod scene_renderer;
 mod shadow;
 mod ssao;
 mod vulkan_scene;
+
+pub use z_ideal_scripting::{
+    ScriptConfig, ScriptDiagnostic, ScriptError, ScriptHost, ScriptHostError, ScriptId,
+    ScriptInstance, ScriptPhase, ScriptRegistryError, ScriptState,
+};
 
 pub use gltf_material::{
     GltfMaterialError, GltfMaterialTextureResource, GltfMaterialTextureResources,

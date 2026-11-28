@@ -11,11 +11,15 @@ mod world;
 pub use fixed_step::{
     FixedStepAccumulator, FixedStepConfig, FixedStepConfigError, FixedStepError, FixedStepPlan,
 };
-pub use scene::{PhysicsScene, PhysicsSceneError, PhysicsSceneEvent, PhysicsSceneRayHit};
+pub use scene::{
+    PhysicsScene, PhysicsSceneError, PhysicsSceneEvent, PhysicsSceneOverlapHit, PhysicsSceneRayHit,
+    PhysicsSceneShapeCastHit,
+};
 pub use world::{
     ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyState, PhysicsBodyType,
-    PhysicsConfigError, PhysicsError, PhysicsEvent, PhysicsRayCast, PhysicsRayHit, PhysicsWorld,
-    PhysicsWorldConfig, RigidBodyDesc,
+    PhysicsConfigError, PhysicsError, PhysicsEvent, PhysicsOverlapHit, PhysicsQueryShape,
+    PhysicsRayCast, PhysicsRayHit, PhysicsShapeCast, PhysicsShapeCastHit, PhysicsShapeOverlap,
+    PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,
 };
 
 /// Returns the crate's stable package name for diagnostics and tooling.

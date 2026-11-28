@@ -12,7 +12,9 @@ mod scene_document;
 mod schedule;
 mod world;
 
-pub use commands::{CommandError, Commands, EntityTarget, PendingEntity};
+pub use commands::{
+    CommandError, CommandResults, Commands, EntityTarget, PendingEntity, PendingPrefab,
+};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use hierarchy::HierarchyError;
@@ -23,7 +25,7 @@ pub use scene_document::{
     SceneError, SerializedComponent,
 };
 pub use schedule::{Schedule, ScheduleError};
-pub use world::{World, WorldError};
+pub use world::{World, WorldError, WorldIdentity};
 
 use z_ideal_math::{PerspectiveCamera, Transform};
 
@@ -273,4 +275,48 @@ mod tests {
             Err(WorldError::StaleEntity(fabricated))
         );
     }
+}
+
+#[cfg(test)]
+mod world_identity_tests {
+    use super::World;
+
+    #[test]
+    fn world_identity_is_stable_for_clones_and_distinct_between_worlds() {
+        let first = World::new();
+        let first_identity = first.identity();
+        let second_identity = first.identity();
+        let second = World::new();
+        assert_eq!(first_identity, second_identity);
+        assert_ne!(first_identity, second.identity());
+    }
+}
+
+#[test]
+fn world_identity_survives_transactional_scene_replacement() {
+    let mut world = World::new();
+    let identity = world.identity();
+    world
+        .load_scene_document(&crate::SceneDocument::new())
+        .expect("load empty scene");
+    assert_eq!(identity, world.identity());
+}
+
+#[test]
+fn scene_replacement_never_revalidates_previously_live_entity_handles() {
+    let mut world = World::new();
+    let stale = world.spawn().expect("spawn old entity");
+    let identity = world.identity();
+    let source_id = crate::SceneEntityId::new(10).expect("scene ID");
+    let mut document = crate::SceneDocument::new();
+    document.next_scene_entity_id = 11;
+    document
+        .entities
+        .push(crate::SceneEntityRecord::new(source_id, None));
+    world.load_scene_document(&document).expect("replace scene");
+    let replacement = world.entities()[0];
+    assert_eq!(identity, world.identity());
+    assert_ne!(stale, replacement);
+    assert!(!world.is_alive(stale));
+    assert!(world.is_alive(replacement));
 }

@@ -8,8 +8,8 @@ use std::{
 use boxddd::{
     BodyDefBuilder, BodyType as Box3dBodyType, BoxHull, ContactEvents as Box3dContactEvents,
     Foundation, FoundationConfig, Pos, Quat as Box3dQuat, QueryFilter,
-    SensorEvents as Box3dSensorEvents, ShapeDef, ShapeId as Box3dShapeId, Sphere, StallThreshold,
-    Vec3 as Box3dVec3, World as Box3dWorld,
+    SensorEvents as Box3dSensorEvents, ShapeCastInput, ShapeDef, ShapeId as Box3dShapeId,
+    ShapeProxy, Sphere, StallThreshold, Vec3 as Box3dVec3, World as Box3dWorld,
 };
 use z_ideal_math::{Quat, Vec3};
 
@@ -107,6 +107,9 @@ pub enum PhysicsError {
     /// An event or query referenced a shape not owned by this adapter.
     #[error("Box3D returned an unmapped shape identifier")]
     UnmappedShape,
+    /// A shape query contains invalid dimensions, transforms or sweep values.
+    #[error("physics shape query contains invalid values")]
+    InvalidQuery,
     /// A unique physics-world identifier could not be allocated.
     #[error("physics world identifier space is exhausted")]
     WorldIdExhausted,
@@ -307,6 +310,107 @@ impl PhysicsRayCast {
             mask_bits: u64::MAX,
         }
     }
+}
+
+/// Convex primitive supported by physics shape casts and overlap queries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PhysicsQueryShape {
+    /// Sphere centered on the query origin.
+    Sphere { radius: f32 },
+    /// Box specified by positive half extents in query-local space.
+    Box { half_extents: Vec3 },
+    /// Capsule aligned to query-local Y. half_height is the centerline half length.
+    Capsule { half_height: f32, radius: f32 },
+}
+
+/// Swept convex-shape query in world space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsShapeCast {
+    /// World-space query origin.
+    pub origin: Vec3,
+    /// Query-local to world-space orientation.
+    pub rotation: Quat,
+    /// World-space displacement over which the shape is swept.
+    pub translation: Vec3,
+    /// Convex primitive and dimensions.
+    pub shape: PhysicsQueryShape,
+    /// Maximum fraction of translation to consider, in [0, 1].
+    pub max_fraction: f32,
+    /// Category bits assigned to the query.
+    pub category_bits: u64,
+    /// Mask bits used to accept candidate collider categories.
+    pub mask_bits: u64,
+}
+
+impl PhysicsShapeCast {
+    /// Creates a shape cast that sweeps the complete translation and accepts
+    /// every collider category.
+    #[must_use]
+    pub const fn new(
+        origin: Vec3,
+        rotation: Quat,
+        translation: Vec3,
+        shape: PhysicsQueryShape,
+    ) -> Self {
+        Self {
+            origin,
+            rotation,
+            translation,
+            shape,
+            max_fraction: 1.0,
+            category_bits: u64::MAX,
+            mask_bits: u64::MAX,
+        }
+    }
+}
+
+/// Static convex-shape overlap query in world space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsShapeOverlap {
+    /// World-space query origin.
+    pub origin: Vec3,
+    /// Query-local to world-space orientation.
+    pub rotation: Quat,
+    /// Convex primitive and dimensions.
+    pub shape: PhysicsQueryShape,
+    /// Category bits assigned to the query.
+    pub category_bits: u64,
+    /// Mask bits used to accept candidate collider categories.
+    pub mask_bits: u64,
+}
+
+impl PhysicsShapeOverlap {
+    /// Creates an overlap query accepting every collider category.
+    #[must_use]
+    pub const fn new(origin: Vec3, rotation: Quat, shape: PhysicsQueryShape) -> Self {
+        Self {
+            origin,
+            rotation,
+            shape,
+            category_bits: u64::MAX,
+            mask_bits: u64::MAX,
+        }
+    }
+}
+
+/// Hit from a swept convex-shape query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsShapeCastHit {
+    /// Body whose collider was hit.
+    pub body: PhysicsBodyHandle,
+    /// World-space intersection point.
+    pub point: Vec3,
+    /// Surface normal at the intersection point.
+    pub normal: Vec3,
+    /// Fraction along the sweep translation.
+    pub fraction: f32,
+}
+
+/// Body found by a convex-shape overlap query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicsOverlapHit {
+    /// Body whose collider overlaps the query shape.
+    pub body: PhysicsBodyHandle,
 }
 
 /// A world ray-cast result associated with an engine body handle.
@@ -555,6 +659,86 @@ impl PhysicsWorld {
         Ok(result)
     }
 
+    /// Sweeps a convex primitive through the world and returns deterministic hits.
+    ///
+    /// The query shape is rotated by the supplied orientation before the sweep.
+    /// Hits are sorted by fraction, then by stable body handle.
+    pub fn cast_shape(
+        &self,
+        query: PhysicsShapeCast,
+    ) -> Result<Vec<PhysicsShapeCastHit>, PhysicsError> {
+        if !query.origin.is_finite()
+            || !query.translation.is_finite()
+            || !query.max_fraction.is_finite()
+            || !(0.0..=1.0).contains(&query.max_fraction)
+        {
+            return Err(PhysicsError::InvalidQuery);
+        }
+        let proxy = make_query_proxy(query.shape, query.rotation)?;
+        let input = ShapeCastInput::with_options(
+            proxy,
+            to_box3d_vec3(query.translation),
+            query.max_fraction,
+            false,
+        )?;
+        let filter = QueryFilter::new()
+            .category_bits(query.category_bits)
+            .mask_bits(query.mask_bits);
+        let hits = self
+            .native
+            .cast_shape(to_box3d_pos(query.origin), input, filter)?;
+        let mut result = Vec::with_capacity(hits.len());
+        for hit in hits {
+            result.push(PhysicsShapeCastHit {
+                body: self.handle_for_shape(hit.shape_id)?,
+                point: Vec3::new(hit.point.x, hit.point.y, hit.point.z),
+                normal: Vec3::new(hit.normal.x, hit.normal.y, hit.normal.z),
+                fraction: hit.fraction,
+            });
+        }
+        result.sort_by(|left, right| {
+            left.fraction
+                .total_cmp(&right.fraction)
+                .then_with(|| left.body.index.cmp(&right.body.index))
+                .then_with(|| left.body.generation.cmp(&right.body.generation))
+        });
+        Ok(result)
+    }
+
+    /// Returns all bodies whose colliders overlap a convex primitive at one pose.
+    ///
+    /// Results are sorted by stable body handle rather than Box3D traversal order.
+    pub fn overlap_shape(
+        &self,
+        query: PhysicsShapeOverlap,
+    ) -> Result<Vec<PhysicsOverlapHit>, PhysicsError> {
+        if !query.origin.is_finite() {
+            return Err(PhysicsError::InvalidQuery);
+        }
+        let proxy = make_query_proxy(query.shape, query.rotation)?;
+        let filter = QueryFilter::new()
+            .category_bits(query.category_bits)
+            .mask_bits(query.mask_bits);
+        let hits = self
+            .native
+            .overlap_shape(to_box3d_pos(query.origin), &proxy, filter)?;
+        let mut result = hits
+            .into_iter()
+            .map(|hit| {
+                Ok(PhysicsOverlapHit {
+                    body: self.handle_for_shape(hit.shape_id)?,
+                })
+            })
+            .collect::<Result<Vec<_>, PhysicsError>>()?;
+        result.sort_by(|left, right| {
+            left.body
+                .index
+                .cmp(&right.body.index)
+                .then_with(|| left.body.generation.cmp(&right.body.generation))
+        });
+        Ok(result)
+    }
+
     /// Replaces a body's world-space position and orientation.
     pub fn set_body_transform(
         &mut self,
@@ -756,6 +940,50 @@ impl PhysicsWorld {
             }
         };
         Ok(shape)
+    }
+}
+
+fn make_query_proxy(shape: PhysicsQueryShape, rotation: Quat) -> Result<ShapeProxy, PhysicsError> {
+    let rotation_length = rotation.length_squared();
+    if !rotation.is_finite() || !rotation_length.is_finite() || rotation_length <= f32::EPSILON {
+        return Err(PhysicsError::InvalidQuery);
+    }
+    let rotation = rotation.normalize();
+    match shape {
+        PhysicsQueryShape::Sphere { radius } => {
+            if !radius.is_finite() || radius <= 0.0 {
+                return Err(PhysicsError::InvalidQuery);
+            }
+            Ok(ShapeProxy::sphere(radius)?)
+        }
+        PhysicsQueryShape::Box { half_extents } => {
+            if !half_extents.is_finite() || half_extents.min_element() <= 0.0 {
+                return Err(PhysicsError::InvalidQuery);
+            }
+            let mut points = Vec::with_capacity(8);
+            for x in [-half_extents.x, half_extents.x] {
+                for y in [-half_extents.y, half_extents.y] {
+                    for z in [-half_extents.z, half_extents.z] {
+                        points.push(to_box3d_vec3(rotation * Vec3::new(x, y, z)));
+                    }
+                }
+            }
+            Ok(ShapeProxy::new(points, 0.0)?)
+        }
+        PhysicsQueryShape::Capsule {
+            half_height,
+            radius,
+        } => {
+            if !half_height.is_finite() || half_height < 0.0 || !radius.is_finite() || radius <= 0.0
+            {
+                return Err(PhysicsError::InvalidQuery);
+            }
+            Ok(ShapeProxy::capsule(
+                to_box3d_vec3(rotation * Vec3::new(0.0, -half_height, 0.0)),
+                to_box3d_vec3(rotation * Vec3::new(0.0, half_height, 0.0)),
+                radius,
+            )?)
+        }
     }
 }
 
@@ -1147,5 +1375,195 @@ mod filter_tests {
             event,
             PhysicsEvent::ContactBegin { .. } | PhysicsEvent::ContactEnd { .. }
         )));
+    }
+}
+
+#[cfg(test)]
+mod shape_query_tests {
+    use super::*;
+
+    fn world() -> PhysicsWorld {
+        PhysicsWorld::new(PhysicsWorldConfig {
+            gravity: Vec3::ZERO,
+            ..PhysicsWorldConfig::default()
+        })
+        .expect("world")
+    }
+
+    fn static_box(world: &mut PhysicsWorld, x: f32, category_bits: u64) -> PhysicsBodyHandle {
+        world
+            .create_body(
+                RigidBodyDesc {
+                    body_type: PhysicsBodyType::Static,
+                    position: Vec3::new(x, 0.0, 0.0),
+                    ..RigidBodyDesc::default()
+                },
+                ColliderDesc {
+                    category_bits,
+                    ..ColliderDesc::cuboid(Vec3::splat(0.5))
+                },
+            )
+            .expect("static box")
+    }
+
+    #[test]
+    fn sphere_overlap_returns_matching_bodies_in_stable_handle_order() {
+        let mut world = world();
+        let first = static_box(&mut world, 0.0, 1);
+        let _second = static_box(&mut world, 4.0, 1);
+        let hits = world
+            .overlap_shape(PhysicsShapeOverlap {
+                category_bits: u64::MAX,
+                mask_bits: 1,
+                ..PhysicsShapeOverlap::new(
+                    Vec3::ZERO,
+                    Quat::IDENTITY,
+                    PhysicsQueryShape::Sphere { radius: 1.0 },
+                )
+            })
+            .expect("overlap");
+        assert_eq!(hits, vec![PhysicsOverlapHit { body: first }]);
+    }
+
+    #[test]
+    fn shape_cast_returns_world_hits_sorted_by_fraction_and_honors_masks() {
+        let mut world = world();
+        let first = static_box(&mut world, 0.0, 1);
+        let second = static_box(&mut world, 3.0, 2);
+        let query = PhysicsShapeCast {
+            category_bits: u64::MAX,
+            mask_bits: 3,
+            ..PhysicsShapeCast::new(
+                Vec3::new(-3.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                Vec3::new(8.0, 0.0, 0.0),
+                PhysicsQueryShape::Sphere { radius: 0.25 },
+            )
+        };
+        let hits = world.cast_shape(query).expect("shape cast");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].body, first);
+        assert_eq!(hits[1].body, second);
+        assert!(hits[0].fraction < hits[1].fraction);
+        assert!(hits[0].point.is_finite());
+        assert!(hits[0].normal.is_finite());
+
+        let filtered = world
+            .cast_shape(PhysicsShapeCast {
+                mask_bits: 1,
+                ..query
+            })
+            .expect("filtered cast");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].body, first);
+    }
+
+    #[test]
+    fn rotated_box_and_capsule_queries_are_supported() {
+        let mut world = world();
+        let target = static_box(&mut world, 0.0, u64::MAX);
+        let rotated_box = PhysicsShapeOverlap::new(
+            Vec3::ZERO,
+            Quat::from_rotation_z(0.4),
+            PhysicsQueryShape::Box {
+                half_extents: Vec3::splat(0.25),
+            },
+        );
+        assert_eq!(
+            world.overlap_shape(rotated_box).expect("box overlap"),
+            vec![PhysicsOverlapHit { body: target }]
+        );
+
+        let capsule = PhysicsShapeOverlap::new(
+            Vec3::new(0.0, 0.25, 0.0),
+            Quat::IDENTITY,
+            PhysicsQueryShape::Capsule {
+                half_height: 0.5,
+                radius: 0.2,
+            },
+        );
+        assert_eq!(
+            world.overlap_shape(capsule).expect("capsule overlap"),
+            vec![PhysicsOverlapHit { body: target }]
+        );
+    }
+
+    #[test]
+    fn invalid_shape_query_inputs_are_rejected() {
+        let world = world();
+        assert!(matches!(
+            world.overlap_shape(PhysicsShapeOverlap::new(
+                Vec3::ZERO,
+                Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+                PhysicsQueryShape::Sphere { radius: 1.0 },
+            )),
+            Err(PhysicsError::InvalidQuery)
+        ));
+        assert!(matches!(
+            world.overlap_shape(PhysicsShapeOverlap::new(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                PhysicsQueryShape::Box {
+                    half_extents: Vec3::new(1.0, 0.0, 1.0)
+                },
+            )),
+            Err(PhysicsError::InvalidQuery)
+        ));
+        assert!(matches!(
+            world.cast_shape(PhysicsShapeCast {
+                max_fraction: 1.5,
+                ..PhysicsShapeCast::new(
+                    Vec3::ZERO,
+                    Quat::IDENTITY,
+                    Vec3::ONE,
+                    PhysicsQueryShape::Sphere { radius: 1.0 },
+                )
+            }),
+            Err(PhysicsError::InvalidQuery)
+        ));
+        assert!(matches!(
+            world.cast_shape(PhysicsShapeCast::new(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                Vec3::ONE,
+                PhysicsQueryShape::Capsule {
+                    half_height: -1.0,
+                    radius: 0.5
+                },
+            )),
+            Err(PhysicsError::InvalidQuery)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod world_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn exposes_world_configuration_body_count_and_validated_gravity_updates() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default()).expect("world");
+        assert_eq!(world.config(), PhysicsWorldConfig::default());
+        assert_eq!(world.body_count(), 0);
+
+        world
+            .set_gravity(Vec3::new(0.0, -4.0, 0.0))
+            .expect("set gravity");
+        assert_eq!(world.config().gravity, Vec3::new(0.0, -4.0, 0.0));
+
+        assert!(matches!(
+            world.set_gravity(Vec3::splat(f32::NAN)),
+            Err(PhysicsError::InvalidConfig(
+                PhysicsConfigError::InvalidGravity
+            ))
+        ));
+        assert_eq!(world.config().gravity, Vec3::new(0.0, -4.0, 0.0));
+
+        let body = world
+            .create_body(RigidBodyDesc::default(), ColliderDesc::sphere(0.5))
+            .expect("body");
+        assert_eq!(world.body_count(), 1);
+        world.destroy_body(body).expect("destroy");
+        assert_eq!(world.body_count(), 0);
     }
 }

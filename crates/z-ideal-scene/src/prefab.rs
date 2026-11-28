@@ -140,7 +140,7 @@ impl Prefab {
         merged.next_scene_entity_id = next_id;
         merged.entities.sort_by_key(|entity| entity.id);
         merged.validate()?;
-        world.load_scene_document(&merged)?;
+        world.load_scene_document_preserving_handles(&merged)?;
 
         let mut instance_entities = BTreeMap::new();
         for (source_id, instance_id) in remap {
