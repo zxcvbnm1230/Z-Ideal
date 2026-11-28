@@ -40,6 +40,12 @@ pub const MAX_SCRIPT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_SCRIPT_EVENT_BYTES: usize = 64 * 1024;
 /// Maximum nesting depth accepted for JSON event payloads.
 pub const MAX_SCRIPT_EVENT_DEPTH: usize = 64;
+/// Minimum Lua VM memory limit, in bytes.
+pub const MIN_SCRIPT_MEMORY_LIMIT_BYTES: usize = 256 * 1024;
+/// Default Lua VM memory limit, in bytes.
+pub const DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum Lua VM memory limit, in bytes.
+pub const MAX_SCRIPT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Configuration for one isolated Lua script instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +56,15 @@ pub struct ScriptConfig {
     /// so a callback may execute up to one check interval beyond the configured
     /// budget before it is interrupted.
     pub instruction_budget: u64,
+    /// Maximum memory allocated by this Lua VM, including its standard libraries.
+    pub memory_limit_bytes: usize,
 }
 
 impl Default for ScriptConfig {
     fn default() -> Self {
         Self {
             instruction_budget: 100_000,
+            memory_limit_bytes: DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES,
         }
     }
 }
@@ -96,6 +105,19 @@ pub enum ScriptError {
         "instruction budget must be between {INSTRUCTION_CHECK_INTERVAL} and {MAX_SCRIPT_INSTRUCTION_BUDGET}"
     )]
     InvalidInstructionBudget,
+    /// Configured VM memory limit is outside the supported range.
+    #[error("Lua VM memory limit {requested} is outside {minimum}..={maximum} bytes")]
+    InvalidMemoryLimit {
+        /// Requested limit.
+        requested: usize,
+        /// Minimum supported limit.
+        minimum: usize,
+        /// Maximum supported limit.
+        maximum: usize,
+    },
+    /// The VM allocator could not apply the configured memory limit.
+    #[error("failed to configure Lua VM memory limit: {0}")]
+    MemoryLimitConfiguration(#[source] mlua::Error),
     /// The source exceeds the configured hard size limit.
     #[error("script source is {actual} bytes; maximum is {maximum} bytes")]
     SourceTooLarge { actual: usize, maximum: usize },
@@ -244,6 +266,7 @@ pub struct ScriptInstance {
     state: ScriptState,
     paused: bool,
     instruction_budget: u64,
+    memory_limit_bytes: usize,
     executed_instructions: Arc<AtomicU64>,
     world_identity: Option<WorldIdentity>,
     attached_entity: Option<Entity>,
@@ -272,6 +295,15 @@ impl ScriptInstance {
         {
             return Err(ScriptError::InvalidInstructionBudget);
         }
+        if !(MIN_SCRIPT_MEMORY_LIMIT_BYTES..=MAX_SCRIPT_MEMORY_LIMIT_BYTES)
+            .contains(&config.memory_limit_bytes)
+        {
+            return Err(ScriptError::InvalidMemoryLimit {
+                requested: config.memory_limit_bytes,
+                minimum: MIN_SCRIPT_MEMORY_LIMIT_BYTES,
+                maximum: MAX_SCRIPT_MEMORY_LIMIT_BYTES,
+            });
+        }
         if source.len() > MAX_SCRIPT_SOURCE_BYTES {
             return Err(ScriptError::SourceTooLarge {
                 actual: source.len(),
@@ -284,6 +316,8 @@ impl ScriptInstance {
             mlua::LuaOptions::default(),
         )
         .map_err(ScriptError::VmInitialization)?;
+        lua.set_memory_limit(config.memory_limit_bytes)
+            .map_err(ScriptError::MemoryLimitConfiguration)?;
 
         // Base-library file loading and GC controls are removed. OS, IO,
         // package, debug and coroutine libraries are never loaded.
@@ -369,6 +403,7 @@ impl ScriptInstance {
             state: ScriptState::Loaded,
             paused: false,
             instruction_budget,
+            memory_limit_bytes: config.memory_limit_bytes,
             executed_instructions,
             world_identity: None,
             attached_entity: None,
@@ -1299,6 +1334,18 @@ impl ScriptInstance {
     #[must_use]
     pub const fn instruction_budget(&self) -> u64 {
         self.instruction_budget
+    }
+
+    /// Returns the configured per-instance Lua VM memory limit.
+    #[must_use]
+    pub const fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit_bytes
+    }
+
+    /// Returns the Lua VM's current allocated memory in bytes.
+    #[must_use]
+    pub fn memory_used_bytes(&self) -> usize {
+        self.lua.used_memory()
     }
 }
 

@@ -4,8 +4,10 @@
 serializable scene physics components, ECS synchronization, collision filters,
 ray/shape queries, overlap queries, contact/sensor event delivery, Lua source
 import, and a Lua VM with scene bindings, lifecycle, events, prefab commands
-and bounded instruction execution are implemented. Filesystem cooking,
-runtime/editor integration and resource quotas remain outstanding.
+and bounded instruction and Lua-VM memory execution are implemented.
+Filesystem cooking, runtime/editor integration, wall-clock deadlines and host
+API quotas remain outstanding. The VM allocator quota does not include
+Rust-side component snapshots or other host allocations.
 
 ## Roadmap scope
 
@@ -118,8 +120,10 @@ colliders are not implemented.
   protected-call helpers, explicit GC controls and console output globals are
   removed. Source is limited to 1 MiB; each chunk/callback has a default
   100,000-instruction budget checked every 1,000 instructions.
-- This is not yet a hostile-code sandbox: there is no VM memory quota or
-  wall-clock deadline. Run trusted project scripts until those controls exist.
+- Each VM has a 16 MiB default allocator limit, configurable from 256 KiB to
+  64 MiB. This limit excludes Rust-side host allocations. There is no wall-clock
+  deadline or native host API quota; run trusted project scripts until those
+  controls and a formal trust policy exist.
 - Engine API tables are callback-scoped and become invalid after callback
   return. Script instances bind to one opaque World identity; use of another
   World is rejected.
@@ -139,7 +143,7 @@ colliders are not implemented.
 - Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
-- Current focused coverage: 58 scripting tests, 46 scene tests, 40 physics
+- Current focused coverage: 60 scripting tests, 46 scene tests, 40 physics
   tests and 22 asset tests pass on the development host. These are focused
   results, not the full workspace gate.
 
@@ -159,7 +163,8 @@ supported desktop targets.
   collider scaling only when the public scene/physics contracts are specified.
 - Add filesystem discovery/build cooking for imported script source and
   connect script diagnostics to editor tooling and the engine logging pipeline.
-- Add memory/resource quotas and a documented trusted/untrusted script policy.
+- Add wall-clock and host API quotas and a documented trusted/untrusted script
+  policy.
 - Drive the runtime-exposed ScriptHost from packaged startup, fixed-step
   scheduling and editor play mode; the packaged app has no complete game-loop
   scheduler yet.

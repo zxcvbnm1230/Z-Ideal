@@ -166,20 +166,24 @@ not loaded. File/dynamic loading helpers, protected-call helpers (pcall and
 xpcall), explicit garbage-collector controls and console output globals are
 removed from the base environment. Source is limited to 1 MiB. Each top-level
 chunk and lifecycle callback has an independent instruction budget (100,000
-by default, capped at 100,000,000), checked every 1,000 Lua VM instructions. An interrupt may
-therefore occur up to one check interval after the configured budget.
-Protected calls are unavailable so a script cannot catch and suppress the
-instruction-budget interrupt.
+by default, capped at 100,000,000), checked every 1,000 Lua VM instructions.
+Each VM also has a per-instance allocator limit (16 MiB by default, configurable
+from 256 KiB through 64 MiB). Allocation beyond the limit returns an execution
+error and discards that callback's uncommitted scene commands. The
+memory_used_bytes and memory_limit_bytes accessors expose VM memory diagnostics.
+This allocator limit does not include Rust-side component snapshots or other
+host allocations. Protected calls are unavailable so a script cannot catch
+and suppress instruction-budget or allocation errors.
 
-**This is not yet a complete hostile-code sandbox.** The VM does not enforce a
-memory quota or wall-clock deadline. Instruction accounting does not bound
-memory allocated by string/table operations or future native host callbacks.
-Only run trusted project scripts until memory accounting and host API quotas
-are implemented.
+**This is not yet a complete hostile-code sandbox.** There is no wall-clock
+deadline or quota for expensive native host APIs. Instruction accounting does
+not bound time spent inside a native call. Only run trusted project scripts
+until those additional controls and a formal trust policy are in place.
 
 ## Remaining Phase 5 work
 
-- Script asset loading/cooking and runtime/editor diagnostics integration.
-- Memory/resource quotas and a documented trusted/untrusted script policy.
+- Filesystem discovery/build cooking for imported script source and
+  runtime/editor diagnostics integration.
+- Wall-clock and host API quotas, plus a documented trusted/untrusted script policy.
 - Automatic hot reload of running scripts with explicit state migration.
 - Broader integration into the packaged runtime loop and editor play mode.

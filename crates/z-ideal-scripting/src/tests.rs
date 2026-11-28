@@ -60,7 +60,8 @@ mod lifecycle_tests {
                 "budget.lua",
                 "return {}",
                 ScriptConfig {
-                    instruction_budget: u64::from(INSTRUCTION_CHECK_INTERVAL) - 1
+                    instruction_budget: u64::from(INSTRUCTION_CHECK_INTERVAL) - 1,
+                    ..ScriptConfig::default()
                 }
             ),
             Err(ScriptError::InvalidInstructionBudget)
@@ -148,6 +149,7 @@ mod lifecycle_tests {
             "return { start = function() while true do end end }",
             ScriptConfig {
                 instruction_budget: u64::from(INSTRUCTION_CHECK_INTERVAL) * 4,
+                ..ScriptConfig::default()
             },
         )
         .expect("load loop script");
@@ -196,6 +198,7 @@ mod lifecycle_tests {
             "while true do end",
             ScriptConfig {
                 instruction_budget: u64::from(INSTRUCTION_CHECK_INTERVAL) * 2,
+                ..ScriptConfig::default()
             },
         );
         assert!(matches!(
@@ -985,6 +988,7 @@ mod budget_cap_tests {
                 "return {}",
                 ScriptConfig {
                     instruction_budget: MAX_SCRIPT_INSTRUCTION_BUDGET + 1,
+                    ..ScriptConfig::default()
                 },
             ),
             Err(ScriptError::InvalidInstructionBudget)
@@ -1187,5 +1191,85 @@ mod imported_asset_tests {
         assert_eq!(script.source_name(), "scripts/player.lua");
         script.start().expect("start");
         script.update(0.016).expect("update");
+    }
+}
+
+#[cfg(test)]
+mod memory_quota_tests {
+    use crate::{
+        DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES, MAX_SCRIPT_MEMORY_LIMIT_BYTES,
+        MIN_SCRIPT_MEMORY_LIMIT_BYTES, ScriptConfig, ScriptError, ScriptInstance, ScriptPhase,
+        ScriptState,
+    };
+    use z_ideal_scene::World;
+
+    #[test]
+    fn rejects_memory_limits_outside_supported_bounds() {
+        for memory_limit_bytes in [
+            MIN_SCRIPT_MEMORY_LIMIT_BYTES - 1,
+            MAX_SCRIPT_MEMORY_LIMIT_BYTES + 1,
+        ] {
+            assert!(matches!(
+                ScriptInstance::load(
+                    "invalid_memory_limit.lua",
+                    "return {}",
+                    ScriptConfig {
+                        memory_limit_bytes,
+                        ..ScriptConfig::default()
+                    },
+                ),
+                Err(ScriptError::InvalidMemoryLimit { .. })
+            ));
+        }
+
+        let script = ScriptInstance::load(
+            "default_memory_limit.lua",
+            "return {}",
+            ScriptConfig::default(),
+        )
+        .expect("default memory limit");
+        assert_eq!(
+            script.memory_limit_bytes(),
+            DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES
+        );
+        assert!(script.memory_used_bytes() <= script.memory_limit_bytes());
+    }
+
+    #[test]
+    fn memory_exhaustion_is_reported_and_discards_scene_commands() {
+        let mut script = ScriptInstance::load(
+            "memory_limit.lua",
+            r#"
+                return {
+                    update = function(self, dt, engine)
+                        engine.entities.spawn()
+                        local allocations = {}
+                        for i = 1, 10000 do
+                            allocations[i] = string.rep("z", 512)
+                        end
+                    end
+                }
+            "#,
+            ScriptConfig {
+                instruction_budget: 10_000_000,
+                memory_limit_bytes: MIN_SCRIPT_MEMORY_LIMIT_BYTES,
+            },
+        )
+        .expect("load bounded script");
+        let mut world = World::new();
+        script.start_with_world(&mut world).expect("start");
+        let error = script
+            .update_with_world(&mut world, 0.016)
+            .expect_err("memory quota");
+        assert!(matches!(
+            error,
+            ScriptError::Execution {
+                phase: ScriptPhase::Update,
+                ..
+            }
+        ));
+        assert_eq!(script.state(), ScriptState::Started);
+        assert!(script.memory_used_bytes() <= script.memory_limit_bytes());
+        assert!(world.entities().is_empty());
     }
 }

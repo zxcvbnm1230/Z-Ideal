@@ -11,8 +11,9 @@ mod ssao;
 mod vulkan_scene;
 
 pub use z_ideal_scripting::{
-    ScriptConfig, ScriptDiagnostic, ScriptError, ScriptHost, ScriptHostError, ScriptId,
-    ScriptInstance, ScriptPhase, ScriptRegistryError, ScriptState,
+    DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES, MAX_SCRIPT_MEMORY_LIMIT_BYTES,
+    MIN_SCRIPT_MEMORY_LIMIT_BYTES, ScriptConfig, ScriptDiagnostic, ScriptError, ScriptHost,
+    ScriptHostError, ScriptId, ScriptInstance, ScriptPhase, ScriptRegistryError, ScriptState,
 };
 
 pub use z_ideal_assets::{
