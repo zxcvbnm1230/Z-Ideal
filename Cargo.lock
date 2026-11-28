@@ -2245,6 +2245,9 @@ dependencies = [
 [[package]]
 name = "z-ideal-physics"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "z-ideal-platform"

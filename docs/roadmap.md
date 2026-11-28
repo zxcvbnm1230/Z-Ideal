@@ -48,6 +48,8 @@ This is a dependency-ordered roadmap, not a claim that these systems are already
 **Exit gate:** reference scenes and image regression tests with documented tolerances.
 
 ## Phase 5 — Physics and Lua
+
+**In progress.** See [Phase 5 implementation notes](phase-5-physics-and-lua.md).
 - Box3D adapter, collider/body components, queries and events.
 - Fixed-step simulation.
 - Lua VM, script assets, lifecycle, entity/component API.
