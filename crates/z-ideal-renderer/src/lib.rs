@@ -15,6 +15,7 @@ mod command;
 mod descriptor;
 mod frame;
 mod graphics_pipeline;
+mod hdr;
 mod image;
 mod memory;
 mod mesh;
@@ -42,6 +43,7 @@ pub use descriptor::{
 };
 pub use frame::{FrameStart, FrameTicket, VulkanFrameScheduler};
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};
+pub use hdr::{HDR_COLOR_FORMAT, HdrTargetError, VulkanHdrColorTarget};
 pub use image::{ImageConfig, ImageViewConfig, VulkanImage, VulkanImageView};
 pub use mesh::{MeshDrawError, MeshGpu, MeshUploadError, MeshVertex};
 pub use pipeline::VulkanComputePipeline;
@@ -59,7 +61,7 @@ pub use shader::{
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
-pub use texture::{TextureUploadError, VulkanTexture2D};
+pub use texture::{TextureColorSpace, TextureUploadError, VulkanTexture2D};
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";

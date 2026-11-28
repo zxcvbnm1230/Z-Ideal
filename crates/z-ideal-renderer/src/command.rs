@@ -1117,6 +1117,81 @@ impl<'recording, 'pool, 'device> CommandBufferRecording<'recording, 'pool, 'devi
         Ok(())
     }
 
+    /// Blits non-overlapping 2D color mip subresources within one image.
+    ///
+    /// The caller must transition each referenced source/destination mip to the supplied
+    /// transfer layouts before recording. The format must support blit source/destination
+    /// operations and linear filtering when `filter` is `LINEAR`.
+    pub fn blit_image(
+        &mut self,
+        image: &'recording VulkanImage<'device>,
+        source_layout: vk::ImageLayout,
+        destination_layout: vk::ImageLayout,
+        regions: &[vk::ImageBlit],
+        filter: vk::Filter,
+    ) -> Result<(), VulkanError> {
+        self.buffer_mut().require_recording()?;
+        let config = image.config();
+        if !queue_supports_transfer(self.buffer_mut().pool.queue_flags)
+            || self.buffer_mut().current_render_pass.is_some()
+            || !std::ptr::eq(image.device, self.buffer_mut().pool.device)
+            || !config
+                .usage
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            || !is_transfer_source_layout(source_layout)
+            || !is_transfer_destination_layout(destination_layout)
+            || !matches!(filter, vk::Filter::NEAREST | vk::Filter::LINEAR)
+            || config.image_type != vk::ImageType::TYPE_2D
+            || config.samples != vk::SampleCountFlags::TYPE_1
+            || regions.is_empty()
+        {
+            return Err(VulkanError::InvalidCopyRegion);
+        }
+        let mut required_features =
+            vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
+        if filter == vk::Filter::LINEAR {
+            required_features |= vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        }
+        // SAFETY: The physical device is owned by the instance retained by this device.
+        let format_properties = unsafe {
+            self.buffer_mut()
+                .pool
+                .device
+                ._instance
+                .handle
+                .get_physical_device_format_properties(
+                    self.buffer_mut().pool.device.physical_device,
+                    config.format,
+                )
+        };
+        if !format_properties
+            .optimal_tiling_features
+            .contains(required_features)
+        {
+            return Err(VulkanError::UnsupportedImageFormatFeature);
+        }
+        for region in regions {
+            if !validate_image_blit_region(region, config) {
+                return Err(VulkanError::InvalidCopyRegion);
+            }
+        }
+        // SAFETY: The image is live and device-compatible; transfer usage, layouts,
+        // subresource indices/layers, non-overlap, and source/destination bounds were checked.
+        unsafe {
+            self.buffer_mut().pool.device.handle.cmd_blit_image(
+                self.buffer_mut().handle,
+                image.handle(),
+                source_layout,
+                image.handle(),
+                destination_layout,
+                regions,
+                filter,
+            );
+        }
+        self.resources.push(image);
+        Ok(())
+    }
+
     /// Records buffer/image memory barriers and image layout transitions.
     ///
     /// Ordinary barriers keep queue-family ownership unchanged. Use the explicit
@@ -2221,6 +2296,55 @@ fn validate_buffer_image_copy_region(
     Ok(())
 }
 
+fn validate_image_blit_region(region: &vk::ImageBlit, config: crate::ImageConfig) -> bool {
+    let source = region.src_subresource;
+    let destination = region.dst_subresource;
+    if config.image_type != vk::ImageType::TYPE_2D
+        || config.samples != vk::SampleCountFlags::TYPE_1
+        || source.aspect_mask != vk::ImageAspectFlags::COLOR
+        || source.aspect_mask != destination.aspect_mask
+        || source.mip_level >= config.mip_levels
+        || destination.mip_level >= config.mip_levels
+        || source.layer_count == 0
+        || source.layer_count != destination.layer_count
+        || source
+            .base_array_layer
+            .checked_add(source.layer_count)
+            .is_none_or(|end| end > config.array_layers)
+        || destination
+            .base_array_layer
+            .checked_add(destination.layer_count)
+            .is_none_or(|end| end > config.array_layers)
+    {
+        return false;
+    }
+    if source.mip_level == destination.mip_level
+        && source.base_array_layer < destination.base_array_layer + destination.layer_count
+        && destination.base_array_layer < source.base_array_layer + source.layer_count
+    {
+        return false;
+    }
+    let mip_extent = |level: u32| vk::Extent3D {
+        width: (config.extent.width >> level).max(1),
+        height: (config.extent.height >> level).max(1),
+        depth: (config.extent.depth >> level).max(1),
+    };
+    let within = |offsets: [vk::Offset3D; 2], extent: vk::Extent3D| {
+        let [a, b] = offsets;
+        a.x >= 0
+            && a.y >= 0
+            && a.z >= 0
+            && b.x > a.x
+            && b.y > a.y
+            && b.z > a.z
+            && u32::try_from(b.x).is_ok_and(|v| v <= extent.width)
+            && u32::try_from(b.y).is_ok_and(|v| v <= extent.height)
+            && u32::try_from(b.z).is_ok_and(|v| v <= extent.depth)
+    };
+    within(region.src_offsets, mip_extent(source.mip_level))
+        && within(region.dst_offsets, mip_extent(destination.mip_level))
+}
+
 fn validate_image_copy_region(
     region: &vk::ImageCopy,
     source: crate::ImageConfig,
@@ -2587,7 +2711,8 @@ mod tests {
         ranges_overlap, swapchain_target_matches, validate_buffer_barrier_range,
         validate_buffer_copy_region, validate_buffer_image_copy_region,
         validate_command_pool_flags, validate_dynamic_offset_requirement,
-        validate_image_barrier_range, validate_image_copy_region, validate_semaphore_handle_sets,
+        validate_image_barrier_range, validate_image_blit_region, validate_image_copy_region,
+        validate_semaphore_handle_sets,
     };
     use crate::descriptor::DynamicOffsetRequirement;
     use ash::vk;
@@ -3139,6 +3264,69 @@ mod tests {
             ..region
         };
         assert!(!validate_image_copy_region(&bad_layers, config, config));
+    }
+
+    #[test]
+    fn validates_image_blit_mip_levels_layers_and_extents() {
+        let config = crate::ImageConfig {
+            mip_levels: 3,
+            usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            ..test_color_image_config()
+        };
+        let source = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let destination = vk::ImageSubresourceLayers {
+            mip_level: 1,
+            ..source
+        };
+        let region = vk::ImageBlit::default()
+            .src_subresource(source)
+            .src_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D { x: 4, y: 4, z: 1 },
+            ])
+            .dst_subresource(destination)
+            .dst_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D { x: 2, y: 2, z: 1 },
+            ]);
+        assert!(validate_image_blit_region(&region, config));
+
+        let out_of_bounds = vk::ImageBlit {
+            dst_offsets: [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D { x: 3, y: 2, z: 1 },
+            ],
+            ..region
+        };
+        assert!(!validate_image_blit_region(&out_of_bounds, config));
+
+        let same_subresource = vk::ImageBlit {
+            dst_subresource: source,
+            ..region
+        };
+        assert!(!validate_image_blit_region(&same_subresource, config));
+
+        let missing_layer = vk::ImageBlit {
+            src_subresource: vk::ImageSubresourceLayers {
+                layer_count: 0,
+                ..source
+            },
+            ..region
+        };
+        assert!(!validate_image_blit_region(&missing_layer, config));
+
+        let missing_mip = vk::ImageBlit {
+            dst_subresource: vk::ImageSubresourceLayers {
+                mip_level: 3,
+                ..destination
+            },
+            ..region
+        };
+        assert!(!validate_image_blit_region(&missing_mip, config));
     }
 
     #[test]

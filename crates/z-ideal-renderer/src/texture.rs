@@ -25,6 +25,21 @@ pub enum TextureUploadError {
     /// The imported image dimensions or pixel storage are invalid.
     #[error("imported image dimensions or pixel storage are invalid")]
     InvalidImageData,
+    /// The requested color space has no compatible Vulkan format for this image representation.
+    #[error("image format {format:?} cannot represent requested {color_space:?} color space")]
+    UnsupportedColorSpaceFormat {
+        format: ImagePixelFormat,
+        color_space: TextureColorSpace,
+    },
+    /// The physical device cannot generate mipmaps for this optimal-tiling image format.
+    #[error(
+        "Vulkan format {format:?} does not support required mip-generation features {required:?}; available {available:?}"
+    )]
+    UnsupportedMipFeatures {
+        format: vk::Format,
+        required: vk::FormatFeatureFlags,
+        available: vk::FormatFeatureFlags,
+    },
     /// The physical device does not support the required optimal-tiling image operations.
     #[error(
         "Vulkan format {format:?} lacks required features {required:?}; available {available:?}"
@@ -45,6 +60,15 @@ pub enum TextureUploadError {
     Vulkan(#[from] VulkanError),
 }
 
+/// Interpretation of normalized 8-bit image channels during sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureColorSpace {
+    /// Numeric channels are sampled without transfer-function conversion.
+    Linear,
+    /// Supported 8-bit channels are sampled using the sRGB transfer function.
+    Srgb,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadState {
     Pending,
@@ -54,15 +78,15 @@ enum UploadState {
 
 /// Owns an imported glTF image's Vulkan image, staging buffer, and sampler.
 ///
-/// Create one instance per imported glTF texture so each texture retains its own
-/// sampler state, even when multiple textures refer to the same source image.
+/// Create one instance per imported glTF texture and semantic color-space use so each
+/// texture retains its own sampler state and linear/sRGB interpretation.
 /// The image starts in UNDEFINED layout. Call record_upload exactly once, outside
 /// a render pass, and submit the command buffer before sampling it. The staging
 /// buffer remains owned by this object and is also retained by the submission
 /// recording until its fence completes.
 ///
-/// This initial implementation uploads one mip level. Sampler LOD is clamped to
-/// level zero; CPU/GPU mip generation is not yet implemented.
+/// The upload generates a complete mip chain with linear blits. Formats and devices
+/// that cannot support sampled-image linear filtering and transfer blits are rejected.
 pub struct VulkanTexture2D<'device> {
     image: VulkanImage<'device>,
     staging: VulkanBuffer<'device>,
@@ -72,10 +96,12 @@ pub struct VulkanTexture2D<'device> {
 
 impl<'device> VulkanTexture2D<'device> {
     /// Creates a Vulkan texture from one imported glTF texture table entry.
+    /// The caller selects sRGB for base-color/emissive data and linear for data maps.
     pub fn from_import(
         device: &'device VulkanDevice,
         import: &GltfImport,
         texture_index: usize,
+        color_space: TextureColorSpace,
     ) -> Result<Self, TextureUploadError> {
         let texture = import
             .textures
@@ -85,7 +111,7 @@ impl<'device> VulkanTexture2D<'device> {
             .images
             .get(texture.source_image)
             .ok_or(TextureUploadError::MissingImage(texture.source_image))?;
-        Self::new(device, image, texture)
+        Self::new(device, image, texture, color_space)
     }
 
     /// Creates a Vulkan texture from decoded image pixels and imported sampler state.
@@ -93,8 +119,9 @@ impl<'device> VulkanTexture2D<'device> {
         device: &'device VulkanDevice,
         imported_image: &ImportedImage,
         imported_texture: &ImportedTexture,
+        color_space: TextureColorSpace,
     ) -> Result<Self, TextureUploadError> {
-        let format = image_vk_format(imported_image.format);
+        let format = image_vk_format(imported_image.format, color_space)?;
         let expected_bytes =
             expected_pixel_bytes(imported_image).ok_or(TextureUploadError::InvalidImageData)?;
         if imported_image.width == 0
@@ -117,9 +144,15 @@ impl<'device> VulkanTexture2D<'device> {
             return Err(TextureUploadError::InvalidImageData);
         }
 
-        let sampler_config = sampler_config(imported_texture);
+        let mip_levels = mip_level_count(imported_image.width, imported_image.height);
+        let sampler_config = sampler_config(imported_texture, mip_levels);
         let mut required_features =
             vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_DST;
+        if mip_levels > 1 {
+            required_features |= vk::FormatFeatureFlags::BLIT_SRC
+                | vk::FormatFeatureFlags::BLIT_DST
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        }
         if sampler_uses_linear_filter(sampler_config) {
             required_features |= vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         }
@@ -132,6 +165,13 @@ impl<'device> VulkanTexture2D<'device> {
         };
         let available_features = format_properties.optimal_tiling_features;
         if !available_features.contains(required_features) {
+            if mip_levels > 1 {
+                return Err(TextureUploadError::UnsupportedMipFeatures {
+                    format,
+                    required: required_features,
+                    available: available_features,
+                });
+            }
             return Err(TextureUploadError::UnsupportedFormatFeatures {
                 format,
                 required: required_features,
@@ -149,11 +189,13 @@ impl<'device> VulkanTexture2D<'device> {
                     depth: 1,
                 },
                 format,
-                mip_levels: 1,
+                mip_levels,
                 array_layers: 1,
                 samples: vk::SampleCountFlags::TYPE_1,
                 tiling: vk::ImageTiling::OPTIMAL,
-                usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+                usage: vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
                 flags: vk::ImageCreateFlags::empty(),
             },
         )?;
@@ -186,7 +228,10 @@ impl<'device> VulkanTexture2D<'device> {
 
     /// Creates an image view for descriptor updates.
     pub fn create_view(&self) -> Result<VulkanImageView<'_, 'device>, VulkanError> {
-        self.image.create_view(ImageViewConfig::default())
+        self.image.create_view(ImageViewConfig {
+            level_count: self.image.config().mip_levels,
+            ..ImageViewConfig::default()
+        })
     }
 
     /// Returns the imported sampler resource for descriptor updates.
@@ -243,7 +288,7 @@ impl<'device> VulkanTexture2D<'device> {
                 destination_access: vk::AccessFlags::TRANSFER_WRITE,
                 aspect: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: self.image.config().mip_levels,
                 base_array_layer: 0,
                 layer_count: 1,
             }],
@@ -269,6 +314,88 @@ impl<'device> VulkanTexture2D<'device> {
             &region,
         )?;
 
+        let mut mip_width = self.image.config().extent.width;
+        let mut mip_height = self.image.config().extent.height;
+        for mip_level in 1..self.image.config().mip_levels {
+            recording.pipeline_barrier(
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[ImageBarrier {
+                    image: &self.image,
+                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    source_access: vk::AccessFlags::TRANSFER_WRITE,
+                    destination_access: vk::AccessFlags::TRANSFER_READ,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_level - 1,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            )?;
+            let next_width = (mip_width / 2).max(1);
+            let next_height = (mip_height / 2).max(1);
+            let blit = [vk::ImageBlit::default()
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(mip_level - 1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: mip_width as i32,
+                        y: mip_height as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(mip_level)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: next_width as i32,
+                        y: next_height as i32,
+                        z: 1,
+                    },
+                ])];
+            recording.blit_image(
+                &self.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &blit,
+                vk::Filter::LINEAR,
+            )?;
+            recording.pipeline_barrier(
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[ImageBarrier {
+                    image: &self.image,
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    source_access: vk::AccessFlags::TRANSFER_READ,
+                    destination_access: vk::AccessFlags::SHADER_READ,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_level - 1,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            )?;
+            mip_width = next_width;
+            mip_height = next_height;
+        }
         recording.pipeline_barrier(
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -281,7 +408,7 @@ impl<'device> VulkanTexture2D<'device> {
                 source_access: vk::AccessFlags::TRANSFER_WRITE,
                 destination_access: vk::AccessFlags::SHADER_READ,
                 aspect: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
+                base_mip_level: self.image.config().mip_levels - 1,
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
@@ -291,19 +418,39 @@ impl<'device> VulkanTexture2D<'device> {
     }
 }
 
-fn image_vk_format(format: ImagePixelFormat) -> vk::Format {
-    match format {
-        ImagePixelFormat::R8 => vk::Format::R8_UNORM,
-        ImagePixelFormat::Rg8 => vk::Format::R8G8_UNORM,
-        ImagePixelFormat::Rgb8 => vk::Format::R8G8B8_UNORM,
-        ImagePixelFormat::Rgba8 => vk::Format::R8G8B8A8_UNORM,
-        ImagePixelFormat::R16 => vk::Format::R16_UNORM,
-        ImagePixelFormat::Rg16 => vk::Format::R16G16_UNORM,
-        ImagePixelFormat::Rgb16 => vk::Format::R16G16B16_UNORM,
-        ImagePixelFormat::Rgba16 => vk::Format::R16G16B16A16_UNORM,
-        ImagePixelFormat::Rgb32Float => vk::Format::R32G32B32_SFLOAT,
-        ImagePixelFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
-    }
+fn image_vk_format(
+    format: ImagePixelFormat,
+    color_space: TextureColorSpace,
+) -> Result<vk::Format, TextureUploadError> {
+    let vk_format = match (format, color_space) {
+        (ImagePixelFormat::R8, TextureColorSpace::Linear) => vk::Format::R8_UNORM,
+        (ImagePixelFormat::Rg8, TextureColorSpace::Linear) => vk::Format::R8G8_UNORM,
+        (ImagePixelFormat::Rgb8, TextureColorSpace::Linear) => vk::Format::R8G8B8_UNORM,
+        (ImagePixelFormat::Rgba8, TextureColorSpace::Linear) => vk::Format::R8G8B8A8_UNORM,
+        (ImagePixelFormat::R16, TextureColorSpace::Linear) => vk::Format::R16_UNORM,
+        (ImagePixelFormat::Rg16, TextureColorSpace::Linear) => vk::Format::R16G16_UNORM,
+        (ImagePixelFormat::Rgb16, TextureColorSpace::Linear) => vk::Format::R16G16B16_UNORM,
+        (ImagePixelFormat::Rgba16, TextureColorSpace::Linear) => vk::Format::R16G16B16A16_UNORM,
+        (ImagePixelFormat::Rgb32Float, TextureColorSpace::Linear) => vk::Format::R32G32B32_SFLOAT,
+        (ImagePixelFormat::Rgba32Float, TextureColorSpace::Linear) => {
+            vk::Format::R32G32B32A32_SFLOAT
+        }
+        (ImagePixelFormat::R8, TextureColorSpace::Srgb) => vk::Format::R8_SRGB,
+        (ImagePixelFormat::Rg8, TextureColorSpace::Srgb) => vk::Format::R8G8_SRGB,
+        (ImagePixelFormat::Rgb8, TextureColorSpace::Srgb) => vk::Format::R8G8B8_SRGB,
+        (ImagePixelFormat::Rgba8, TextureColorSpace::Srgb) => vk::Format::R8G8B8A8_SRGB,
+        (format, TextureColorSpace::Srgb) => {
+            return Err(TextureUploadError::UnsupportedColorSpaceFormat {
+                format,
+                color_space,
+            });
+        }
+    };
+    Ok(vk_format)
+}
+
+fn mip_level_count(width: u32, height: u32) -> u32 {
+    u32::BITS - width.max(height).leading_zeros()
 }
 
 fn expected_pixel_bytes(image: &ImportedImage) -> Option<usize> {
@@ -325,7 +472,7 @@ fn expected_pixel_bytes(image: &ImportedImage) -> Option<usize> {
         .checked_mul(bytes_per_pixel)
 }
 
-fn sampler_config(texture: &ImportedTexture) -> SamplerConfig {
+fn sampler_config(texture: &ImportedTexture, mip_levels: u32) -> SamplerConfig {
     let (mag_filter, min_filter, mipmap_mode) = match texture.min_filter {
         Some(TextureMinFilter::Nearest) => (
             texture.mag_filter,
@@ -370,7 +517,7 @@ fn sampler_config(texture: &ImportedTexture) -> SamplerConfig {
         address_mode_v: address_mode(texture.wrap_t),
         address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
         min_lod: 0.0,
-        max_lod: 0.0,
+        max_lod: (mip_levels - 1) as f32,
         ..SamplerConfig::default()
     }
 }
@@ -384,12 +531,17 @@ fn address_mode(mode: TextureWrapMode) -> vk::SamplerAddressMode {
 }
 
 fn sampler_uses_linear_filter(config: SamplerConfig) -> bool {
-    config.mag_filter == vk::Filter::LINEAR || config.min_filter == vk::Filter::LINEAR
+    config.mag_filter == vk::Filter::LINEAR
+        || config.min_filter == vk::Filter::LINEAR
+        || config.mipmap_mode == vk::SamplerMipmapMode::LINEAR
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{address_mode, expected_pixel_bytes, image_vk_format, sampler_config};
+    use super::{
+        TextureColorSpace, address_mode, expected_pixel_bytes, image_vk_format, mip_level_count,
+        sampler_config, sampler_uses_linear_filter,
+    };
     use ash::vk;
     use z_ideal_assets::{
         ImagePixelFormat, ImportedImage, ImportedTexture, TextureMagFilter, TextureMinFilter,
@@ -425,7 +577,10 @@ mod tests {
                 format,
                 pixels: vec![0; expected_bytes],
             };
-            assert_eq!(image_vk_format(format), expected_format);
+            assert_eq!(
+                image_vk_format(format, TextureColorSpace::Linear).expect("linear format"),
+                expected_format
+            );
             assert_eq!(expected_pixel_bytes(&image), Some(expected_bytes));
         }
     }
@@ -439,7 +594,7 @@ mod tests {
             wrap_s: TextureWrapMode::MirroredRepeat,
             wrap_t: TextureWrapMode::ClampToEdge,
         };
-        let config = sampler_config(&texture);
+        let config = sampler_config(&texture, 5);
         assert_eq!(config.mag_filter, vk::Filter::NEAREST);
         assert_eq!(config.min_filter, vk::Filter::LINEAR);
         assert_eq!(config.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
@@ -448,7 +603,7 @@ mod tests {
             vk::SamplerAddressMode::MIRRORED_REPEAT
         );
         assert_eq!(config.address_mode_v, vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        assert_eq!(config.max_lod, 0.0);
+        assert_eq!(config.max_lod, 4.0);
         assert_eq!(
             address_mode(TextureWrapMode::Repeat),
             vk::SamplerAddressMode::REPEAT
@@ -464,11 +619,43 @@ mod tests {
             wrap_s: TextureWrapMode::Repeat,
             wrap_t: TextureWrapMode::Repeat,
         };
-        let config = sampler_config(&texture);
+        let config = sampler_config(&texture, 1);
         assert_eq!(config.mag_filter, vk::Filter::LINEAR);
         assert_eq!(config.min_filter, vk::Filter::LINEAR);
         assert_eq!(config.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
         assert_eq!(config.min_lod, 0.0);
         assert_eq!(config.max_lod, 0.0);
+    }
+
+    #[test]
+    fn selects_srgb_formats_only_for_supported_eight_bit_channels() {
+        assert_eq!(
+            image_vk_format(ImagePixelFormat::Rgba8, TextureColorSpace::Srgb).expect("sRGB RGBA"),
+            vk::Format::R8G8B8A8_SRGB
+        );
+        assert!(matches!(
+            image_vk_format(ImagePixelFormat::Rgba16, TextureColorSpace::Srgb),
+            Err(super::TextureUploadError::UnsupportedColorSpaceFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn computes_complete_mip_chain_for_non_power_of_two_extents() {
+        assert_eq!(mip_level_count(1, 1), 1);
+        assert_eq!(mip_level_count(2, 2), 2);
+        assert_eq!(mip_level_count(8, 4), 4);
+        assert_eq!(mip_level_count(7, 3), 3);
+    }
+
+    #[test]
+    fn mip_interpolation_requires_linear_sampling_support() {
+        let texture = ImportedTexture {
+            source_image: 0,
+            mag_filter: Some(TextureMagFilter::Nearest),
+            min_filter: Some(TextureMinFilter::NearestMipmapLinear),
+            wrap_s: TextureWrapMode::Repeat,
+            wrap_t: TextureWrapMode::Repeat,
+        };
+        assert!(sampler_uses_linear_filter(sampler_config(&texture, 4)));
     }
 }

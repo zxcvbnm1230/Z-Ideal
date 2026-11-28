@@ -441,3 +441,45 @@ fn enforces_external_image_file_byte_budget() {
         } if resource == "image.png"
     ));
 }
+
+#[test]
+fn truncated_external_buffer_returns_a_structured_import_error() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    fs::write(fixture.0.join("mesh.bin"), [0_u8; 41]).expect("truncate external buffer");
+    let error = GltfImporter::import(&path).expect_err("truncated buffer must fail");
+    println!("truncated buffer error: {error:?}");
+    assert!(matches!(error, GltfImportError::Import { .. }));
+}
+
+#[test]
+fn accessor_extending_beyond_its_buffer_view_is_rejected() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read glTF fixture");
+    let malformed = document.replace(
+        "\"byteOffset\":0,\"byteLength\":36",
+        "\"byteOffset\":0,\"byteLength\":35",
+    );
+    assert_ne!(document, malformed, "fixture buffer view must be found");
+    fs::write(&path, malformed).expect("write malformed accessor fixture");
+    assert!(GltfImporter::import(&path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_external_resource_symlink_that_resolves_outside_project_directory() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = FixtureDir::new();
+    let outside = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let external_target = outside.0.join("outside.bin");
+    fs::write(&external_target, [0_u8; 42]).expect("write external target");
+    fs::remove_file(fixture.0.join("mesh.bin")).expect("remove original resource");
+    symlink(&external_target, fixture.0.join("mesh.bin")).expect("create escaping symlink");
+    assert!(matches!(
+        GltfImporter::import(&path),
+        Err(GltfImportError::InvalidExternalUri { .. })
+    ));
+}

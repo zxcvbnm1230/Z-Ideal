@@ -2,7 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ash::vk;
-use z_ideal_assets::{AssetCache, AssetHandle, AssetId, AssetKind, AssetUri, GltfImport};
+use z_ideal_assets::{
+    AssetCache, AssetHandle, AssetId, AssetKind, AssetUri, GltfImport, ImportedMaterial,
+};
 use z_ideal_renderer::{
     BufferBarrier, CommandBufferRecording, MeshDrawError, MeshGpu, MeshUploadError, VulkanDevice,
     VulkanError, VulkanPipelineLayout,
@@ -200,6 +202,56 @@ impl<'device> VulkanSceneMeshes<'device> {
         Ok(draw_count)
     }
 
+    /// Returns the imported CPU asset pinned for a project-relative source URI.
+    #[must_use]
+    pub fn imported_asset(&self, uri: &AssetUri) -> Option<&GltfImport> {
+        self.assets.get(uri).map(AssetHandle::get)
+    }
+
+    /// Resolves the optional imported material assigned to one uploaded primitive.
+    ///
+    /// The returned material borrows the asset handle pinned by this adapter.
+    pub fn material_for_primitive(
+        &self,
+        uri: &AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+    ) -> Result<Option<&ImportedMaterial>, VulkanSceneMeshesError> {
+        let asset = self
+            .assets
+            .get(uri)
+            .ok_or_else(|| VulkanSceneMeshesError::MissingAsset { uri: uri.clone() })?
+            .get();
+        let mesh = asset
+            .meshes
+            .iter()
+            .find(|mesh| mesh.source_index == mesh_index)
+            .ok_or_else(|| VulkanSceneMeshesError::MissingMesh {
+                uri: uri.clone(),
+                mesh_index,
+            })?;
+        let primitive = mesh.primitives.get(primitive_index).ok_or_else(|| {
+            VulkanSceneMeshesError::MissingPrimitive {
+                uri: uri.clone(),
+                mesh_index,
+                primitive_index,
+            }
+        })?;
+        let Some(material_index) = primitive.material_index else {
+            return Ok(None);
+        };
+        asset
+            .materials
+            .get(material_index)
+            .map(Some)
+            .ok_or_else(|| VulkanSceneMeshesError::MissingMaterial {
+                uri: uri.clone(),
+                mesh_index,
+                primitive_index,
+                material_index,
+            })
+    }
+
     /// Returns the number of distinct GPU primitives owned by this adapter.
     #[must_use]
     pub fn primitive_count(&self) -> usize {
@@ -225,6 +277,23 @@ pub enum VulkanSceneMeshesError {
     /// The imported asset contains duplicate source mesh indices.
     #[error("asset {uri} contains more than one mesh with source index {mesh_index}")]
     AmbiguousMesh { uri: AssetUri, mesh_index: usize },
+    /// The requested source primitive index is outside the imported mesh.
+    #[error("asset {uri} mesh {mesh_index} does not contain primitive {primitive_index}")]
+    MissingPrimitive {
+        uri: AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+    },
+    /// The imported primitive refers to a missing material table entry.
+    #[error(
+        "asset {uri} mesh {mesh_index} primitive {primitive_index} refers to missing material {material_index}"
+    )]
+    MissingMaterial {
+        uri: AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+        material_index: usize,
+    },
     /// The referenced imported mesh contains no primitives.
     #[error("asset {uri} mesh {mesh_index} contains no primitives")]
     EmptyMesh { uri: AssetUri, mesh_index: usize },

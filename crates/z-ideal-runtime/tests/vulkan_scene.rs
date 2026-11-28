@@ -2,18 +2,21 @@ use std::sync::Arc;
 
 use ash::vk;
 use z_ideal_assets::{
-    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, GltfImporter, ImportedMesh,
-    ImportedPrimitive, PrimitiveTopology,
+    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, GltfImporter, ImportedImage,
+    ImportedMesh, ImportedPrimitive, ImportedTexture, PrimitiveTopology, TextureWrapMode,
 };
 use z_ideal_math::{Mat4, PerspectiveCamera, Quat, Transform, Vec3};
 use z_ideal_renderer::{
-    BufferBarrier, BufferConfig, BufferMemoryLocation, CommandPoolConfig, FenceWaitResult,
-    GraphicsPipelineConfig, ImageConfig, ImageViewConfig, MeshUploadError,
-    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
-    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage,
-    TextureUploadError, VulkanBuffer, VulkanCommandPool, VulkanConfig, VulkanDevice,
-    VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage, VulkanInstance, VulkanPipelineLayout,
-    VulkanQueue, VulkanRenderPass, VulkanShaderModule, VulkanTexture2D, compile_glsl,
+    BufferBarrier, BufferConfig, BufferDescriptorWrite, BufferMemoryLocation, CommandPoolConfig,
+    DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize, DescriptorResourceWrite,
+    DescriptorSetLayoutConfig, FenceWaitResult, GraphicsPipelineConfig, ImageConfig,
+    ImageDescriptorWrite, ImageViewConfig, MeshUploadError, RenderPassAttachmentConfig,
+    RenderPassAttachmentReference, RenderPassConfig, RenderPassDependency, RenderPassSubpassConfig,
+    ShaderCompileConfig, ShaderStage, TextureColorSpace, TextureUploadError, VulkanBuffer,
+    VulkanCommandPool, VulkanConfig, VulkanDescriptorPool, VulkanDescriptorSetLayout, VulkanDevice,
+    VulkanFramebuffer, VulkanGraphicsPipeline, VulkanHdrColorTarget, VulkanImage, VulkanInstance,
+    VulkanPipelineLayout, VulkanQueue, VulkanRenderPass, VulkanShaderModule, VulkanTexture2D,
+    compile_glsl,
 };
 use z_ideal_runtime::{
     GltfMeshInstance, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
@@ -94,25 +97,108 @@ fn record_texture_upload(device: &VulkanDevice, texture: &VulkanTexture2D<'_>) {
     );
     drop(submission);
     let view = texture.create_view().expect("create imported texture view");
-    assert_eq!(view.config().level_count, 1);
-    assert_eq!(texture.sampler().config().max_lod, 0.0);
+    assert_eq!(
+        view.config().level_count,
+        texture.image().config().mip_levels
+    );
+    assert_eq!(
+        texture.sampler().config().max_lod,
+        (texture.image().config().mip_levels - 1) as f32
+    );
 }
 
 fn record_scene_draws(
     device: &VulkanDevice,
     gpu_scene: &VulkanSceneMeshes<'_>,
     scene: &RenderSceneSnapshot,
+    imported_texture: Option<&VulkanTexture2D<'_>>,
+    material_factor: [f32; 4],
 ) -> (usize, Vec<u8>) {
     const WIDTH: u32 = 32;
     const HEIGHT: u32 = 32;
-    let image_config = ImageConfig {
+    let fallback_image = ImportedImage {
+        width: 1,
+        height: 1,
+        format: z_ideal_assets::ImagePixelFormat::Rgba8,
+        pixels: vec![255; 4],
+    };
+    let fallback_sampler = ImportedTexture {
+        source_image: 0,
+        mag_filter: None,
+        min_filter: None,
+        wrap_s: TextureWrapMode::Repeat,
+        wrap_t: TextureWrapMode::Repeat,
+    };
+    let fallback_texture = if imported_texture.is_none() {
+        let texture = VulkanTexture2D::new(
+            device,
+            &fallback_image,
+            &fallback_sampler,
+            TextureColorSpace::Srgb,
+        )
+        .expect("create white fallback texture");
+        record_texture_upload(device, &texture);
+        Some(texture)
+    } else {
+        None
+    };
+    let texture = imported_texture
+        .or(fallback_texture.as_ref())
+        .expect("a sampled texture is always supplied");
+    let hdr_target = VulkanHdrColorTarget::new(device, WIDTH, HEIGHT)
+        .expect("create floating-point HDR scene target");
+    let hdr_view = hdr_target.create_view().expect("create HDR scene view");
+    let hdr_render_pass = VulkanRenderPass::new(
+        device,
+        RenderPassConfig {
+            attachments: vec![RenderPassAttachmentConfig {
+                format: z_ideal_renderer::HDR_COLOR_FORMAT,
+                samples: vk::SampleCountFlags::TYPE_1,
+                load_op: vk::AttachmentLoadOp::CLEAR,
+                store_op: vk::AttachmentStoreOp::STORE,
+                stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                final_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }],
+            subpasses: vec![RenderPassSubpassConfig {
+                color_attachments: vec![RenderPassAttachmentReference {
+                    attachment: 0,
+                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                }],
+                ..RenderPassSubpassConfig::default()
+            }],
+            dependencies: vec![RenderPassDependency {
+                source_subpass: 0,
+                destination_subpass: vk::SUBPASS_EXTERNAL,
+                source_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                destination_stage_mask: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                source_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                destination_access_mask: vk::AccessFlags::SHADER_READ,
+                flags: vk::DependencyFlags::BY_REGION,
+            }],
+        },
+    )
+    .expect("create HDR scene render pass");
+    let hdr_framebuffer = VulkanFramebuffer::new(
+        &hdr_render_pass,
+        &[&hdr_view],
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        1,
+    )
+    .expect("create HDR scene framebuffer");
+
+    let output_config = ImageConfig {
         image_type: vk::ImageType::TYPE_2D,
         extent: vk::Extent3D {
             width: WIDTH,
             height: HEIGHT,
             depth: 1,
         },
-        format: vk::Format::R8G8B8A8_UNORM,
+        format: vk::Format::R8G8B8A8_SRGB,
         mip_levels: 1,
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
@@ -120,15 +206,16 @@ fn record_scene_draws(
         usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
         flags: vk::ImageCreateFlags::empty(),
     };
-    let image = VulkanImage::new(device, image_config).expect("create scene color target");
-    let image_view = image
+    let output_image =
+        VulkanImage::new(device, output_config).expect("create tone-mapped output target");
+    let output_view = output_image
         .create_view(ImageViewConfig::default())
-        .expect("create scene color target view");
-    let render_pass = VulkanRenderPass::new(
+        .expect("create tone-mapped output view");
+    let tone_render_pass = VulkanRenderPass::new(
         device,
         RenderPassConfig {
             attachments: vec![RenderPassAttachmentConfig {
-                format: image_config.format,
+                format: output_config.format,
                 samples: vk::SampleCountFlags::TYPE_1,
                 load_op: vk::AttachmentLoadOp::CLEAR,
                 store_op: vk::AttachmentStoreOp::STORE,
@@ -155,22 +242,98 @@ fn record_scene_draws(
             }],
         },
     )
-    .expect("create scene render pass");
-    let framebuffer = VulkanFramebuffer::new(
-        &render_pass,
-        &[&image_view],
+    .expect("create tone-mapping render pass");
+    let tone_framebuffer = VulkanFramebuffer::new(
+        &tone_render_pass,
+        &[&output_view],
         vk::Extent2D {
             width: WIDTH,
             height: HEIGHT,
         },
         1,
     )
-    .expect("create scene framebuffer");
+    .expect("create tone-mapping framebuffer");
+
+    let descriptor_layout = VulkanDescriptorSetLayout::new(
+        device,
+        DescriptorSetLayoutConfig {
+            bindings: vec![
+                DescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                },
+                DescriptorBinding {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                },
+            ],
+        },
+    )
+    .expect("create glTF material descriptor layout");
+    let descriptor_pool = VulkanDescriptorPool::new(
+        device,
+        DescriptorPoolConfig {
+            max_sets: 1,
+            pool_sizes: vec![
+                DescriptorPoolSize {
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: 1,
+                },
+                DescriptorPoolSize {
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: 1,
+                },
+            ],
+        },
+    )
+    .expect("create glTF material descriptor pool");
+    let mut descriptor_set = descriptor_pool
+        .allocate_set(&descriptor_layout)
+        .expect("allocate glTF material descriptor set");
+    let texture_view = texture.create_view().expect("create sampled texture view");
+    let material_bytes: Vec<u8> = material_factor
+        .iter()
+        .flat_map(|component| component.to_ne_bytes())
+        .collect();
+    let mut material_buffer = VulkanBuffer::new(
+        device,
+        BufferConfig {
+            size: material_bytes.len() as u64,
+            usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+            memory: BufferMemoryLocation::Upload,
+        },
+    )
+    .expect("create material factor uniform buffer");
+    material_buffer
+        .write(0, &material_bytes)
+        .expect("write material factor uniform data");
+    let descriptor_lease = descriptor_set
+        .write_descriptors(&[
+            DescriptorResourceWrite::Image(ImageDescriptorWrite {
+                binding: 0,
+                array_element: 0,
+                view: &texture_view,
+                sampler: Some(texture.sampler()),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }),
+            DescriptorResourceWrite::Buffer(BufferDescriptorWrite {
+                binding: 1,
+                array_element: 0,
+                buffer: &material_buffer,
+                offset: 0,
+                range: material_bytes.len() as u64,
+            }),
+        ])
+        .expect("write glTF material texture and factor descriptors");
 
     let vertex_shader = VulkanShaderModule::new(
         device,
         compile_glsl(
-            "#version 450\nlayout(location=0) in vec3 position;\nlayout(location=1) in vec2 tex_coord;\nlayout(push_constant) uniform Draw { mat4 mvp; } draw_data;\nvoid main() { gl_Position = draw_data.mvp * vec4(position, 1.0); }",
+            "#version 450\nlayout(location=0) in vec3 position;\nlayout(location=1) in vec2 tex_coord;\nlayout(location=0) out vec2 uv;\nlayout(push_constant) uniform Draw { mat4 mvp; } draw_data;\nvoid main() { gl_Position = draw_data.mvp * vec4(position, 1.0); uv = tex_coord; }",
             &ShaderCompileConfig::new(ShaderStage::Vertex),
         )
         .expect("compile scene vertex shader"),
@@ -179,7 +342,7 @@ fn record_scene_draws(
     let fragment_shader = VulkanShaderModule::new(
         device,
         compile_glsl(
-            "#version 450\nlayout(location=0) out vec4 output_color;\nvoid main() { output_color = vec4(1.0, 0.25, 0.0, 1.0); }",
+            "#version 450\nlayout(set=0,binding=0) uniform sampler2D base_color_texture;\nlayout(set=0,binding=1) uniform Material { vec4 base_color_factor; } material;\nlayout(location=0) in vec2 uv;\nlayout(location=0) out vec4 output_color;\nvoid main() { output_color = texture(base_color_texture, uv) * material.base_color_factor * 4.0; }",
             &ShaderCompileConfig::new(ShaderStage::Fragment),
         )
         .expect("compile scene fragment shader"),
@@ -189,13 +352,13 @@ fn record_scene_draws(
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
         .size(64)];
-    let pipeline_layout = VulkanPipelineLayout::new(device, &[], &push_constants)
+    let pipeline_layout = VulkanPipelineLayout::new(device, &[&descriptor_layout], &push_constants)
         .expect("create scene pipeline layout");
     let pipeline = VulkanGraphicsPipeline::new(
         &pipeline_layout,
         &vertex_shader,
         &fragment_shader,
-        &render_pass,
+        &hdr_render_pass,
         &GraphicsPipelineConfig {
             vertex_bindings: vec![z_ideal_renderer::MeshGpu::vertex_binding()],
             vertex_attributes: z_ideal_renderer::MeshGpu::vertex_attributes().to_vec(),
@@ -203,6 +366,70 @@ fn record_scene_draws(
         },
     )
     .expect("create scene graphics pipeline");
+
+    let tone_descriptor_layout = VulkanDescriptorSetLayout::new(
+        device,
+        DescriptorSetLayoutConfig {
+            bindings: vec![DescriptorBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            }],
+        },
+    )
+    .expect("create tone-map descriptor layout");
+    let tone_descriptor_pool = VulkanDescriptorPool::new(
+        device,
+        DescriptorPoolConfig {
+            max_sets: 1,
+            pool_sizes: vec![DescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 1,
+            }],
+        },
+    )
+    .expect("create tone-map descriptor pool");
+    let mut tone_descriptor_set = tone_descriptor_pool
+        .allocate_set(&tone_descriptor_layout)
+        .expect("allocate tone-map descriptor set");
+    let tone_descriptor_lease = tone_descriptor_set
+        .write_descriptors(&[DescriptorResourceWrite::Image(ImageDescriptorWrite {
+            binding: 0,
+            array_element: 0,
+            view: &hdr_view,
+            sampler: Some(texture.sampler()),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        })])
+        .expect("write HDR sampled-image descriptor");
+    let tone_vertex_shader = VulkanShaderModule::new(
+        device,
+        compile_glsl(
+            "#version 450\nlayout(location=0) out vec2 uv;\nvoid main() { vec2 p[3] = vec2[](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0)); vec2 pos = p[gl_VertexIndex]; gl_Position = vec4(pos,0.0,1.0); uv = pos * 0.5 + 0.5; }",
+            &ShaderCompileConfig::new(ShaderStage::Vertex),
+        )
+        .expect("compile tone-map vertex shader"),
+    )
+    .expect("create tone-map vertex module");
+    let tone_fragment_shader = VulkanShaderModule::new(
+        device,
+        compile_glsl(
+            "#version 450\nlayout(set=0,binding=0) uniform sampler2D hdr_color;\nlayout(location=0) in vec2 uv;\nlayout(location=0) out vec4 output_color;\nvoid main() { vec3 hdr = texture(hdr_color, uv).rgb; vec3 mapped = hdr / (vec3(1.0) + hdr); output_color = vec4(mapped, 1.0); }",
+            &ShaderCompileConfig::new(ShaderStage::Fragment),
+        )
+        .expect("compile tone-map fragment shader"),
+    )
+    .expect("create tone-map fragment module");
+    let tone_pipeline_layout = VulkanPipelineLayout::new(device, &[&tone_descriptor_layout], &[])
+        .expect("create tone-map pipeline layout");
+    let tone_pipeline = VulkanGraphicsPipeline::new(
+        &tone_pipeline_layout,
+        &tone_vertex_shader,
+        &tone_fragment_shader,
+        &tone_render_pass,
+        &GraphicsPipelineConfig::default(),
+    )
+    .expect("create tone-map graphics pipeline");
 
     let mut readback = VulkanBuffer::new(
         device,
@@ -230,11 +457,20 @@ fn record_scene_draws(
         .record_upload_barriers(&mut recording)
         .expect("synchronize uploaded scene mesh buffers");
     recording
-        .begin_render_pass(&render_pass, &framebuffer, &clear)
+        .begin_render_pass(&hdr_render_pass, &hdr_framebuffer, &clear)
         .expect("begin scene render pass");
     recording
         .bind_graphics_pipeline(&pipeline)
         .expect("bind scene graphics pipeline");
+    recording
+        .bind_descriptor_sets(
+            vk::PipelineBindPoint::GRAPHICS,
+            &pipeline_layout,
+            0,
+            &[descriptor_lease.as_ref()],
+            &[],
+        )
+        .expect("bind glTF material descriptors");
     recording
         .set_viewport(vk::Viewport {
             x: 0.0,
@@ -257,7 +493,47 @@ fn record_scene_draws(
     let draw_count = gpu_scene
         .record_draws(scene, &mut recording, &pipeline_layout)
         .expect("record runtime scene draws");
-    recording.end_render_pass().expect("end scene render pass");
+    recording
+        .end_render_pass()
+        .expect("end HDR scene render pass");
+    recording
+        .begin_render_pass(&tone_render_pass, &tone_framebuffer, &clear)
+        .expect("begin tone-mapping pass");
+    recording
+        .bind_graphics_pipeline(&tone_pipeline)
+        .expect("bind tone-map pipeline");
+    recording
+        .bind_descriptor_sets(
+            vk::PipelineBindPoint::GRAPHICS,
+            &tone_pipeline_layout,
+            0,
+            &[tone_descriptor_lease.as_ref()],
+            &[],
+        )
+        .expect("bind HDR image for tone mapping");
+    recording
+        .set_viewport(vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: WIDTH as f32,
+            height: HEIGHT as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        })
+        .expect("set tone-map viewport");
+    recording
+        .set_scissor(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+        })
+        .expect("set tone-map scissor");
+    recording
+        .draw(3, 1, 0, 0)
+        .expect("draw full-screen tone-map triangle");
+    recording.end_render_pass().expect("end tone-mapping pass");
     let copy_region = [vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(0)
@@ -277,7 +553,7 @@ fn record_scene_draws(
         })];
     recording
         .copy_image_to_buffer(
-            &image,
+            &output_image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             &readback,
             &copy_region,
@@ -369,12 +645,31 @@ fn snapshot_mesh_references_resolve_upload_and_record_draws_validation_clean() {
     let gpu_scene = VulkanSceneMeshes::upload(&device, &cache, &scene_snapshot)
         .expect("resolve and upload snapshot");
     assert_eq!(gpu_scene.asset_count(), 1);
+    assert!(
+        gpu_scene
+            .material_for_primitive(&uri, 0, 0)
+            .expect("resolve unmaterialed primitive")
+            .is_none()
+    );
+    assert!(matches!(
+        gpu_scene.material_for_primitive(&uri, 0, 1),
+        Err(VulkanSceneMeshesError::MissingPrimitive {
+            primitive_index: 1,
+            ..
+        })
+    ));
     assert_eq!(
         gpu_scene.primitive_count(),
         1,
         "shared mesh uploaded more than once"
     );
-    let (draw_count, pixels) = record_scene_draws(&device, &gpu_scene, &scene_snapshot);
+    let (draw_count, pixels) = record_scene_draws(
+        &device,
+        &gpu_scene,
+        &scene_snapshot,
+        None,
+        [1.0, 0.2, 0.0, 1.0],
+    );
     assert_eq!(
         draw_count, 2,
         "one draw per primitive instance should be recorded"
@@ -382,7 +677,7 @@ fn snapshot_mesh_references_resolve_upload_and_record_draws_validation_clean() {
     let center = &pixels[((16 * 32 + 16) * 4)..][..4];
     assert_eq!(
         center,
-        &[255, 64, 0, 255],
+        &[231, 178, 0, 255],
         "unexpected scene pixel: {center:?}"
     );
     assert_eq!(&pixels[..4], &[0, 0, 0, 255], "unexpected clear pixel");
@@ -460,22 +755,64 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
         .expect("create Vulkan instance with validation enabled"),
     );
     let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan device");
-    let texture = VulkanTexture2D::from_import(&device, &imported, 0)
-        .expect("create Vulkan image and sampler from imported texture");
-    record_texture_upload(&device, &texture);
+    let mip_image = ImportedImage {
+        width: 7,
+        height: 3,
+        format: z_ideal_assets::ImagePixelFormat::Rgba8,
+        pixels: vec![127; 7 * 3 * 4],
+    };
+    let mip_sampler = ImportedTexture {
+        source_image: 0,
+        mag_filter: None,
+        min_filter: None,
+        wrap_s: TextureWrapMode::Repeat,
+        wrap_t: TextureWrapMode::MirroredRepeat,
+    };
+    let mip_texture =
+        VulkanTexture2D::new(&device, &mip_image, &mip_sampler, TextureColorSpace::Linear)
+            .expect("create 7x3 texture with a complete mip chain");
+    assert_eq!(mip_texture.image().config().mip_levels, 3);
+    record_texture_upload(&device, &mip_texture);
     let gpu_scene = VulkanSceneMeshes::upload(&device, &cache, &scene_snapshot)
         .expect("upload imported scene meshes");
-    let (draw_count, pixels) = record_scene_draws(&device, &gpu_scene, &scene_snapshot);
+    let material = gpu_scene
+        .material_for_primitive(&source_uri, 0, 0)
+        .expect("resolve source primitive material")
+        .expect("sample primitive declares a material");
+    assert_eq!(material.base_color_texture, Some(0));
+    assert_eq!(material.base_color_factor, [1.0, 0.2, 0.0, 1.0]);
+    let pinned_import = gpu_scene
+        .imported_asset(&source_uri)
+        .expect("scene adapter pins imported asset");
+    let texture_index = material
+        .base_color_texture
+        .expect("base-color texture reference");
+    let texture = VulkanTexture2D::from_import(
+        &device,
+        pinned_import,
+        texture_index,
+        TextureColorSpace::Srgb,
+    )
+    .expect("create Vulkan image and sampler from imported base-color texture");
+    record_texture_upload(&device, &texture);
+    let (draw_count, pixels) = record_scene_draws(
+        &device,
+        &gpu_scene,
+        &scene_snapshot,
+        Some(&texture),
+        material.base_color_factor,
+    );
     assert_eq!(draw_count, 1, "expected one imported primitive draw");
     let center = &pixels[((16 * 32 + 16) * 4)..][..4];
     assert_eq!(
         center,
-        &[255, 64, 0, 255],
+        &[231, 178, 0, 255],
         "unexpected rendered sample pixel: {center:?}"
     );
     assert_eq!(&pixels[..4], &[0, 0, 0, 255], "unexpected clear pixel");
 
     drop(gpu_scene);
+    drop(mip_texture);
     drop(texture);
     drop(device);
     let validation_errors: Vec<_> = instance

@@ -828,19 +828,20 @@ fn import_buffers_with_limits(
                 )?)
             }
         };
-        while data.0.len() % 4 != 0 {
-            data.0.push(0);
-        }
-        if data.len() < source_buffer.length() {
+        let actual_length = data.0.len();
+        if actual_length < source_buffer.length() {
             return Err(GltfImportError::Import {
                 path: source_path.to_path_buf(),
                 message: format!(
                     "buffer {} contains {} bytes but declares {}",
                     source_buffer.index(),
-                    data.len(),
+                    actual_length,
                     source_buffer.length()
                 ),
             });
+        }
+        while data.0.len() % 4 != 0 {
+            data.0.push(0);
         }
         imported_buffers.push(data);
     }
