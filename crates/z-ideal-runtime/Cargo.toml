@@ -7,3 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+z-ideal-assets = { path = "../z-ideal-assets" }
+z-ideal-math = { path = "../z-ideal-math" }
+z-ideal-scene = { path = "../z-ideal-scene" }
+serde.workspace = true
+thiserror.workspace = true

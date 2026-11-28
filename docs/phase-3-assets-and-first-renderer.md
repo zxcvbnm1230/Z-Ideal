@@ -31,13 +31,14 @@
 
 - PerspectiveCamera validates field of view, aspect ratio, and near/far planes and builds a right-handed zero-to-one-depth projection. Its aspect ratio can be updated after drawable-size changes.
 - PerspectiveCamera is registered as a validated scene component with stable ID z_ideal.camera.perspective.
+- The runtime crate instantiates selected glTF scenes transactionally into ECS entities. It preserves local transforms, parent/child relationships, optional node names, source node indices, and mesh-instance references to a project-relative source URI and imported mesh index. It supports explicit scene selection and the declared default scene. Malformed reachable hierarchy data is rejected before entities are created; ECS failures trigger rollback of entities created by the operation. Runtime components participate in versioned scene serialization.
 - MeshGpu validates triangle-list geometry and uploads interleaved position/UV vertices plus 32-bit indices into explicitly owned Vulkan upload buffers. Its vertex layout is exposed as matching Vulkan binding/attribute descriptions.
 
 ## Known limitations and next work
 
 - Import currently delegates file loading and image decoding to gltf/image without configurable pre-allocation byte or pixel budgets. Treat project imports as trusted input until bounded external-resource loading is implemented.
 - Image channel formats and decoded bytes are preserved; color-space interpretation, GPU texture upload, mip generation, and sampler creation from imported texture state are not yet integrated.
-- Imported node hierarchies are currently CPU asset data only; runtime/ECS instantiation and preservation of skins, morph targets, animations, tangents, and extension-defined material behavior remain outstanding.
+- ECS instantiation preserves node transforms, hierarchy, names, and mesh references, but does not yet instantiate skinning, morph targets, animation channels, tangents, or extension-defined material behavior.
 - Asset catalog registration is currently an explicit API; the importer does not yet compute a complete transitive content fingerprint or automatically populate metadata and dependency records.
 - MeshGpu is an initial indexed triangle-list upload path only. It uses host-visible upload memory and leaves host/GPU barriers to the caller. It is not yet a scene renderer or a production mesh-draw abstraction.
 - The render path still needs scene extraction, camera view/projection binding, depth-tested mesh rendering, HDR color targets, tone mapping, deterministic sample-scene fixtures, and GPU image regression checks.
@@ -49,10 +50,10 @@ Full workspace checks passed on the connected Linux host:
 
 - cargo fmt --all -- --check — passed.
 - cargo clippy --workspace --all-targets --all-features -- -D warnings — passed.
-- cargo test --workspace --all-features — 195 passed, 2 GPU integration tests ignored by default, 0 failures.
+- cargo test --workspace --all-features — 203 passed, 2 GPU integration tests ignored by default, 0 failed.
 - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps — passed.
 
-The asset tests cover identity, metadata, cache lifetime, dependency graph behavior, glTF/GLB mesh import, embedded image decoding, material texture references, external dependency reporting, path-traversal rejection, malformed primitives, invalid indices, and topology-specific index counts. The renderer has CPU-side mesh-layout tests.
+The asset tests cover identity, metadata, cache lifetime, dependency graph behavior, glTF/GLB mesh and node import, embedded image decoding, material texture references, external dependency reporting, path-traversal rejection, malformed primitives, invalid indices, and topology-specific index counts. Runtime tests cover default-scene selection, entity/node mapping, transforms, hierarchy, mesh-instance references, transactional validation failures, and scene serialization round trips. The renderer has CPU-side mesh-layout tests.
 
 The ignored offscreen Vulkan integration test was also run manually with VK_LAYER_KHRONOS_validation on an NVIDIA GeForce 940MX. It uploaded and drew the indexed MeshGpu triangle, exercised the graphics-family-0 / transfer-family-1 ownership path, performed image readback and deterministic pixel checks, and passed without validation errors.
 
