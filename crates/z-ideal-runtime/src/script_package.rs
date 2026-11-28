@@ -126,7 +126,10 @@ mod tests {
             .expect("cook package");
 
         let package = RuntimeScriptPackage::open(&package_dir).expect("open package");
-        assert_eq!(package.directory(), package_dir);
+        assert_eq!(
+            package.directory(),
+            fs::canonicalize(&package_dir).expect("canonical package path")
+        );
         assert!(package.directory().is_absolute());
         assert_eq!(package.len(), 2);
         assert!(!package.is_empty());
