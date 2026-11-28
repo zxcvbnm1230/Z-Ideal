@@ -9,7 +9,7 @@ license.workspace = true
 [dependencies]
 gltf.workspace = true
 base64.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["hdr"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

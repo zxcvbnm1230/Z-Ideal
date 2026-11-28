@@ -30,7 +30,7 @@ This is a dependency-ordered roadmap, not a claim that these systems are already
 
 ## Phase 3 — Asset pipeline and first renderer
 
-Currently in progress: see [Phase 3 status](phase-3-assets-and-first-renderer.md).
+**Complete and validated.** See [Phase 3 status](phase-3-assets-and-first-renderer.md).
 - glTF 2.0/GLB import, textures, material conversion.
 - Asset handles, cache, dependency graph and metadata.
 - Mesh rendering, camera, depth, HDR target and tone mapping.
@@ -38,6 +38,8 @@ Currently in progress: see [Phase 3 status](phase-3-assets-and-first-renderer.md
 **Exit gate:** deterministic sample scene rendering and robust malformed-asset handling.
 
 ## Phase 4 — PBR and lighting
+
+Currently in progress: see [Phase 4 status](phase-4-pbr-and-lighting.md).
 - Metallic-roughness materials and texture slots.
 - HDRI import, irradiance and prefiltered environment maps.
 - Directional/point/spot lighting as scoped.
