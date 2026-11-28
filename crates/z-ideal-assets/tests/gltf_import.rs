@@ -182,3 +182,63 @@ fn malformed_document_returns_an_error_instead_of_panicking() {
     .expect("write malformed fixture");
     assert!(GltfImporter::import(&path).is_err());
 }
+
+#[test]
+fn imports_scene_nodes_transforms_mesh_instances_and_roots() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read fixture");
+    let document = document
+        .replace(
+            r#""nodes":[{"mesh":0}]"#,
+            r#""nodes":[
+                {"name":"root","translation":[1.0,2.0,3.0],"children":[1]},
+                {"name":"mesh-node","rotation":[0.0,0.0,0.7071068,0.7071068],"scale":[2.0,2.0,2.0],"mesh":0}
+            ]"#,
+        )
+        .replace(
+            r#""scenes":[{"nodes":[0]}]"#,
+            r#""scenes":[{"name":"main","nodes":[0]}]"#,
+        );
+    fs::write(&path, document).expect("write hierarchy fixture");
+
+    let imported = GltfImporter::import(&path).expect("valid node hierarchy");
+    assert_eq!(imported.nodes.len(), 2);
+    assert_eq!(imported.nodes[0].source_index, 0);
+    assert_eq!(imported.nodes[0].name.as_deref(), Some("root"));
+    assert_eq!(imported.nodes[0].translation, [1.0, 2.0, 3.0]);
+    assert_eq!(imported.nodes[0].children, vec![1]);
+    assert_eq!(imported.nodes[1].name.as_deref(), Some("mesh-node"));
+    assert_eq!(imported.nodes[1].mesh_index, Some(0));
+    assert_eq!(imported.nodes[1].scale, [2.0, 2.0, 2.0]);
+    assert_eq!(imported.scenes.len(), 1);
+    assert_eq!(imported.scenes[0].name.as_deref(), Some("main"));
+    assert_eq!(imported.scenes[0].root_nodes, vec![0]);
+    assert_eq!(imported.default_scene, Some(0));
+}
+
+#[test]
+fn rejects_cyclic_node_hierarchies() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read fixture");
+    let document = document.replace(
+        r#""nodes":[{"mesh":0}]"#,
+        r#""nodes":[{"children":[1]},{"children":[0],"mesh":0}]"#,
+    );
+    fs::write(&path, document).expect("write cyclic fixture");
+    assert!(GltfImporter::import(&path).is_err());
+}
+
+#[test]
+fn rejects_nodes_with_multiple_parents() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read fixture");
+    let document = document.replace(
+        r#""nodes":[{"mesh":0}]"#,
+        r#""nodes":[{"children":[2]},{"children":[2]},{"mesh":0}]"#,
+    );
+    fs::write(&path, document).expect("write multi-parent fixture");
+    assert!(GltfImporter::import(&path).is_err());
+}

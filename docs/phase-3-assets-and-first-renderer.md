@@ -22,7 +22,7 @@
 ### glTF import
 
 - Pinned gltf 1.4.1 parses glTF 2.0 JSON and GLB, external and data-URI buffers/images, and decodes source images.
-- Mesh primitives preserve topology, positions, optional normals and UV0, indices, and explicit material references. Missing indices become sequential indices. Position/normal/UV finiteness, attribute counts, index bounds, and triangle index counts are checked.
+- Mesh primitives preserve topology, positions, optional normals and UV0, indices, and explicit material references. Nodes preserve source indices, names, validated local TRS transforms, mesh references, and ordered child indices; scenes preserve named root-node lists and the declared default scene. The importer rejects out-of-range child/mesh/root references, multiple parents, cyclic hierarchies, and scene roots that are also children. Missing indices become sequential indices. Position/normal/UV finiteness, attribute counts, index bounds, and triangle index counts are checked.
 - Metallic-roughness materials preserve base color, metallic and roughness factors, alpha mode/cutoff, double-sided state, and base-color, metallic-roughness, normal, occlusion, and emissive texture indices.
 - Texture source-image references, filters, and wrapping modes are converted to engine-facing types. Embedded data URIs are not reported as external catalog dependencies. External paths are percent-decoded, constrained to the source directory, and canonicalized before resource loading; absolute paths, URI schemes, traversal, missing files, and symlink escapes are rejected.
 - Parser-specific glTF types do not leak through the public asset import structures.
@@ -37,7 +37,7 @@
 
 - Import currently delegates file loading and image decoding to gltf/image without configurable pre-allocation byte or pixel budgets. Treat project imports as trusted input until bounded external-resource loading is implemented.
 - Image channel formats and decoded bytes are preserved; color-space interpretation, GPU texture upload, mip generation, and sampler creation from imported texture state are not yet integrated.
-- Mesh import does not yet instantiate glTF node hierarchies into ECS entities or preserve skins, morph targets, animations, tangents, and extension-defined material behavior.
+- Imported node hierarchies are currently CPU asset data only; runtime/ECS instantiation and preservation of skins, morph targets, animations, tangents, and extension-defined material behavior remain outstanding.
 - Asset catalog registration is currently an explicit API; the importer does not yet compute a complete transitive content fingerprint or automatically populate metadata and dependency records.
 - MeshGpu is an initial indexed triangle-list upload path only. It uses host-visible upload memory and leaves host/GPU barriers to the caller. It is not yet a scene renderer or a production mesh-draw abstraction.
 - The render path still needs scene extraction, camera view/projection binding, depth-tested mesh rendering, HDR color targets, tone mapping, deterministic sample-scene fixtures, and GPU image regression checks.

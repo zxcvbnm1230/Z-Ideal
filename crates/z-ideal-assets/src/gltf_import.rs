@@ -75,6 +75,12 @@ pub struct GltfImport {
     pub source_path: PathBuf,
     /// Imported mesh definitions and primitives.
     pub meshes: Vec<ImportedMesh>,
+    /// All source nodes in document-index order, including nodes not selected by a scene.
+    pub nodes: Vec<ImportedNode>,
+    /// Scene roots referencing indices in `nodes`.
+    pub scenes: Vec<ImportedScene>,
+    /// Index of the document's default scene, when one is declared.
+    pub default_scene: Option<usize>,
     /// Explicitly defined materials.
     pub materials: Vec<ImportedMaterial>,
     /// Sampler/texture-to-image mappings.
@@ -94,6 +100,36 @@ pub struct ImportedMesh {
     /// Imported primitives.
     pub primitives: Vec<ImportedPrimitive>,
 }
+/// Imported glTF node with a validated local TRS transform and source mesh reference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedNode {
+    /// Source node index; stable within this source document.
+    pub source_index: usize,
+    /// Optional source name.
+    pub name: Option<String>,
+    /// Local translation in engine coordinates.
+    pub translation: [f32; 3],
+    /// Local rotation as an XYZW quaternion.
+    pub rotation_xyzw: [f32; 4],
+    /// Local scale.
+    pub scale: [f32; 3],
+    /// Referenced imported mesh index.
+    pub mesh_index: Option<usize>,
+    /// Child node indices in source order.
+    pub children: Vec<usize>,
+}
+
+/// Imported glTF scene and its root node indices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedScene {
+    /// Source scene index.
+    pub source_index: usize,
+    /// Optional source name.
+    pub name: Option<String>,
+    /// Root nodes in source order.
+    pub root_nodes: Vec<usize>,
+}
+
 /// Imported mesh primitive data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedPrimitive {
@@ -204,6 +240,23 @@ pub enum GltfImportError {
         material: usize,
         texture: usize,
     },
+    /// A node has an invalid reference, transform, parent count, or cyclic relationship.
+    #[error("glTF {path} node {node}: {reason}")]
+    InvalidNode {
+        path: PathBuf,
+        node: usize,
+        reason: String,
+    },
+    /// A scene refers to a node outside the imported node table.
+    #[error("glTF {path} scene {scene} refers to missing root node {node}")]
+    MissingSceneNode {
+        path: PathBuf,
+        scene: usize,
+        node: usize,
+    },
+    /// The default scene index is outside the imported scene table.
+    #[error("glTF {path} declares missing default scene {scene}")]
+    MissingDefaultScene { path: PathBuf, scene: usize },
 }
 
 /// glTF 2.0 importer.
@@ -467,11 +520,97 @@ impl GltfImporter {
             });
         }
 
+        let imported_nodes = document
+            .nodes()
+            .map(|node| {
+                let (translation, rotation_xyzw, scale) = node.transform().decomposed();
+                let mesh_index = node.mesh().map(|mesh| mesh.index());
+                if mesh_index.is_some_and(|index| index >= imported_meshes.len()) {
+                    return Err(GltfImportError::InvalidNode {
+                        path: source_path.clone(),
+                        node: node.index(),
+                        reason: "mesh reference is outside the imported mesh table".to_owned(),
+                    });
+                }
+                let children = node
+                    .children()
+                    .map(|child| child.index())
+                    .collect::<Vec<_>>();
+                if translation
+                    .iter()
+                    .chain(rotation_xyzw.iter())
+                    .chain(scale.iter())
+                    .any(|value| !value.is_finite())
+                {
+                    return Err(GltfImportError::InvalidNode {
+                        path: source_path.clone(),
+                        node: node.index(),
+                        reason: "transform components must be finite".to_owned(),
+                    });
+                }
+                let rotation_length = rotation_xyzw.iter().map(|value| value * value).sum::<f32>();
+                if !rotation_length.is_finite() || rotation_length <= f32::EPSILON {
+                    return Err(GltfImportError::InvalidNode {
+                        path: source_path.clone(),
+                        node: node.index(),
+                        reason: "rotation quaternion must have non-zero finite length".to_owned(),
+                    });
+                }
+                Ok(ImportedNode {
+                    source_index: node.index(),
+                    name: node.name().map(str::to_owned),
+                    translation,
+                    rotation_xyzw,
+                    scale,
+                    mesh_index,
+                    children,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let node_parents = validate_node_graph(&source_path, &imported_nodes)?;
+        let imported_scenes = document
+            .scenes()
+            .map(|scene| {
+                let root_nodes = scene.nodes().map(|node| node.index()).collect::<Vec<_>>();
+                for node in &root_nodes {
+                    if *node >= imported_nodes.len() {
+                        return Err(GltfImportError::MissingSceneNode {
+                            path: source_path.clone(),
+                            scene: scene.index(),
+                            node: *node,
+                        });
+                    }
+                    if node_parents[*node].is_some() {
+                        return Err(GltfImportError::InvalidNode {
+                            path: source_path.clone(),
+                            node: *node,
+                            reason: "scene root is also a child of another node".to_owned(),
+                        });
+                    }
+                }
+                Ok(ImportedScene {
+                    source_index: scene.index(),
+                    name: scene.name().map(str::to_owned),
+                    root_nodes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let default_scene = document.default_scene().map(|scene| scene.index());
+        if default_scene.is_some_and(|index| index >= imported_scenes.len()) {
+            return Err(GltfImportError::MissingDefaultScene {
+                path: source_path.clone(),
+                scene: default_scene.unwrap_or(usize::MAX),
+            });
+        }
+
         let dependency_uris = external_dependencies.into_iter().collect();
 
         Ok(GltfImport {
             source_path,
             meshes: imported_meshes,
+            nodes: imported_nodes,
+            scenes: imported_scenes,
+            default_scene,
             materials: imported_materials,
             textures: imported_textures,
             images: imported_images,
@@ -479,6 +618,60 @@ impl GltfImporter {
         })
     }
 }
+
+fn validate_node_graph(
+    path: &Path,
+    nodes: &[ImportedNode],
+) -> Result<Vec<Option<usize>>, GltfImportError> {
+    let mut parent_of = vec![None; nodes.len()];
+    for node in nodes {
+        for child in &node.children {
+            if *child >= nodes.len() {
+                return Err(GltfImportError::InvalidNode {
+                    path: path.to_path_buf(),
+                    node: node.source_index,
+                    reason: format!("child node index {child} is outside the node table"),
+                });
+            }
+            if parent_of[*child].replace(node.source_index).is_some() {
+                return Err(GltfImportError::InvalidNode {
+                    path: path.to_path_buf(),
+                    node: *child,
+                    reason: "node has more than one parent".to_owned(),
+                });
+            }
+        }
+    }
+
+    // Follow the single-parent links iteratively so adversarially deep input cannot
+    // exhaust the call stack during cycle validation.
+    let mut state = vec![0_u8; nodes.len()];
+    for start in 0..nodes.len() {
+        let mut path_nodes = Vec::new();
+        let mut cursor = Some(start);
+        while let Some(index) = cursor {
+            match state[index] {
+                1 => {
+                    return Err(GltfImportError::InvalidNode {
+                        path: path.to_path_buf(),
+                        node: index,
+                        reason: "node hierarchy contains a cycle".to_owned(),
+                    });
+                }
+                2 => break,
+                _ => {}
+            }
+            state[index] = 1;
+            path_nodes.push(index);
+            cursor = parent_of[index];
+        }
+        for index in path_nodes {
+            state[index] = 2;
+        }
+    }
+    Ok(parent_of)
+}
+
 fn valid_index_count(mode: PrimitiveTopology, count: usize) -> bool {
     match mode {
         PrimitiveTopology::Points => count >= 1,
