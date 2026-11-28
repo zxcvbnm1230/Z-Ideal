@@ -39,7 +39,7 @@ This is a dependency-ordered roadmap, not a claim that these systems are already
 
 ## Phase 4 — PBR and lighting
 
-Currently in progress: see [Phase 4 status](phase-4-pbr-and-lighting.md).
+**Complete and validated.** See [Phase 4 status](phase-4-pbr-and-lighting.md).
 - Metallic-roughness materials and texture slots.
 - HDRI import, irradiance and prefiltered environment maps.
 - Directional/point/spot lighting as scoped.

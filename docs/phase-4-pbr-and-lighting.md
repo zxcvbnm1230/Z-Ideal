@@ -1,6 +1,6 @@
 # Phase 4 — PBR and lighting
 
-**Status:** in progress. Implemented foundations include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, GGX roughness-prefiltered specular mip generation/upload, runtime PBR image-based lighting, directional PCF shadows, and depth-based SSAO compute/compositing.
+**Status:** complete and validated. The selected Phase 4 scope includes bounded scene-linear HDRI import, diffuse/specular environment lighting, metallic-roughness PBR, directional/point/spot direct lights, directional PCF shadows, depth-based SSAO, and deterministic reference-image regression.
 
 ## Roadmap scope
 
@@ -9,7 +9,7 @@
 - Directional, point, and spot lighting as scoped.
 - Directional filtered shadow maps and screen-space ambient occlusion (SSAO); point/spot shadow maps and cascades are not currently selected.
 
-**Exit gate:** reference scenes and deterministic image-regression tests with documented tolerances. Phase 4 remains open until all selected lighting paths and regression scenes meet this gate.
+**Exit gate:** met. The two-material PBR reference scene exercises directional, point, and spot lighting, directional PCF, environment lighting, and AO composition. The 32x32 RGBA8 golden uses exact alpha, a 16/255 per-channel tolerance, and at most 16 edge-pixel outliers; the separate SSAO regression checks a synthetic depth discontinuity.
 
 ## Implemented foundation
 
@@ -31,12 +31,13 @@
 - `VulkanEnvironmentCube::from_cube_mips` uploads explicit mip contents into a cube-compatible RGBA32F image, creates a full-chain cube view and trilinear clamp-to-edge sampler, and records staging/image barriers with retained resource lifetimes. It validates sampled-image, transfer-source/destination, and linear-filter format support. It does not generate GGX levels by ordinary box-filtered mip blits.
 - CPU tests cover all-face constant-radiance preservation, directional face orientation, diffuse integral normalization, deterministic convolution, and the reduction/spreading of a directional HDR lobe as roughness increases. The validation-layer GPU regression uploads irradiance and a two-level GGX chain, copies both specular levels back, checks exact float values, and verifies no Vulkan validation errors on the NVIDIA development device.
 
-## Remaining work
+## Implemented lighting stages and scope limits
 
-- Directional-light PBR shadow sampling is integrated through a caller-owned depth comparison image, light view-projection matrix, depth bias, and 3x3 PCF. The depth-only render stage records scene meshes with a dedicated 64-byte MVP path. Point/spot shadow maps and cascades remain out of scope.
+- Directional-light PBR shadow sampling uses a caller-owned depth comparison image, light view-projection matrix, depth bias, and 3x3 PCF. The depth-only render stage records scene meshes with a dedicated 64-byte MVP path.
 - `VulkanSsaoRenderer` dispatches a bounded 8x8 compute pass using depth reconstruction, eight deterministic screen-space directions, caller-provided inverse projection, pixel/world radii, bias, and intensity. It writes `R32_SFLOAT` AO, transitions it for fragment sampling, and the PBR shader consumes it through set 1 binding 4 with an explicit strength control.
-- Add broader reference scenes covering multiple material/light combinations and image regression comparisons with documented tolerances on supported Vulkan CI and hardware runners.
+- The reference scene contains two distinct metallic-roughness material descriptor sets and evaluates one directional, one point, and one spot light. It renders with directional PCF and screen-space AO enabled, then compares the complete 32x32 RGBA8 image against the checked-in golden.
+- Explicit limitations: environment convolution is a deterministic CPU reference path, not GPU compute; specular IBL uses an analytic split-sum approximation rather than a BRDF LUT; the current shadow map is directional-only (no point/spot maps or cascades); SSAO is a single eight-direction depth pass without temporal accumulation or a denoising blur. These are documented scope boundaries, not silently substituted implementations.
 
 ## Current validation
 
-HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. The runtime PBR shader/descriptor path now samples both environment maps and evaluates one directional plus up to four bounded point/spot lights. Its specular IBL uses an analytic split-sum approximation, not a BRDF LUT. The depth-only shadow pass is implemented for one light-camera view (directional or spot). Directional PBR shadow sampling and 3x3 PCF are covered by a Vulkan readback/validation regression. SSAO is covered by a Vulkan compute/readback regression using a synthetic depth discontinuity and is consumed by the PBR shader. Point/spot shadow maps and cascades remain out of scope for the current directional shadow implementation. Broader multi-material reference scenes remain outstanding; the initial 32x32 PBR directional-shadow golden regression is now implemented.
+Workspace validation on the final Phase 4 commit passed formatting, Clippy with warnings denied, all workspace tests, Rust documentation with warnings denied, and `git diff --check`. The workspace reported 262 passed tests and 8 intentionally ignored Vulkan tests. On the NVIDIA GeForce 940MX with Khronos validation enabled, seven ignored Vulkan tests passed: HDR environment upload/readback, offscreen rendering, four runtime scene tests (including the two-material PBR golden), and the SSAO compute/readback regression. The PBR golden compares every RGBA8 pixel to `tests/fixtures/pbr_reference.rgba8`, requires exact alpha, permits at most 16 pixels outside a 16/255 RGB channel tolerance, and separately checks representative pixels for both material variants and the clear target. The SSAO test renders a synthetic near/far depth discontinuity, dispatches the compute pass, reads back AO, verifies finite values in [0,1] and measurable occlusion, and checks Khronos validation. GitHub CI passed the quality matrix on Windows, macOS, and Ubuntu 24.04; the Vulkan workflow passed on lavapipe. The HDR environment upload regression was also validated on the NVIDIA device with exact float readback.
