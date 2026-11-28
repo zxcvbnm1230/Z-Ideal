@@ -6,14 +6,42 @@ use z_ideal_assets::{
     AssetCache, AssetHandle, AssetId, AssetKind, AssetUri, GltfImport, ImportedMaterial,
 };
 use z_ideal_renderer::{
-    BufferBarrier, CommandBufferRecording, MeshDrawError, MeshGpu, MeshUploadError, VulkanDevice,
-    VulkanError, VulkanPipelineLayout,
+    BufferBarrier, CommandBufferRecording, MeshDrawError, MeshGpu, MeshUploadError,
+    TextureColorSpace, VulkanDevice, VulkanError, VulkanPipelineLayout,
 };
 
 use crate::RenderSceneSnapshot;
 
 type MeshKey = (AssetUri, usize);
 type PrimitiveKey = (AssetUri, usize, usize);
+
+/// Semantic role of one imported glTF material texture slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GltfMaterialTextureSlot {
+    /// Base color is sampled with the sRGB transfer function.
+    BaseColor,
+    /// Metallic and roughness channels are linear data.
+    MetallicRoughness,
+    /// Tangent-space normal data is linear.
+    Normal,
+    /// Occlusion data is linear.
+    Occlusion,
+    /// Emissive color is sampled with the sRGB transfer function.
+    Emissive,
+}
+
+/// Resolved texture input for one primitive material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GltfMaterialTextureBinding {
+    /// Material slot receiving this texture.
+    pub slot: GltfMaterialTextureSlot,
+    /// Index in the imported asset's texture table.
+    pub texture_index: usize,
+    /// Required GPU sampling interpretation for this semantic.
+    pub color_space: TextureColorSpace,
+    /// glTF texture-coordinate set selected by this material slot.
+    pub tex_coord: u32,
+}
 
 /// Owns uploaded GPU primitives and pins their imported CPU assets.
 ///
@@ -280,6 +308,30 @@ impl<'device> VulkanSceneMeshes<'device> {
             })
     }
 
+    /// Resolves all populated standard glTF metallic-roughness texture slots for a primitive.
+    ///
+    /// Base-color and emissive slots require sRGB uploads; metallic-roughness, normal,
+    /// and occlusion slots require linear uploads. A texture used by multiple semantic
+    /// slots may therefore need separate GPU image resources for the two color spaces.
+    /// This mesh adapter currently imports only UV0; nonzero texture-coordinate sets
+    /// are reported as unsupported instead of silently sampling the wrong coordinates.
+    pub fn material_texture_bindings_for_primitive(
+        &self,
+        uri: &AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+    ) -> Result<Vec<GltfMaterialTextureBinding>, VulkanSceneMeshesError> {
+        let asset = self
+            .assets
+            .get(uri)
+            .ok_or_else(|| VulkanSceneMeshesError::MissingAsset { uri: uri.clone() })?
+            .get();
+        let Some(material) = self.material_for_primitive(uri, mesh_index, primitive_index)? else {
+            return Ok(Vec::new());
+        };
+        resolve_material_texture_bindings(asset, material, uri, mesh_index, primitive_index)
+    }
+
     /// Returns the number of distinct GPU primitives owned by this adapter.
     #[must_use]
     pub fn primitive_count(&self) -> usize {
@@ -291,6 +343,85 @@ impl<'device> VulkanSceneMeshes<'device> {
     pub fn asset_count(&self) -> usize {
         self.assets.len()
     }
+}
+
+fn resolve_material_texture_bindings(
+    asset: &GltfImport,
+    material: &ImportedMaterial,
+    uri: &AssetUri,
+    mesh_index: usize,
+    primitive_index: usize,
+) -> Result<Vec<GltfMaterialTextureBinding>, VulkanSceneMeshesError> {
+    let slots = [
+        (
+            GltfMaterialTextureSlot::BaseColor,
+            material.base_color_texture,
+            material.base_color_tex_coord,
+            TextureColorSpace::Srgb,
+        ),
+        (
+            GltfMaterialTextureSlot::MetallicRoughness,
+            material.metallic_roughness_texture,
+            material.metallic_roughness_tex_coord,
+            TextureColorSpace::Linear,
+        ),
+        (
+            GltfMaterialTextureSlot::Normal,
+            material.normal_texture,
+            material.normal_tex_coord,
+            TextureColorSpace::Linear,
+        ),
+        (
+            GltfMaterialTextureSlot::Occlusion,
+            material.occlusion_texture,
+            material.occlusion_tex_coord,
+            TextureColorSpace::Linear,
+        ),
+        (
+            GltfMaterialTextureSlot::Emissive,
+            material.emissive_texture,
+            material.emissive_tex_coord,
+            TextureColorSpace::Srgb,
+        ),
+    ];
+    let mut bindings = Vec::new();
+    for (slot, texture_index, tex_coord, color_space) in slots {
+        let Some(texture_index) = texture_index else {
+            continue;
+        };
+        if tex_coord != 0 {
+            return Err(VulkanSceneMeshesError::UnsupportedTextureCoordinateSet {
+                uri: uri.clone(),
+                mesh_index,
+                primitive_index,
+                slot,
+                tex_coord,
+            });
+        }
+        let texture = asset.textures.get(texture_index).ok_or_else(|| {
+            VulkanSceneMeshesError::MissingMaterialTexture {
+                uri: uri.clone(),
+                mesh_index,
+                primitive_index,
+                texture_index,
+            }
+        })?;
+        if asset.images.get(texture.source_image).is_none() {
+            return Err(VulkanSceneMeshesError::MissingMaterialImage {
+                uri: uri.clone(),
+                mesh_index,
+                primitive_index,
+                image_index: texture.source_image,
+            });
+        }
+        bindings.push(GltfMaterialTextureBinding {
+            slot,
+            texture_index,
+            color_space,
+            tex_coord,
+        });
+    }
+    Ok(bindings)
 }
 
 /// Failures while resolving imported mesh data and creating or recording GPU resources.
@@ -349,6 +480,37 @@ pub enum VulkanSceneMeshesError {
         mesh_index: usize,
         primitive_index: usize,
     },
+    /// A material texture uses a UV set not currently imported by MeshGpu.
+    #[error(
+        "asset {uri} mesh {mesh_index} primitive {primitive_index} uses unsupported texCoord {tex_coord} for {slot:?}"
+    )]
+    UnsupportedTextureCoordinateSet {
+        uri: AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+        slot: GltfMaterialTextureSlot,
+        tex_coord: u32,
+    },
+    /// A material references a missing imported texture table entry.
+    #[error(
+        "asset {uri} mesh {mesh_index} primitive {primitive_index} refers to missing texture {texture_index}"
+    )]
+    MissingMaterialTexture {
+        uri: AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+        texture_index: usize,
+    },
+    /// A material texture refers to a missing decoded image.
+    #[error(
+        "asset {uri} mesh {mesh_index} primitive {primitive_index} texture refers to missing image {image_index}"
+    )]
+    MissingMaterialImage {
+        uri: AssetUri,
+        mesh_index: usize,
+        primitive_index: usize,
+        image_index: usize,
+    },
     /// The combined camera view-projection matrix is not finite.
     #[error("scene camera view-projection matrix is not finite")]
     NonFiniteViewProjection,
@@ -358,4 +520,106 @@ pub enum VulkanSceneMeshesError {
     /// Vulkan command recording or synchronization failed.
     #[error(transparent)]
     Vulkan(#[from] VulkanError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use z_ideal_assets::{
+        ImagePixelFormat, ImportedImage, ImportedTexture, MaterialAlphaMode, TextureWrapMode,
+    };
+
+    fn imported_asset() -> GltfImport {
+        GltfImport {
+            source_path: "models/material.gltf".into(),
+            meshes: Vec::new(),
+            nodes: Vec::new(),
+            scenes: Vec::new(),
+            default_scene: None,
+            materials: Vec::new(),
+            textures: vec![ImportedTexture {
+                source_image: 0,
+                mag_filter: None,
+                min_filter: None,
+                wrap_s: TextureWrapMode::Repeat,
+                wrap_t: TextureWrapMode::Repeat,
+            }],
+            images: vec![ImportedImage {
+                width: 1,
+                height: 1,
+                format: ImagePixelFormat::Rgba8,
+                pixels: vec![255; 4],
+            }],
+            dependency_uris: Vec::new(),
+        }
+    }
+
+    fn imported_material() -> ImportedMaterial {
+        ImportedMaterial {
+            name: None,
+            base_color_factor: [1.0; 4],
+            metallic_factor: 1.0,
+            roughness_factor: 1.0,
+            base_color_texture: Some(0),
+            base_color_tex_coord: 0,
+            metallic_roughness_texture: Some(0),
+            metallic_roughness_tex_coord: 0,
+            normal_texture: Some(0),
+            normal_tex_coord: 0,
+            normal_scale: 1.0,
+            occlusion_texture: Some(0),
+            occlusion_tex_coord: 0,
+            occlusion_strength: 1.0,
+            emissive_texture: Some(0),
+            emissive_tex_coord: 0,
+            emissive_factor: [0.0; 3],
+            alpha_mode: MaterialAlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+            double_sided: false,
+        }
+    }
+
+    #[test]
+    fn resolves_all_five_standard_texture_slots_with_semantic_color_spaces() {
+        let asset = imported_asset();
+        let material = imported_material();
+        let uri = AssetUri::new("models/material.gltf").expect("valid asset URI");
+        let bindings =
+            resolve_material_texture_bindings(&asset, &material, &uri, 0, 0).expect("bindings");
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| (binding.slot, binding.color_space))
+                .collect::<Vec<_>>(),
+            vec![
+                (GltfMaterialTextureSlot::BaseColor, TextureColorSpace::Srgb),
+                (
+                    GltfMaterialTextureSlot::MetallicRoughness,
+                    TextureColorSpace::Linear
+                ),
+                (GltfMaterialTextureSlot::Normal, TextureColorSpace::Linear),
+                (
+                    GltfMaterialTextureSlot::Occlusion,
+                    TextureColorSpace::Linear
+                ),
+                (GltfMaterialTextureSlot::Emissive, TextureColorSpace::Srgb),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_material_uv_sets_not_carried_by_the_mesh_vertex_format() {
+        let asset = imported_asset();
+        let mut material = imported_material();
+        material.normal_tex_coord = 1;
+        let uri = AssetUri::new("models/material.gltf").expect("valid asset URI");
+        assert!(matches!(
+            resolve_material_texture_bindings(&asset, &material, &uri, 0, 0),
+            Err(VulkanSceneMeshesError::UnsupportedTextureCoordinateSet {
+                slot: GltfMaterialTextureSlot::Normal,
+                tex_coord: 1,
+                ..
+            })
+        ));
+    }
 }

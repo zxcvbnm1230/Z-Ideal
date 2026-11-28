@@ -161,14 +161,28 @@ pub struct ImportedMaterial {
     pub roughness_factor: f32,
     /// Base color texture index.
     pub base_color_texture: Option<usize>,
+    /// Texture coordinate set used by the base color texture.
+    pub base_color_tex_coord: u32,
     /// Metallic-roughness texture index.
     pub metallic_roughness_texture: Option<usize>,
+    /// Texture coordinate set used by the metallic-roughness texture.
+    pub metallic_roughness_tex_coord: u32,
     /// Normal texture index.
     pub normal_texture: Option<usize>,
+    /// Texture coordinate set used by the normal texture.
+    pub normal_tex_coord: u32,
+    /// Scalar applied to sampled tangent-space normal X and Y components.
+    pub normal_scale: f32,
     /// Occlusion texture index.
     pub occlusion_texture: Option<usize>,
+    /// Texture coordinate set used by the occlusion texture.
+    pub occlusion_tex_coord: u32,
+    /// Strength of the occlusion effect.
+    pub occlusion_strength: f32,
     /// Emissive texture index.
     pub emissive_texture: Option<usize>,
+    /// Texture coordinate set used by the emissive texture.
+    pub emissive_tex_coord: u32,
     /// Emissive RGB factor.
     pub emissive_factor: [f32; 3],
     /// Alpha rendering mode.
@@ -233,6 +247,13 @@ pub enum GltfImportError {
         path: PathBuf,
         mesh: usize,
         primitive: usize,
+        reason: String,
+    },
+    /// An imported material contains non-finite or out-of-range core glTF factors.
+    #[error("glTF {path} material {material} has invalid material factors: {reason}")]
+    InvalidMaterial {
+        path: PathBuf,
+        material: usize,
         reason: String,
     },
     /// A material refers to a texture outside the imported texture table.
@@ -455,17 +476,23 @@ impl GltfImporter {
             .materials()
             .map(|material| {
                 let pbr = material.pbr_metallic_roughness();
+                let base_color_texture = pbr.base_color_texture();
+                let metallic_roughness_texture = pbr.metallic_roughness_texture();
+                let normal_texture = material.normal_texture();
+                let occlusion_texture = material.occlusion_texture();
+                let emissive_texture = material.emissive_texture();
                 let texture_indices = [
-                    pbr.base_color_texture().map(|info| info.texture().index()),
-                    pbr.metallic_roughness_texture()
+                    base_color_texture
+                        .as_ref()
                         .map(|info| info.texture().index()),
-                    material.normal_texture().map(|info| info.texture().index()),
-                    material
-                        .occlusion_texture()
+                    metallic_roughness_texture
+                        .as_ref()
                         .map(|info| info.texture().index()),
-                    material
-                        .emissive_texture()
+                    normal_texture.as_ref().map(|info| info.texture().index()),
+                    occlusion_texture
+                        .as_ref()
                         .map(|info| info.texture().index()),
+                    emissive_texture.as_ref().map(|info| info.texture().index()),
                 ];
                 for texture in texture_indices.into_iter().flatten() {
                     if texture >= imported_textures.len() {
@@ -476,16 +503,32 @@ impl GltfImporter {
                         });
                     }
                 }
-                Ok(ImportedMaterial {
+                let imported = ImportedMaterial {
                     name: material.name().map(str::to_owned),
                     base_color_factor: pbr.base_color_factor(),
                     metallic_factor: pbr.metallic_factor(),
                     roughness_factor: pbr.roughness_factor(),
                     base_color_texture: texture_indices[0],
+                    base_color_tex_coord: base_color_texture
+                        .as_ref()
+                        .map_or(0, |info| info.tex_coord()),
                     metallic_roughness_texture: texture_indices[1],
+                    metallic_roughness_tex_coord: metallic_roughness_texture
+                        .map_or(0, |info| info.tex_coord()),
                     normal_texture: texture_indices[2],
+                    normal_tex_coord: normal_texture.as_ref().map_or(0, |info| info.tex_coord()),
+                    normal_scale: normal_texture.as_ref().map_or(1.0, |info| info.scale()),
                     occlusion_texture: texture_indices[3],
+                    occlusion_tex_coord: occlusion_texture
+                        .as_ref()
+                        .map_or(0, |info| info.tex_coord()),
+                    occlusion_strength: occlusion_texture
+                        .as_ref()
+                        .map_or(1.0, |info| info.strength()),
                     emissive_texture: texture_indices[4],
+                    emissive_tex_coord: emissive_texture
+                        .as_ref()
+                        .map_or(0, |info| info.tex_coord()),
                     emissive_factor: material.emissive_factor(),
                     alpha_mode: match material.alpha_mode() {
                         gltf::material::AlphaMode::Opaque => MaterialAlphaMode::Opaque,
@@ -494,7 +537,13 @@ impl GltfImporter {
                     },
                     alpha_cutoff: material.alpha_cutoff().unwrap_or(0.5),
                     double_sided: material.double_sided(),
-                })
+                };
+                validate_imported_material(
+                    &source_path,
+                    material.index().unwrap_or(usize::MAX),
+                    &imported,
+                )?;
+                Ok(imported)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1212,6 +1261,48 @@ fn map_primitive_mode(mode: gltf::mesh::Mode) -> PrimitiveTopology {
         gltf::mesh::Mode::TriangleStrip => PrimitiveTopology::TriangleStrip,
         gltf::mesh::Mode::TriangleFan => PrimitiveTopology::TriangleFan,
     }
+}
+
+fn validate_imported_material(
+    path: &Path,
+    material: usize,
+    value: &ImportedMaterial,
+) -> Result<(), GltfImportError> {
+    let in_unit_interval = |factor: f32| factor.is_finite() && (0.0..=1.0).contains(&factor);
+    if !value.base_color_factor.into_iter().all(in_unit_interval) {
+        return Err(GltfImportError::InvalidMaterial {
+            path: path.to_path_buf(),
+            material,
+            reason: "base color factor components must be finite and within [0, 1]".to_owned(),
+        });
+    }
+    if !in_unit_interval(value.metallic_factor) || !in_unit_interval(value.roughness_factor) {
+        return Err(GltfImportError::InvalidMaterial {
+            path: path.to_path_buf(),
+            material,
+            reason: "metallic and roughness factors must be finite and within [0, 1]".to_owned(),
+        });
+    }
+    if !value.emissive_factor.into_iter().all(in_unit_interval) {
+        return Err(GltfImportError::InvalidMaterial {
+            path: path.to_path_buf(),
+            material,
+            reason: "emissive factor components must be finite and within [0, 1]".to_owned(),
+        });
+    }
+    if !value.normal_scale.is_finite()
+        || !value.occlusion_strength.is_finite()
+        || !(0.0..=1.0).contains(&value.occlusion_strength)
+        || !value.alpha_cutoff.is_finite()
+        || value.alpha_cutoff < 0.0
+    {
+        return Err(GltfImportError::InvalidMaterial {
+            path: path.to_path_buf(),
+            material,
+            reason: "normal scale, occlusion strength, or alpha cutoff is invalid".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn map_min_filter(filter: gltf::texture::MinFilter) -> TextureMinFilter {

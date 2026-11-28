@@ -9,7 +9,18 @@
   }],
   "materials": [{
     "name": "sample-material",
-    "pbrMetallicRoughness": { "baseColorFactor": [1.0, 0.2, 0.0, 1.0], "baseColorTexture": { "index": 0 } }
+    "pbrMetallicRoughness": {
+      "baseColorFactor": [1.0, 0.2, 0.0, 1.0],
+      "baseColorTexture": { "index": 0 },
+      "metallicRoughnessTexture": { "index": 0 }
+    },
+    "normalTexture": { "index": 0, "scale": 0.7 },
+    "occlusionTexture": { "index": 0, "strength": 0.6 },
+    "emissiveTexture": { "index": 0 },
+    "emissiveFactor": [0.1, 0.2, 0.3],
+    "alphaMode": "MASK",
+    "alphaCutoff": 0.4,
+    "doubleSided": true
   }],
   "textures": [{ "source": 0 }],
   "images": [{

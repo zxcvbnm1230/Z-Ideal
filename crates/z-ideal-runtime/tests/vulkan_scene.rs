@@ -19,8 +19,9 @@ use z_ideal_renderer::{
     compile_glsl,
 };
 use z_ideal_runtime::{
-    GltfMeshInstance, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
-    VulkanSceneMeshesError, extract_render_scene, instantiate_default_gltf_scene,
+    GltfMaterialTextureBinding, GltfMaterialTextureSlot, GltfMeshInstance, RenderMeshInstance,
+    RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError, extract_render_scene,
+    instantiate_default_gltf_scene,
 };
 use z_ideal_scene::World;
 
@@ -788,6 +789,43 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
         .expect("sample primitive declares a material");
     assert_eq!(material.base_color_texture, Some(0));
     assert_eq!(material.base_color_factor, [1.0, 0.2, 0.0, 1.0]);
+    assert_eq!(
+        gpu_scene
+            .material_texture_bindings_for_primitive(&source_uri, 0, 0)
+            .expect("resolve standard material texture semantics"),
+        vec![
+            GltfMaterialTextureBinding {
+                slot: GltfMaterialTextureSlot::BaseColor,
+                texture_index: 0,
+                color_space: TextureColorSpace::Srgb,
+                tex_coord: 0,
+            },
+            GltfMaterialTextureBinding {
+                slot: GltfMaterialTextureSlot::MetallicRoughness,
+                texture_index: 0,
+                color_space: TextureColorSpace::Linear,
+                tex_coord: 0,
+            },
+            GltfMaterialTextureBinding {
+                slot: GltfMaterialTextureSlot::Normal,
+                texture_index: 0,
+                color_space: TextureColorSpace::Linear,
+                tex_coord: 0,
+            },
+            GltfMaterialTextureBinding {
+                slot: GltfMaterialTextureSlot::Occlusion,
+                texture_index: 0,
+                color_space: TextureColorSpace::Linear,
+                tex_coord: 0,
+            },
+            GltfMaterialTextureBinding {
+                slot: GltfMaterialTextureSlot::Emissive,
+                texture_index: 0,
+                color_space: TextureColorSpace::Srgb,
+                tex_coord: 0,
+            },
+        ]
+    );
     let pinned_import = gpu_scene
         .imported_asset(&source_uri)
         .expect("scene adapter pins imported asset");

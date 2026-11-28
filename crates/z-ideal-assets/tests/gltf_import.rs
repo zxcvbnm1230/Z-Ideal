@@ -60,10 +60,18 @@ impl FixtureDir {
             "textures":[{"source":0}],
             "materials":[{"name":"paint","pbrMetallicRoughness":{
                 "baseColorFactor":[0.5,0.6,0.7,1.0],
-                "baseColorTexture":{"index":0},
+                "baseColorTexture":{"index":0,"texCoord":0},
+                "metallicRoughnessTexture":{"index":0,"texCoord":1},
                 "metallicFactor":0.25,
                 "roughnessFactor":0.75
-            }}],
+            },
+            "normalTexture":{"index":0,"texCoord":2,"scale":0.35},
+            "occlusionTexture":{"index":0,"texCoord":3,"strength":0.4},
+            "emissiveTexture":{"index":0,"texCoord":4},
+            "emissiveFactor":[0.1,0.2,0.3],
+            "alphaMode":"MASK",
+            "alphaCutoff":0.37,
+            "doubleSided":true}],
             "meshes":[{"name":"triangle","primitives":[{
                 "attributes":{"POSITION":0},"indices":1,"material":0
             }]}]
@@ -99,12 +107,45 @@ fn imports_gltf_mesh_indices_material_and_external_dependency() {
     );
     assert_eq!(imported.materials[0].metallic_factor, 0.25);
     assert_eq!(imported.materials[0].roughness_factor, 0.75);
-    assert_eq!(imported.materials[0].base_color_texture, Some(0));
+    let material = &imported.materials[0];
+    assert_eq!(material.base_color_texture, Some(0));
+    assert_eq!(material.base_color_tex_coord, 0);
+    assert_eq!(material.metallic_roughness_texture, Some(0));
+    assert_eq!(material.metallic_roughness_tex_coord, 1);
+    assert_eq!(material.normal_texture, Some(0));
+    assert_eq!(material.normal_tex_coord, 2);
+    assert_eq!(material.normal_scale, 0.35);
+    assert_eq!(material.occlusion_texture, Some(0));
+    assert_eq!(material.occlusion_tex_coord, 3);
+    assert_eq!(material.occlusion_strength, 0.4);
+    assert_eq!(material.emissive_texture, Some(0));
+    assert_eq!(material.emissive_tex_coord, 4);
+    assert_eq!(material.emissive_factor, [0.1, 0.2, 0.3]);
+    assert_eq!(material.alpha_mode, z_ideal_assets::MaterialAlphaMode::Mask);
+    assert_eq!(material.alpha_cutoff, 0.37);
+    assert!(material.double_sided);
     assert_eq!(imported.textures.len(), 1);
     assert_eq!(imported.images.len(), 1);
     assert_eq!(imported.images[0].width, 1);
     assert_eq!(imported.images[0].height, 1);
     assert_eq!(imported.dependency_uris, vec!["mesh.bin"]);
+}
+
+#[test]
+fn rejects_out_of_range_imported_material_factors() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read glTF fixture");
+    fs::write(
+        &path,
+        document.replace("\"metallicFactor\":0.25", "\"metallicFactor\":1.5"),
+    )
+    .expect("write invalid material fixture");
+
+    assert!(matches!(
+        GltfImporter::import(&path),
+        Err(GltfImportError::InvalidMaterial { material: 0, .. })
+    ));
 }
 
 #[test]

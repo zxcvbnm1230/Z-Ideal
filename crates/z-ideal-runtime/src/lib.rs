@@ -12,7 +12,9 @@ pub use gltf_scene::{
 pub use render_scene::{
     RenderMeshInstance, RenderSceneExtractionError, RenderSceneSnapshot, extract_render_scene,
 };
-pub use vulkan_scene::{VulkanSceneMeshes, VulkanSceneMeshesError};
+pub use vulkan_scene::{
+    GltfMaterialTextureBinding, GltfMaterialTextureSlot, VulkanSceneMeshes, VulkanSceneMeshesError,
+};
 
 /// Returns the crate's stable package name for diagnostics and tooling.
 pub const CRATE_NAME: &str = "z-ideal-runtime";
