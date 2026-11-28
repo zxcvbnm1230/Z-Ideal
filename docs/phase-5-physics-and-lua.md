@@ -2,10 +2,10 @@
 
 **Status:** in progress. Fixed-step timing, the Box3D world/body adapter,
 serializable scene physics components, ECS synchronization, collision filters,
-ray/shape queries, overlap queries, contact/sensor event delivery, and a Lua VM with scene bindings,
-lifecycle, events, prefab commands and bounded instruction execution are
-implemented. Script asset cooking, runtime/editor integration and resource
-quotas remain outstanding.
+ray/shape queries, overlap queries, contact/sensor event delivery, Lua source
+import, and a Lua VM with scene bindings, lifecycle, events, prefab commands
+and bounded instruction execution are implemented. Filesystem cooking,
+runtime/editor integration and resource quotas remain outstanding.
 
 ## Roadmap scope
 
@@ -139,8 +139,9 @@ colliders are not implemented.
 - Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
-- Current focused coverage: 57 scripting tests, 46 scene tests and 40 physics
-  tests pass on the development host. These are focused results, not the full workspace gate.
+- Current focused coverage: 58 scripting tests, 46 scene tests, 40 physics
+  tests and 22 asset tests pass on the development host. These are focused
+  results, not the full workspace gate.
 
 ## Backend evaluation
 
@@ -156,8 +157,8 @@ supported desktop targets.
 
 - Add joints, mesh/compound/height-field colliders, parent-transform support and
   collider scaling only when the public scene/physics contracts are specified.
-- Add script asset import/cooking and connect script diagnostics to editor
-  tooling and the engine logging pipeline.
+- Add filesystem discovery/build cooking for imported script source and
+  connect script diagnostics to editor tooling and the engine logging pipeline.
 - Add memory/resource quotas and a documented trusted/untrusted script policy.
 - Drive the runtime-exposed ScriptHost from packaged startup, fixed-step
   scheduling and editor play mode; the packaged app has no complete game-loop

@@ -15,6 +15,11 @@ pub use z_ideal_scripting::{
     ScriptInstance, ScriptPhase, ScriptRegistryError, ScriptState,
 };
 
+pub use z_ideal_assets::{
+    AssetUri, LuaScriptImporter, MAX_SCRIPT_ASSET_BYTES, SCRIPT_ASSET_API_VERSION, ScriptAsset,
+    ScriptAssetImportError,
+};
+
 pub use gltf_material::{
     GltfMaterialError, GltfMaterialTextureResource, GltfMaterialTextureResources,
     GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform,

@@ -29,7 +29,7 @@ use z_ideal_scene::{
 /// Stable package identifier for diagnostics and tooling.
 pub const CRATE_NAME: &str = "z-ideal-scripting";
 /// Version of the public Lua scripting contract.
-pub const SCRIPT_API_VERSION: u32 = 1;
+pub const SCRIPT_API_VERSION: u32 = z_ideal_assets::SCRIPT_ASSET_API_VERSION;
 /// Lua VM instructions between execution-budget checks.
 pub const INSTRUCTION_CHECK_INTERVAL: u32 = 1_000;
 /// Largest accepted per-callback instruction budget.
@@ -99,6 +99,18 @@ pub enum ScriptError {
     /// The source exceeds the configured hard size limit.
     #[error("script source is {actual} bytes; maximum is {maximum} bytes")]
     SourceTooLarge { actual: usize, maximum: usize },
+    /// Imported asset declares an API version unsupported by this runtime.
+    #[error(
+        "script '{source_name}' requires API version {found}; supported version is {supported}"
+    )]
+    UnsupportedApiVersion {
+        /// Script source identifier.
+        source_name: String,
+        /// Version declared by the asset.
+        found: u32,
+        /// Version supported by this runtime.
+        supported: u32,
+    },
     /// Lua VM initialization failed.
     #[error("failed to initialize Lua VM: {0}")]
     VmInitialization(#[source] mlua::Error),
@@ -402,6 +414,22 @@ impl ScriptInstance {
         }
         Rc::make_mut(&mut self.prefab_registry).insert(name, prefab);
         Ok(())
+    }
+
+    /// Loads an imported Lua source asset after checking its declared API version.
+    pub fn load_asset(
+        asset: &z_ideal_assets::ScriptAsset,
+        config: ScriptConfig,
+    ) -> Result<Self, ScriptError> {
+        let source_name = asset.uri().to_string();
+        if asset.api_version() != SCRIPT_API_VERSION {
+            return Err(ScriptError::UnsupportedApiVersion {
+                source_name,
+                found: asset.api_version(),
+                supported: SCRIPT_API_VERSION,
+            });
+        }
+        Self::load(asset.uri().to_string(), asset.source(), config)
     }
 
     /// Returns the source name associated with diagnostics.

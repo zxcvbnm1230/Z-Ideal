@@ -4,6 +4,23 @@ The scripting crate owns the Lua VM boundary. Lua values and functions remain
 inside this crate. Scripts communicate with the ECS through generation-safe
 entity userdata, a typed component registry, and scoped command APIs.
 
+## Script source assets
+
+The assets crate provides LuaScriptImporter for caller-supplied source bytes.
+It accepts project-relative .lua URIs, valid UTF-8, and source up to 1 MiB.
+An optional first-line header of the form -- z-ideal-script-api: 1 declares
+the API version; omitting it selects the current version. Unsupported or
+malformed versions are rejected during import.
+
+The importer returns ScriptAsset with the original source, logical URI,
+version and deterministic 64-bit FNV-1a content fingerprint. Its metadata is
+registered as AssetKind::Script with importer ID z-ideal-lua/1 and no implicit
+dependencies. The fingerprint is non-cryptographic and must not be used for
+authenticity decisions. Import does not compile or execute Lua. The runtime
+compiles an imported asset through ScriptInstance::load_asset before attaching
+it to ScriptHost. Filesystem discovery, build cooking and bytecode generation
+are not implemented; the caller supplies source bytes to the importer.
+
 ## Runtime and lifecycle
 
 The runtime pins **mlua 0.12.3** with **Lua 5.4** built from vendored sources.

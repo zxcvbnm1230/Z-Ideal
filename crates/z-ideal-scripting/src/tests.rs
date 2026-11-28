@@ -1165,3 +1165,27 @@ mod shutdown_prefab_ticket_tests {
         assert!(world.entities().is_empty());
     }
 }
+
+#[cfg(test)]
+mod imported_asset_tests {
+    use crate::{SCRIPT_API_VERSION, ScriptConfig, ScriptInstance};
+    use z_ideal_assets::{AssetUri, LuaScriptImporter};
+
+    #[test]
+    fn imported_script_assets_load_into_the_runtime_with_their_logical_uri() {
+        let source = format!(
+            "-- z-ideal-script-api: {SCRIPT_API_VERSION}\nreturn {{ start = function(self) self.started = true end, update = function(self) assert(self.started) end }}"
+        );
+        let asset = LuaScriptImporter::default()
+            .import(
+                AssetUri::new("scripts/player.lua").expect("URI"),
+                source.as_bytes(),
+            )
+            .expect("import");
+        let mut script = ScriptInstance::load_asset(&asset, ScriptConfig::default())
+            .expect("load imported asset");
+        assert_eq!(script.source_name(), "scripts/player.lua");
+        script.start().expect("start");
+        script.update(0.016).expect("update");
+    }
+}
