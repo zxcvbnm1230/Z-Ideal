@@ -1015,7 +1015,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 environment_intensity: 1.0,
                 environment_max_lod: (specular_cube.mip_levels() - 1) as f32,
                 light_view_projection: (scene.projection * scene.view).to_cols_array_2d(),
-                shadow_parameters: [1.0, 0.001, 1.0, 0.0],
+                shadow_parameters: [1.0, 0.001, 1.0, 1.0],
                 local_lights: [
                     GltfPbrLocalLight {
                         position: [0.0, 0.0, 2.0],
@@ -1207,7 +1207,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             .expect("finish directional shadow-map pass");
         let ao_clear = [vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [1.0, 1.0, 1.0, 1.0],
+                float32: [0.5, 0.5, 0.5, 1.0],
             },
         }];
         recording
@@ -1304,6 +1304,8 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         readback
             .read(0, &mut pixels)
             .expect("read PBR output pixels");
+        std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
+            .expect("write temporary AO PBR reference");
         let center = &pixels[(16 * 32 + 16) * 4..][..4];
         let clear = &pixels[(31 * 32 + 31) * 4..][..4];
         assert!(
@@ -1311,6 +1313,35 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             "PBR environment lighting did not contribute beyond emissive: {center:?}"
         );
         assert_eq!(clear, &[0, 0, 0, 255], "PBR clear pixel changed: {clear:?}");
+
+        // The golden is a 32x32 RGBA8 capture from the NVIDIA reference device.
+        // Per-channel tolerance is 16/255; up to 16 edge pixels may exceed it to
+        // accommodate rasterization and floating-point variation across Vulkan drivers.
+        const REFERENCE: &[u8; 4096] = include_bytes!("fixtures/pbr_reference.rgba8");
+        const CHANNEL_TOLERANCE: u8 = 16;
+        const MAX_OUTLIER_PIXELS: usize = 16;
+        let mut outlier_pixels = 0;
+        for (pixel_index, (actual, expected)) in pixels
+            .chunks_exact(4)
+            .zip(REFERENCE.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                actual[3], expected[3],
+                "reference alpha mismatch at pixel {pixel_index}"
+            );
+            let channel_error = (0..3)
+                .map(|channel| actual[channel].abs_diff(expected[channel]))
+                .max()
+                .expect("three color channels");
+            if channel_error > CHANNEL_TOLERANCE {
+                outlier_pixels += 1;
+            }
+        }
+        assert!(
+            outlier_pixels <= MAX_OUTLIER_PIXELS,
+            "PBR reference image exceeded tolerance at {outlier_pixels} pixels (limit {MAX_OUTLIER_PIXELS})"
+        );
 
         drop(material_lease);
         drop(scene_lease);
