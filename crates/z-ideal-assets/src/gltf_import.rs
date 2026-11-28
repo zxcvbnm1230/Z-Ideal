@@ -1,5 +1,6 @@
 //! glTF 2.0 / GLB import into renderer-independent, validated CPU asset data.
-use gltf::{buffer, image};
+use gltf::{buffer, image as gltf_image};
+use image::{DynamicImage, ImageDecoder as _, ImageReader, Limits};
 
 /// Engine-facing primitive topology, independent of the glTF parser representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,7 @@ pub enum TextureWrapMode {
 }
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
 };
 
@@ -268,14 +269,31 @@ pub enum GltfImportError {
         actual_bytes: u64,
         limit_bytes: u64,
     },
+    /// An image exceeded the configured strict width or height limit.
+    #[error("glTF {path} image {index} is {width}x{height}; maximum is {max_width}x{max_height}")]
+    ImageDimensionsExceeded {
+        path: PathBuf,
+        index: usize,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
+    /// Encoded image data could not be read or decoded.
+    #[error("glTF {path} image {index} could not be decoded: {message}")]
+    ImageDecode {
+        path: PathBuf,
+        index: usize,
+        message: String,
+    },
 }
 
-/// Pre-allocation byte limits for glTF source documents and external resources.
+/// Resource limits for glTF source documents, external resources, and decoded images.
 ///
-/// These limits bound document reads and external buffer/image file sizes before
-/// the gltf crate allocates their contents. Embedded data URIs and GLB binary chunks are
-/// bounded by max_source_file_bytes. Decoded image expansion is not bounded by
-/// this type and remains a limitation of the current importer.
+/// Source and external resource reads are bounded, and decoded image output size is
+/// checked before allocating pixel storage. Canonical path validation still has a
+/// symlink/file-replacement time-of-check/time-of-use race. Embedded data URIs and
+/// GLB binary chunks are bounded by max_source_file_bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GltfImportOptions {
     /// Maximum source glTF or GLB file size in bytes.
@@ -284,6 +302,14 @@ pub struct GltfImportOptions {
     pub max_external_resource_bytes: u64,
     /// Maximum combined size of distinct external buffer and image files in bytes.
     pub max_total_external_resource_bytes: u64,
+    /// Maximum decoded image width in pixels.
+    pub max_image_width: u32,
+    /// Maximum decoded image height in pixels.
+    pub max_image_height: u32,
+    /// Maximum decoded pixel storage for one image in bytes.
+    pub max_decoded_image_bytes: u64,
+    /// Maximum combined decoded pixel storage across all images in bytes.
+    pub max_total_decoded_image_bytes: u64,
 }
 
 impl Default for GltfImportOptions {
@@ -292,6 +318,10 @@ impl Default for GltfImportOptions {
             max_source_file_bytes: 64 * 1024 * 1024,
             max_external_resource_bytes: 256 * 1024 * 1024,
             max_total_external_resource_bytes: 512 * 1024 * 1024,
+            max_image_width: 16_384,
+            max_image_height: 16_384,
+            max_decoded_image_bytes: 256 * 1024 * 1024,
+            max_total_decoded_image_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -368,7 +398,7 @@ impl GltfImporter {
             }
         }
         for image in document.images() {
-            if let image::Source::Uri { uri, .. } = image.source() {
+            if let gltf_image::Source::Uri { uri, .. } = image.source() {
                 if let Some((uri, resolved)) =
                     validate_external_uri(&source_directory, &source_path, uri)?
                 {
@@ -378,40 +408,23 @@ impl GltfImporter {
             }
         }
         validate_external_resource_budgets(&source_path, &external_resources, options)?;
-        let buffers =
-            gltf::import_buffers(&document, Some(&source_directory), blob).map_err(|error| {
-                GltfImportError::Import {
-                    path: source_path.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-        let images =
-            gltf::import_images(&document, Some(&source_directory), &buffers).map_err(|error| {
-                GltfImportError::Import {
-                    path: source_path.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-        let imported_images = images
-            .into_iter()
-            .enumerate()
-            .map(|(index, image)| {
-                let format = map_image_format(image.format);
-                let expected = expected_image_bytes(format, image.width, image.height);
-                if expected != Some(image.pixels.len()) || image.width == 0 || image.height == 0 {
-                    return Err(GltfImportError::InvalidImageData {
-                        path: source_path.clone(),
-                        index,
-                    });
-                }
-                Ok(ImportedImage {
-                    width: image.width,
-                    height: image.height,
-                    format,
-                    pixels: image.pixels,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut external_read_budget = ExternalReadBudget::default();
+        let buffers = import_buffers_with_limits(
+            &document,
+            &source_directory,
+            &source_path,
+            blob,
+            options,
+            &mut external_read_budget,
+        )?;
+        let imported_images = import_images_with_limits(
+            &document,
+            &source_directory,
+            &source_path,
+            &buffers,
+            options,
+            &mut external_read_budget,
+        )?;
 
         let imported_textures = document
             .textures()
@@ -761,6 +774,341 @@ fn valid_index_count(mode: PrimitiveTopology, count: usize) -> bool {
     }
 }
 
+#[derive(Default)]
+struct ExternalReadBudget {
+    resource_sizes: BTreeMap<PathBuf, u64>,
+    total_bytes: u64,
+}
+
+fn import_buffers_with_limits(
+    document: &gltf::Document,
+    source_directory: &Path,
+    source_path: &Path,
+    blob: Option<Vec<u8>>,
+    options: GltfImportOptions,
+    external_budget: &mut ExternalReadBudget,
+) -> Result<Vec<buffer::Data>, GltfImportError> {
+    let mut blob = blob;
+    let mut imported_buffers = Vec::new();
+    for source_buffer in document.buffers() {
+        let mut data = match source_buffer.source() {
+            buffer::Source::Bin => {
+                buffer::Data(blob.take().ok_or_else(|| GltfImportError::Import {
+                    path: source_path.to_path_buf(),
+                    message: format!(
+                        "buffer {} requires a missing GLB BIN chunk",
+                        source_buffer.index()
+                    ),
+                })?)
+            }
+            buffer::Source::Uri(uri) if uri.starts_with("data:") => {
+                buffer::Data::from_source(buffer::Source::Uri(uri), None).map_err(|error| {
+                    GltfImportError::Import {
+                        path: source_path.to_path_buf(),
+                        message: format!(
+                            "could not decode buffer {} data URI: {error}",
+                            source_buffer.index()
+                        ),
+                    }
+                })?
+            }
+            buffer::Source::Uri(uri) => {
+                let (_, resolved) = validate_external_uri(source_directory, source_path, uri)?
+                    .ok_or_else(|| GltfImportError::InvalidExternalUri {
+                        path: source_path.to_path_buf(),
+                        uri: uri.to_owned(),
+                        reason: "external buffer URI resolved as embedded data".to_owned(),
+                    })?;
+                buffer::Data(read_external_resource(
+                    &resolved,
+                    uri,
+                    source_path,
+                    options,
+                    external_budget,
+                )?)
+            }
+        };
+        while data.0.len() % 4 != 0 {
+            data.0.push(0);
+        }
+        if data.len() < source_buffer.length() {
+            return Err(GltfImportError::Import {
+                path: source_path.to_path_buf(),
+                message: format!(
+                    "buffer {} contains {} bytes but declares {}",
+                    source_buffer.index(),
+                    data.len(),
+                    source_buffer.length()
+                ),
+            });
+        }
+        imported_buffers.push(data);
+    }
+    Ok(imported_buffers)
+}
+
+fn import_images_with_limits(
+    document: &gltf::Document,
+    source_directory: &Path,
+    source_path: &Path,
+    buffers: &[buffer::Data],
+    options: GltfImportOptions,
+    external_budget: &mut ExternalReadBudget,
+) -> Result<Vec<ImportedImage>, GltfImportError> {
+    let mut imported_images = Vec::new();
+    let mut total_decoded_bytes = 0_u64;
+    for source_image in document.images() {
+        let index = source_image.index();
+        let encoded = match source_image.source() {
+            gltf_image::Source::Uri { uri, .. } if uri.starts_with("data:") => {
+                decode_image_data_uri(uri, source_path, index)?
+            }
+            gltf_image::Source::Uri { uri, .. } => {
+                let (_, resolved) = validate_external_uri(source_directory, source_path, uri)?
+                    .ok_or_else(|| GltfImportError::ImageDecode {
+                        path: source_path.to_path_buf(),
+                        index,
+                        message: "external image URI resolved as embedded data".to_owned(),
+                    })?;
+                read_external_resource(&resolved, uri, source_path, options, external_budget)?
+            }
+            gltf_image::Source::View { view, .. } => {
+                let buffer_index = view.buffer().index();
+                let data =
+                    buffers
+                        .get(buffer_index)
+                        .ok_or_else(|| GltfImportError::MissingResource {
+                            path: source_path.to_path_buf(),
+                            kind: "image buffer",
+                            index: buffer_index,
+                        })?;
+                let begin = view.offset();
+                let end = begin.checked_add(view.length()).ok_or_else(|| {
+                    GltfImportError::ImageDecode {
+                        path: source_path.to_path_buf(),
+                        index,
+                        message: "image buffer-view range overflowed".to_owned(),
+                    }
+                })?;
+                data.0
+                    .get(begin..end)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| GltfImportError::ImageDecode {
+                        path: source_path.to_path_buf(),
+                        index,
+                        message: "image buffer-view range is outside its buffer".to_owned(),
+                    })?
+            }
+        };
+
+        let reader = ImageReader::new(Cursor::new(encoded))
+            .with_guessed_format()
+            .map_err(|error| GltfImportError::ImageDecode {
+                path: source_path.to_path_buf(),
+                index,
+                message: error.to_string(),
+            })?;
+        let mut decoder = reader
+            .into_decoder()
+            .map_err(|error| GltfImportError::ImageDecode {
+                path: source_path.to_path_buf(),
+                index,
+                message: error.to_string(),
+            })?;
+        let (width, height) = decoder.dimensions();
+        if width == 0
+            || height == 0
+            || width > options.max_image_width
+            || height > options.max_image_height
+        {
+            return Err(GltfImportError::ImageDimensionsExceeded {
+                path: source_path.to_path_buf(),
+                index,
+                width,
+                height,
+                max_width: options.max_image_width,
+                max_height: options.max_image_height,
+            });
+        }
+        let decoded_bytes = decoder.total_bytes();
+        if decoded_bytes > options.max_decoded_image_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: format!("decoded image {index}"),
+                actual_bytes: decoded_bytes,
+                limit_bytes: options.max_decoded_image_bytes,
+            });
+        }
+        total_decoded_bytes = total_decoded_bytes
+            .checked_add(decoded_bytes)
+            .ok_or_else(|| GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined decoded images".to_owned(),
+                actual_bytes: u64::MAX,
+                limit_bytes: options.max_total_decoded_image_bytes,
+            })?;
+        if total_decoded_bytes > options.max_total_decoded_image_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined decoded images".to_owned(),
+                actual_bytes: total_decoded_bytes,
+                limit_bytes: options.max_total_decoded_image_bytes,
+            });
+        }
+
+        let mut decoder_limits = Limits::default();
+        decoder_limits.max_image_width = Some(options.max_image_width);
+        decoder_limits.max_image_height = Some(options.max_image_height);
+        decoder_limits.max_alloc = Some(options.max_decoded_image_bytes);
+        decoder
+            .set_limits(decoder_limits)
+            .map_err(|error| GltfImportError::ImageDecode {
+                path: source_path.to_path_buf(),
+                index,
+                message: error.to_string(),
+            })?;
+        let decoded =
+            DynamicImage::from_decoder(decoder).map_err(|error| GltfImportError::ImageDecode {
+                path: source_path.to_path_buf(),
+                index,
+                message: error.to_string(),
+            })?;
+        let format =
+            map_image_color_type(decoded.color()).ok_or_else(|| GltfImportError::ImageDecode {
+                path: source_path.to_path_buf(),
+                index,
+                message: "decoded image channel format is unsupported".to_owned(),
+            })?;
+        let pixels = decoded.into_bytes();
+        if expected_image_bytes(format, width, height) != Some(pixels.len()) {
+            return Err(GltfImportError::InvalidImageData {
+                path: source_path.to_path_buf(),
+                index,
+            });
+        }
+        imported_images.push(ImportedImage {
+            width,
+            height,
+            format,
+            pixels,
+        });
+    }
+    Ok(imported_images)
+}
+
+fn decode_image_data_uri(
+    uri: &str,
+    source_path: &Path,
+    image_index: usize,
+) -> Result<Vec<u8>, GltfImportError> {
+    let (metadata, encoded) = uri
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(','))
+        .ok_or_else(|| GltfImportError::ImageDecode {
+            path: source_path.to_path_buf(),
+            index: image_index,
+            message: "malformed image data URI".to_owned(),
+        })?;
+    if !metadata.split(';').any(|part| part == "base64") {
+        return Err(GltfImportError::ImageDecode {
+            path: source_path.to_path_buf(),
+            index: image_index,
+            message: "only base64-encoded image data URIs are supported".to_owned(),
+        });
+    }
+    base64::decode(encoded).map_err(|error| GltfImportError::ImageDecode {
+        path: source_path.to_path_buf(),
+        index: image_index,
+        message: format!("invalid base64 image data URI: {error}"),
+    })
+}
+
+fn read_external_resource(
+    path: &Path,
+    uri: &str,
+    source_path: &Path,
+    options: GltfImportOptions,
+    budget: &mut ExternalReadBudget,
+) -> Result<Vec<u8>, GltfImportError> {
+    let file = std::fs::File::open(path).map_err(|error| GltfImportError::InvalidExternalUri {
+        path: source_path.to_path_buf(),
+        uri: uri.to_owned(),
+        reason: format!("could not open external resource: {error}"),
+    })?;
+    let mut reader = file.take(options.max_external_resource_bytes.saturating_add(1));
+    let mut encoded = Vec::new();
+    reader
+        .read_to_end(&mut encoded)
+        .map_err(|error| GltfImportError::InvalidExternalUri {
+            path: source_path.to_path_buf(),
+            uri: uri.to_owned(),
+            reason: format!("could not read external resource: {error}"),
+        })?;
+    let actual_bytes =
+        u64::try_from(encoded.len()).map_err(|_| GltfImportError::ResourceLimitExceeded {
+            path: source_path.to_path_buf(),
+            resource: uri.to_owned(),
+            actual_bytes: u64::MAX,
+            limit_bytes: options.max_external_resource_bytes,
+        })?;
+    if actual_bytes > options.max_external_resource_bytes {
+        return Err(GltfImportError::ResourceLimitExceeded {
+            path: source_path.to_path_buf(),
+            resource: uri.to_owned(),
+            actual_bytes,
+            limit_bytes: options.max_external_resource_bytes,
+        });
+    }
+
+    if let Some(previous_size) = budget.resource_sizes.get(path) {
+        if *previous_size != actual_bytes {
+            return Err(GltfImportError::InvalidExternalUri {
+                path: source_path.to_path_buf(),
+                uri: uri.to_owned(),
+                reason: "external resource changed size during import".to_owned(),
+            });
+        }
+    } else {
+        budget.total_bytes = budget
+            .total_bytes
+            .checked_add(actual_bytes)
+            .ok_or_else(|| GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined external resources".to_owned(),
+                actual_bytes: u64::MAX,
+                limit_bytes: options.max_total_external_resource_bytes,
+            })?;
+        if budget.total_bytes > options.max_total_external_resource_bytes {
+            return Err(GltfImportError::ResourceLimitExceeded {
+                path: source_path.to_path_buf(),
+                resource: "combined external resources".to_owned(),
+                actual_bytes: budget.total_bytes,
+                limit_bytes: options.max_total_external_resource_bytes,
+            });
+        }
+        budget
+            .resource_sizes
+            .insert(path.to_path_buf(), actual_bytes);
+    }
+    Ok(encoded)
+}
+
+fn map_image_color_type(color: image::ColorType) -> Option<ImagePixelFormat> {
+    Some(match color {
+        image::ColorType::L8 => ImagePixelFormat::R8,
+        image::ColorType::La8 => ImagePixelFormat::Rg8,
+        image::ColorType::Rgb8 => ImagePixelFormat::Rgb8,
+        image::ColorType::Rgba8 => ImagePixelFormat::Rgba8,
+        image::ColorType::L16 => ImagePixelFormat::R16,
+        image::ColorType::La16 => ImagePixelFormat::Rg16,
+        image::ColorType::Rgb16 => ImagePixelFormat::Rgb16,
+        image::ColorType::Rgba16 => ImagePixelFormat::Rgba16,
+        image::ColorType::Rgb32F => ImagePixelFormat::Rgb32Float,
+        image::ColorType::Rgba32F => ImagePixelFormat::Rgba32Float,
+        _ => return None,
+    })
+}
+
 fn validate_external_uri(
     source_directory: &Path,
     source_path: &Path,
@@ -865,21 +1213,6 @@ fn map_primitive_mode(mode: gltf::mesh::Mode) -> PrimitiveTopology {
     }
 }
 
-fn map_image_format(format: image::Format) -> ImagePixelFormat {
-    match format {
-        image::Format::R8 => ImagePixelFormat::R8,
-        image::Format::R8G8 => ImagePixelFormat::Rg8,
-        image::Format::R8G8B8 => ImagePixelFormat::Rgb8,
-        image::Format::R8G8B8A8 => ImagePixelFormat::Rgba8,
-        image::Format::R16 => ImagePixelFormat::R16,
-        image::Format::R16G16 => ImagePixelFormat::Rg16,
-        image::Format::R16G16B16 => ImagePixelFormat::Rgb16,
-        image::Format::R16G16B16A16 => ImagePixelFormat::Rgba16,
-        image::Format::R32G32B32FLOAT => ImagePixelFormat::Rgb32Float,
-        image::Format::R32G32B32A32FLOAT => ImagePixelFormat::Rgba32Float,
-    }
-}
-
 fn map_min_filter(filter: gltf::texture::MinFilter) -> TextureMinFilter {
     match filter {
         gltf::texture::MinFilter::Nearest => TextureMinFilter::Nearest,
@@ -962,5 +1295,81 @@ mod tests {
             expected_image_bytes(ImagePixelFormat::Rgba32Float, u32::MAX, u32::MAX),
             None
         );
+    }
+
+    #[test]
+    fn bounded_external_reads_enforce_actual_bytes_and_aggregate_budget() {
+        use super::{
+            ExternalReadBudget, GltfImportError, GltfImportOptions, read_external_resource,
+        };
+        use std::{
+            fs,
+            path::Path,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "z-ideal-resource-budget-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create isolated fixture directory");
+        let oversized = directory.join("oversized.bin");
+        fs::write(&oversized, [1_u8, 2, 3, 4]).expect("write oversized resource");
+        let options = GltfImportOptions {
+            max_external_resource_bytes: 3,
+            max_total_external_resource_bytes: 10,
+            ..GltfImportOptions::default()
+        };
+        let error = read_external_resource(
+            &oversized,
+            "oversized.bin",
+            Path::new("scene.gltf"),
+            options,
+            &mut ExternalReadBudget::default(),
+        )
+        .expect_err("actual external read must enforce the per-file limit");
+        assert!(matches!(
+            error,
+            GltfImportError::ResourceLimitExceeded {
+                actual_bytes: 4,
+                limit_bytes: 3,
+                ..
+            }
+        ));
+        fs::remove_dir_all(directory).expect("remove isolated fixture directory");
+    }
+
+    #[test]
+    fn bounded_external_reads_count_distinct_canonical_paths_once() {
+        use super::{ExternalReadBudget, GltfImportOptions, read_external_resource};
+        use std::{
+            fs,
+            path::Path,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "z-ideal-resource-dedup-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create isolated fixture directory");
+        let shared = directory.join("shared.bin");
+        fs::write(&shared, [1_u8, 2, 3]).expect("write shared resource");
+        let options = GltfImportOptions {
+            max_external_resource_bytes: 3,
+            max_total_external_resource_bytes: 3,
+            ..GltfImportOptions::default()
+        };
+        let mut budget = ExternalReadBudget::default();
+        for uri in ["shared.bin", "alias/shared.bin"] {
+            read_external_resource(&shared, uri, Path::new("scene.gltf"), options, &mut budget)
+                .expect("re-reading one canonical file does not consume aggregate budget twice");
+        }
+        assert_eq!(budget.total_bytes, 3);
+        fs::remove_dir_all(directory).expect("remove isolated fixture directory");
     }
 }

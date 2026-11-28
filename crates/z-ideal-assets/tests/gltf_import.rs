@@ -320,3 +320,124 @@ fn enforces_aggregate_external_resource_byte_budget() {
         } if resource == "combined external resources"
     ));
 }
+
+#[test]
+fn enforces_strict_image_dimensions_before_decoding_pixels() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_image_width: 0,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("one-pixel image exceeds zero-pixel width budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ImageDimensionsExceeded {
+            index: 0,
+            width: 1,
+            height: 1,
+            max_width: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn enforces_per_image_decoded_byte_budget_before_pixel_allocation() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_decoded_image_bytes: 3,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("four decoded RGBA bytes exceed configured per-image budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes: 4,
+            limit_bytes: 3,
+            ..
+        } if resource == "decoded image 0"
+    ));
+}
+
+#[test]
+fn enforces_aggregate_decoded_image_byte_budget() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_total_decoded_image_bytes: 3,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("four decoded RGBA bytes exceed aggregate image budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes: 4,
+            limit_bytes: 3,
+            ..
+        } if resource == "combined decoded images"
+    ));
+}
+
+#[test]
+fn malformed_embedded_image_returns_a_structured_decode_error() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read fixture");
+    let document = document.replace(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==",
+        "AA==",
+    );
+    fs::write(&path, document).expect("write malformed image fixture");
+    assert!(matches!(
+        GltfImporter::import(&path),
+        Err(GltfImportError::ImageDecode { index: 0, .. })
+    ));
+}
+
+#[test]
+fn enforces_external_image_file_byte_budget() {
+    let fixture = FixtureDir::new();
+    let path = fixture.write_triangle(false);
+    let document = fs::read_to_string(&path).expect("read fixture");
+    let document = document.replace(
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==",
+        "image.png",
+    );
+    fs::write(&path, document).expect("write external image fixture");
+    fs::write(
+        fixture.0.join("image.png"),
+        base64::decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==")
+            .expect("decode PNG fixture"),
+    )
+    .expect("write external image");
+    let error = GltfImporter::import_with_options(
+        &path,
+        GltfImportOptions {
+            max_external_resource_bytes: 64,
+            ..GltfImportOptions::default()
+        },
+    )
+    .expect_err("external image exceeds configured per-file budget");
+    assert!(matches!(
+        error,
+        GltfImportError::ResourceLimitExceeded {
+            resource,
+            actual_bytes: 70,
+            limit_bytes: 64,
+            ..
+        } if resource == "image.png"
+    ));
+}

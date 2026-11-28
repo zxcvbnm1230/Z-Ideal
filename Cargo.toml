@@ -29,6 +29,8 @@ ash-window = "=0.13.0"
 raw-window-handle = "=0.6.2"
 glam = { version = "=0.34.3", features = ["serde"] }
 gltf = "=1.4.1"
+base64 = "=0.13.1"
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png"] }
 urlencoding = "=2.1.3"
 shaderc = { version = "=0.10.1", features = ["build-from-source"] }
 serde = { version = "1", features = ["derive"] }

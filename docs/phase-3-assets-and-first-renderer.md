@@ -40,24 +40,24 @@
 
 ## Known limitations and next work
 
-- GltfImporter::import_with_options now enforces pre-allocation source-document, per-external-file, and aggregate external-file byte budgets (defaults: 64 MiB, 256 MiB, and 512 MiB). Embedded data URIs and GLB chunks are bounded by the source-document limit. Decoded-image expansion is not yet bounded, and canonical-path validation still has a symlink time-of-check/time-of-use race; treat imports as trusted project content until those are resolved.
-- Image channel formats and decoded bytes are preserved. VulkanTexture2D maps normalized integer channels to UNORM formats and currently uploads one mip level with sampler LOD clamped to zero. sRGB/linear usage selection, mip generation, and imported material descriptor binding are not yet integrated.
+- GltfImporter::import_with_options enforces bounded source-document reads (64 MiB default), per-external-file and aggregate external-resource budgets (256 MiB and 512 MiB defaults), strict decoded image dimensions (16,384 by 16,384), decoded output bytes per image (256 MiB), and aggregate decoded image bytes (512 MiB). Decoded output size is checked before allocating the pixel buffer and the image decoder receives matching limits; some decoder-internal temporary allocations remain best-effort. External buffer and image reads are bounded to the configured per-file limit, and actual bytes across distinct canonical paths are checked against the aggregate limit. Canonical-path validation still retains a symlink/file-replacement time-of-check/time-of-use race; treat imports as trusted project content until that is resolved.
+- Embedded image data URIs currently require base64 encoding. Image channel formats and decoded bytes are preserved. VulkanTexture2D maps normalized integer channels to UNORM formats and currently uploads one mip level with sampler LOD clamped to zero. sRGB/linear usage selection, mip generation, and imported material descriptor binding are not yet integrated.
 - ECS instantiation preserves node transforms, hierarchy, names, and mesh references, but does not yet instantiate skinning, morph targets, animation channels, tangents, or extension-defined material behavior.
 - Asset catalog registration is currently an explicit API; the importer does not yet compute a complete transitive content fingerprint or automatically populate metadata and dependency records.
 - VulkanSceneMeshes remains a geometry adapter. VulkanTexture2D is a separate image/sampler upload path and is not yet wired into per-material descriptor sets or draw submission. Imported material binding, shader material contracts, HDR color targets, tone mapping, and a complete runtime-owned scene renderer remain outstanding.
-- Malformed-resource testing must be expanded to truncated buffers, invalid accessors, malformed images, unsupported encodings/extensions, decoded-image allocation limits, and symlink race conditions. Source, per-file external, and aggregate external byte budgets now have regression coverage.
+- Malformed-resource testing must be expanded to truncated buffers, invalid accessors, malformed images, unsupported encodings/extensions, and symlink race conditions. Source, per-file external, aggregate external, strict image dimension, per-image decoded-byte, and aggregate decoded-image budgets now have regression coverage.
 - The Vulkan CI workflow runs lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation under Xvfb. Hardware-specific driver coverage remains separate.
 
 ## Current validation
 
-Local validation after the importer-budget, sample-render, and Vulkan texture-upload changes:
+Local validation after external/decoded-image budgets, sample-render, and Vulkan texture-upload changes:
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --all-features` — 213 passed, 4 GPU integration tests ignored by default, 0 failed.
+- `cargo test --workspace --all-features` — 220 passed, 4 GPU integration tests ignored by default, 0 failed.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps` — passed.
 - `git diff --check` — passed.
 
 Both runtime Vulkan integration tests were run manually on the connected NVIDIA GeForce 940MX host with Khronos validation enabled. The imported glTF -> ECS -> snapshot -> mesh upload -> texture upload/sampler creation -> offscreen pixel-readback regression passed, as did the adapter/lifetime/error test. No Vulkan validation errors were reported.
 
-GitHub CI on commit `42589ea` passed the Windows, macOS, and Ubuntu quality jobs, and the Vulkan workflow passed lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation. The current Vulkan texture-upload changes still require a new CI run after they are committed and pushed.
+GitHub CI on commit `0ffe929` passed the Windows, macOS, and Ubuntu quality jobs, and the Vulkan workflow passed lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation. The current bounded external/image decoder changes still require a new CI run after they are committed and pushed.
