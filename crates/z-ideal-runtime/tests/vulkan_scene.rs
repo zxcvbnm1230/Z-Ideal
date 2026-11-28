@@ -1027,11 +1027,20 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                         outer_cone_cos: 0.8,
                         kind: GltfPbrLocalLightKind::Spot,
                     },
-                    GltfPbrLocalLight::default(),
+                    GltfPbrLocalLight {
+                        position: [1.0, 0.0, 2.0],
+                        range: 10.0,
+                        color: [0.4, 0.2, 0.1],
+                        intensity: 0.25,
+                        direction: [0.0, 0.0, -1.0],
+                        inner_cone_cos: 1.0,
+                        outer_cone_cos: 0.0,
+                        kind: GltfPbrLocalLightKind::Point,
+                    },
                     GltfPbrLocalLight::default(),
                     GltfPbrLocalLight::default(),
                 ],
-                local_light_count: 1,
+                local_light_count: 2,
             },
             GltfPbrEnvironmentResources {
                 diffuse_irradiance: z_ideal_runtime::GltfMaterialTextureResource {
@@ -1304,6 +1313,8 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         readback
             .read(0, &mut pixels)
             .expect("read PBR output pixels");
+        std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
+            .expect("write temporary point/spot reference");
         std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
             .expect("write temporary AO PBR reference");
         let center = &pixels[(16 * 32 + 16) * 4..][..4];
