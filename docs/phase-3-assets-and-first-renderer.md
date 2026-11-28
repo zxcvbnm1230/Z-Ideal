@@ -35,6 +35,7 @@
 - The runtime crate instantiates selected glTF scenes transactionally into ECS entities. It preserves local transforms, parent/child relationships, optional node names, source node indices, and mesh-instance references to a project-relative source URI and imported mesh index. It supports explicit scene selection and the declared default scene. Malformed reachable hierarchy data is rejected before entities are created; ECS failures trigger rollback of entities created by the operation. Runtime components participate in versioned scene serialization.
 - MeshGpu validates triangle-list geometry and uploads interleaved position/UV vertices plus 32-bit indices into explicitly owned Vulkan upload buffers. Its vertex layout is exposed as matching Vulkan binding/attribute descriptions. MeshGpu::record_draw composes view-projection and model matrices, writes a validated 64-byte column-major vertex push constant, binds the mesh buffers, and records an indexed draw.
 - VulkanSceneMeshes is a runtime-side Vulkan adapter. It resolves each distinct logical mesh reference against AssetCache<GltfImport>, uploads all primitives through MeshGpu, pins strong CPU asset handles, and reports missing/ambiguous/empty mesh references or upload errors explicitly. Construction is transactional. `record_upload_barriers` records HOST_WRITE -> VERTEX_INPUT synchronization before the consuming render pass; `record_draws` records one indexed draw per primitive instance inside the pass. The caller binds a compatible pipeline and owns render-pass, framebuffer, viewport/scissor, queue submission, and frame synchronization.
+- A checked-in glTF sample fixture now has a hardware-validated end-to-end regression: import the file, instantiate its default scene into ECS, extract the camera/mesh snapshot, resolve and upload the asset through VulkanSceneMeshes, render offscreen, copy RGBA8 pixels to host memory, and assert exact center/clear pixel values.
 
 ## Known limitations and next work
 
@@ -48,14 +49,14 @@
 
 ## Current validation
 
-Local validation after the runtime Vulkan adapter and glTF byte-budget changes:
+Local validation after the importer-budget and end-to-end sample-render changes:
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --all-features` — 210 passed, 3 GPU integration tests ignored by default, 0 failed.
+- `cargo test --workspace --all-features` — 210 passed, 4 GPU integration tests ignored by default, 0 failed.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps` — passed.
 - `git diff --check` — passed.
 
-The runtime Vulkan integration test was run manually on the connected NVIDIA Vulkan host with Khronos validation enabled. It verifies explicit missing-asset, missing-mesh, and unsupported-topology errors; shared-mesh upload deduplication; retained asset-handle lifetime after cache eviction; upload barriers recorded before the render pass; and indexed draw recording for two instances. It completed with no Vulkan validation errors.
+Both runtime Vulkan integration tests were run manually on the connected NVIDIA GeForce 940MX host with Khronos validation enabled: the adapter/lifetime/error test and the imported glTF -> ECS -> snapshot -> GPU upload -> offscreen pixel-readback regression. Both passed with no Vulkan validation errors.
 
-GitHub CI on commit `3f47c6c` passed the Windows, macOS, and Ubuntu quality jobs, and the Vulkan workflow passed lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation. The current glTF import-budget changes still require a new CI run after they are committed and pushed.
+GitHub CI on commit `3f47c6c` passed the Windows, macOS, and Ubuntu quality jobs, and the Vulkan workflow passed lavapipe offscreen readback, runtime scene-mesh upload, and X11 swapchain/depth validation. The glTF import-budget and end-to-end sample-render regression changes still require a new CI run after they are committed and pushed.

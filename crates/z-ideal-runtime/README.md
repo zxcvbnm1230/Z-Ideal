@@ -23,3 +23,11 @@ Camera selection is explicit when multiple cameras exist. Extraction rejects mis
 The adapter retains strong `AssetHandle<GltfImport>` values for the imported assets and owns the resulting `MeshGpu` resources. It borrows the Vulkan device, so it must be dropped before that device. Call `record_upload_barriers` while recording commands outside the consuming render pass; Vulkan does not permit this ordinary barrier inside a render pass. Then bind a compatible graphics pipeline inside the render pass and call `record_draws` to draw every primitive for each snapshot instance using the snapshot view-projection matrix and each instance's model matrix.
 
 The caller must bind a graphics pipeline compatible with `MeshGpu::vertex_binding`, `MeshGpu::vertex_attributes`, and its 64-byte vertex push-constant range before recording. The caller still owns render-pass/framebuffer setup, viewport/scissor, pipeline selection, queue submission, and frame synchronization. This adapter does not yet bind imported materials or textures and does not provide HDR or tone mapping.
+
+## Vulkan regression coverage
+
+The ignored vulkan_scene integration tests exercise mesh-reference resolution, upload lifetime and error paths, and an end-to-end imported sample scene. The sample test imports tests/fixtures/sample_scene.gltf, instantiates its default scene into an ECS world, extracts a camera snapshot, uploads the referenced mesh, renders to an offscreen RGBA8 target, reads the pixels back, and checks known center and clear pixels.
+
+Run these tests on a Vulkan host with the Khronos validation layer:
+
+cargo test -p z-ideal-runtime --test vulkan_scene --all-features -- --ignored --nocapture

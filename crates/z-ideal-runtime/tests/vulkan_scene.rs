@@ -2,20 +2,22 @@ use std::sync::Arc;
 
 use ash::vk;
 use z_ideal_assets::{
-    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, ImportedMesh, ImportedPrimitive,
-    PrimitiveTopology,
+    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, GltfImporter, ImportedMesh,
+    ImportedPrimitive, PrimitiveTopology,
 };
-use z_ideal_math::Mat4;
+use z_ideal_math::{Mat4, PerspectiveCamera, Quat, Transform, Vec3};
 use z_ideal_renderer::{
-    CommandPoolConfig, FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig,
-    MeshUploadError, RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
-    RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanCommandPool, VulkanConfig,
-    VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage, VulkanInstance,
-    VulkanPipelineLayout, VulkanQueue, VulkanRenderPass, VulkanShaderModule, compile_glsl,
+    BufferBarrier, BufferConfig, BufferMemoryLocation, CommandPoolConfig, FenceWaitResult,
+    GraphicsPipelineConfig, ImageConfig, ImageViewConfig, MeshUploadError,
+    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
+    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanBuffer,
+    VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline,
+    VulkanImage, VulkanInstance, VulkanPipelineLayout, VulkanQueue, VulkanRenderPass,
+    VulkanShaderModule, compile_glsl,
 };
 use z_ideal_runtime::{
     GltfMeshInstance, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
-    VulkanSceneMeshesError,
+    VulkanSceneMeshesError, extract_render_scene, instantiate_default_gltf_scene,
 };
 use z_ideal_scene::World;
 
@@ -67,7 +69,7 @@ fn record_scene_draws(
     device: &VulkanDevice,
     gpu_scene: &VulkanSceneMeshes<'_>,
     scene: &RenderSceneSnapshot,
-) -> usize {
+) -> (usize, Vec<u8>) {
     const WIDTH: u32 = 32;
     const HEIGHT: u32 = 32;
     let image_config = ImageConfig {
@@ -82,7 +84,7 @@ fn record_scene_draws(
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
-        usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
         flags: vk::ImageCreateFlags::empty(),
     };
     let image = VulkanImage::new(device, image_config).expect("create scene color target");
@@ -100,7 +102,7 @@ fn record_scene_draws(
                 stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
                 stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
                 initial_layout: vk::ImageLayout::UNDEFINED,
-                final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             }],
             subpasses: vec![RenderPassSubpassConfig {
                 color_attachments: vec![RenderPassAttachmentReference {
@@ -109,7 +111,15 @@ fn record_scene_draws(
                 }],
                 ..RenderPassSubpassConfig::default()
             }],
-            dependencies: Vec::new(),
+            dependencies: vec![RenderPassDependency {
+                source_subpass: 0,
+                destination_subpass: vk::SUBPASS_EXTERNAL,
+                source_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                destination_stage_mask: vk::PipelineStageFlags::TRANSFER,
+                source_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                destination_access_mask: vk::AccessFlags::TRANSFER_READ,
+                flags: vk::DependencyFlags::BY_REGION,
+            }],
         },
     )
     .expect("create scene render pass");
@@ -161,6 +171,15 @@ fn record_scene_draws(
     )
     .expect("create scene graphics pipeline");
 
+    let mut readback = VulkanBuffer::new(
+        device,
+        BufferConfig {
+            size: u64::from(WIDTH) * u64::from(HEIGHT) * 4,
+            usage: vk::BufferUsageFlags::TRANSFER_DST,
+            memory: BufferMemoryLocation::Readback,
+        },
+    )
+    .expect("create scene readback buffer");
     let command_pool = VulkanCommandPool::new(device, CommandPoolConfig::default())
         .expect("create scene command pool");
     let mut command_buffer = command_pool
@@ -206,6 +225,46 @@ fn record_scene_draws(
         .record_draws(scene, &mut recording, &pipeline_layout)
         .expect("record runtime scene draws");
     recording.end_render_pass().expect("end scene render pass");
+    let copy_region = [vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(vk::Extent3D {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: 1,
+        })];
+    recording
+        .copy_image_to_buffer(
+            &image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            &readback,
+            &copy_region,
+        )
+        .expect("copy rendered scene to readback buffer");
+    recording
+        .pipeline_barrier(
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[BufferBarrier {
+                buffer: &readback,
+                source_access: vk::AccessFlags::TRANSFER_WRITE,
+                destination_access: vk::AccessFlags::HOST_READ,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            }],
+            &[],
+        )
+        .expect("make rendered pixels visible to the host");
     let executable = recording.end().expect("finish scene command buffer");
     let queue = VulkanQueue::graphics(device);
     let mut submission = queue
@@ -217,7 +276,11 @@ fn record_scene_draws(
     );
     drop(submission);
 
-    draw_count
+    let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+    readback
+        .read(0, &mut pixels)
+        .expect("read rendered scene pixels");
+    (draw_count, pixels)
 }
 
 #[test]
@@ -278,11 +341,18 @@ fn snapshot_mesh_references_resolve_upload_and_record_draws_validation_clean() {
         1,
         "shared mesh uploaded more than once"
     );
+    let (draw_count, pixels) = record_scene_draws(&device, &gpu_scene, &scene_snapshot);
     assert_eq!(
-        record_scene_draws(&device, &gpu_scene, &scene_snapshot),
-        2,
+        draw_count, 2,
         "one draw per primitive instance should be recorded"
     );
+    let center = &pixels[((16 * 32 + 16) * 4)..][..4];
+    assert_eq!(
+        center,
+        &[255, 64, 0, 255],
+        "unexpected scene pixel: {center:?}"
+    );
+    assert_eq!(&pixels[..4], &[0, 0, 0, 255], "unexpected clear pixel");
     assert!(cache.remove(asset_id).is_some());
     assert_eq!(
         gpu_scene.asset_count(),
@@ -293,6 +363,82 @@ fn snapshot_mesh_references_resolve_upload_and_record_draws_validation_clean() {
     drop(gpu_scene);
     drop(device);
 
+    let validation_errors: Vec<_> = instance
+        .validation_messages()
+        .expect("read Vulkan validation diagnostics")
+        .into_iter()
+        .filter(|message| {
+            message
+                .severity
+                .contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+        })
+        .collect();
+    assert!(
+        validation_errors.is_empty(),
+        "Vulkan validation reported errors: {validation_errors:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan ICD and Khronos validation layer; run with --ignored on a Vulkan host"]
+fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
+    let source_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_scene.gltf");
+    let imported = GltfImporter::import(&source_path).expect("import deterministic glTF fixture");
+    let source_uri = AssetUri::new("fixtures/sample_scene.gltf").expect("valid project asset URI");
+
+    let mut world = World::new();
+    let instance = instantiate_default_gltf_scene(&mut world, &imported, source_uri.clone())
+        .expect("instantiate imported default scene");
+    assert_eq!(instance.nodes.len(), 1);
+    world
+        .register_component::<PerspectiveCamera>()
+        .expect("register perspective camera component");
+    let camera_entity = world.spawn().expect("spawn camera entity");
+    world
+        .insert(
+            camera_entity,
+            PerspectiveCamera::new(1.0, 1.0, 0.1, 100.0).expect("valid perspective camera"),
+        )
+        .expect("attach perspective camera");
+    world
+        .insert(
+            camera_entity,
+            Transform::new(Vec3::new(0.0, 0.0, 5.0), Quat::IDENTITY, Vec3::ONE)
+                .expect("valid camera transform"),
+        )
+        .expect("attach camera transform");
+    let scene_snapshot =
+        extract_render_scene(&world, camera_entity).expect("extract imported scene snapshot");
+    assert_eq!(scene_snapshot.meshes.len(), 1);
+
+    let asset_id = AssetId::from_uri(AssetKind::Mesh, &source_uri);
+    let mut cache = AssetCache::new();
+    cache
+        .insert(asset_id, imported)
+        .expect("cache imported sample scene");
+    let instance = Arc::new(
+        VulkanInstance::new(&VulkanConfig {
+            application_name: "Z Ideal imported glTF scene render regression".to_owned(),
+            enable_validation: true,
+        })
+        .expect("create Vulkan instance with validation enabled"),
+    );
+    let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan device");
+    let gpu_scene = VulkanSceneMeshes::upload(&device, &cache, &scene_snapshot)
+        .expect("upload imported scene meshes");
+    let (draw_count, pixels) = record_scene_draws(&device, &gpu_scene, &scene_snapshot);
+    assert_eq!(draw_count, 1, "expected one imported primitive draw");
+    let center = &pixels[((16 * 32 + 16) * 4)..][..4];
+    assert_eq!(
+        center,
+        &[255, 64, 0, 255],
+        "unexpected rendered sample pixel: {center:?}"
+    );
+    assert_eq!(&pixels[..4], &[0, 0, 0, 255], "unexpected clear pixel");
+
+    drop(gpu_scene);
+    drop(device);
     let validation_errors: Vec<_> = instance
         .validation_messages()
         .expect("read Vulkan validation diagnostics")
