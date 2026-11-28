@@ -1253,6 +1253,7 @@ mod memory_quota_tests {
             ScriptConfig {
                 instruction_budget: 10_000_000,
                 memory_limit_bytes: MIN_SCRIPT_MEMORY_LIMIT_BYTES,
+                ..ScriptConfig::default()
             },
         )
         .expect("load bounded script");
@@ -1271,5 +1272,75 @@ mod memory_quota_tests {
         assert_eq!(script.state(), ScriptState::Started);
         assert!(script.memory_used_bytes() <= script.memory_limit_bytes());
         assert!(world.entities().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod time_budget_tests {
+    use crate::{
+        DEFAULT_SCRIPT_TIME_BUDGET, MAX_SCRIPT_INSTRUCTION_BUDGET, MAX_SCRIPT_TIME_BUDGET,
+        MIN_SCRIPT_TIME_BUDGET, ScriptConfig, ScriptError, ScriptInstance, ScriptPhase,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn rejects_time_budgets_outside_supported_bounds() {
+        for time_budget in [
+            Duration::ZERO,
+            MAX_SCRIPT_TIME_BUDGET + Duration::from_millis(1),
+        ] {
+            assert!(matches!(
+                ScriptInstance::load(
+                    "invalid_time_budget.lua",
+                    "return {}",
+                    ScriptConfig {
+                        time_budget,
+                        ..ScriptConfig::default()
+                    },
+                ),
+                Err(ScriptError::InvalidTimeBudget { .. })
+            ));
+        }
+
+        let script = ScriptInstance::load(
+            "default_time_budget.lua",
+            "return {}",
+            ScriptConfig::default(),
+        )
+        .expect("default time budget");
+        assert_eq!(script.time_budget(), DEFAULT_SCRIPT_TIME_BUDGET);
+        let minimum = ScriptInstance::load(
+            "minimum_time_budget.lua",
+            "return {}",
+            ScriptConfig {
+                time_budget: MIN_SCRIPT_TIME_BUDGET,
+                ..ScriptConfig::default()
+            },
+        )
+        .expect("minimum time budget");
+        assert_eq!(minimum.time_budget(), MIN_SCRIPT_TIME_BUDGET);
+    }
+
+    #[test]
+    fn elapsed_time_budget_interrupts_a_non_terminating_callback() {
+        let mut script = ScriptInstance::load(
+            "time_budget.lua",
+            "return { update = function() while true do end end }",
+            ScriptConfig {
+                instruction_budget: MAX_SCRIPT_INSTRUCTION_BUDGET,
+                time_budget: Duration::from_millis(5),
+                ..ScriptConfig::default()
+            },
+        )
+        .expect("load timed script");
+        script.start().expect("start");
+        let started_at = Instant::now();
+        let error = script.update(0.016).expect_err("elapsed-time budget");
+        let ScriptError::Execution { phase, message, .. } = error else {
+            panic!("expected time-budget execution error");
+        };
+        assert_eq!(phase, ScriptPhase::Update);
+        assert!(message.contains("script time budget exceeded"));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 }

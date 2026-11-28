@@ -168,22 +168,25 @@ removed from the base environment. Source is limited to 1 MiB. Each top-level
 chunk and lifecycle callback has an independent instruction budget (100,000
 by default, capped at 100,000,000), checked every 1,000 Lua VM instructions.
 Each VM also has a per-instance allocator limit (16 MiB by default, configurable
-from 256 KiB through 64 MiB). Allocation beyond the limit returns an execution
-error and discards that callback's uncommitted scene commands. The
-memory_used_bytes and memory_limit_bytes accessors expose VM memory diagnostics.
+from 256 KiB through 64 MiB). Each chunk and callback also has a 50 ms elapsed
+time budget by default, configurable from 1 ms through 5 s and checked at the
+same instruction-hook interval. Allocation or elapsed-time exhaustion returns
+an execution error and discards that callback's uncommitted scene commands.
+The memory_used_bytes, memory_limit_bytes and time_budget accessors expose
+runtime budget diagnostics.
 This allocator limit does not include Rust-side component snapshots or other
 host allocations. Protected calls are unavailable so a script cannot catch
-and suppress instruction-budget or allocation errors.
+and suppress instruction-budget, time-budget or allocation errors.
 
-**This is not yet a complete hostile-code sandbox.** There is no wall-clock
-deadline or quota for expensive native host APIs. Instruction accounting does
-not bound time spent inside a native call. Only run trusted project scripts
+**This is not yet a complete hostile-code sandbox.** The elapsed-time check cannot interrupt a long-running native host call, and
+there is no quota for expensive native host APIs. The time budget is therefore
+a soft Lua-execution bound, not a hard callback deadline. Only run trusted project scripts
 until those additional controls and a formal trust policy are in place.
 
 ## Remaining Phase 5 work
 
 - Filesystem discovery/build cooking for imported script source and
   runtime/editor diagnostics integration.
-- Wall-clock and host API quotas, plus a documented trusted/untrusted script policy.
+- Hard deadlines for native host calls and native API quotas, plus a documented trusted/untrusted script policy.
 - Automatic hot reload of running scripts with explicit state migration.
 - Broader integration into the packaged runtime loop and editor play mode.

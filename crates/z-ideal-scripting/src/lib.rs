@@ -19,6 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use z_ideal_math::{Quat, Transform, Vec3};
 use z_ideal_scene::{
@@ -46,6 +47,12 @@ pub const MIN_SCRIPT_MEMORY_LIMIT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum Lua VM memory limit, in bytes.
 pub const MAX_SCRIPT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// Minimum per-chunk and per-callback elapsed-time budget.
+pub const MIN_SCRIPT_TIME_BUDGET: Duration = Duration::from_millis(1);
+/// Default per-chunk and per-callback elapsed-time budget.
+pub const DEFAULT_SCRIPT_TIME_BUDGET: Duration = Duration::from_millis(50);
+/// Maximum per-chunk and per-callback elapsed-time budget.
+pub const MAX_SCRIPT_TIME_BUDGET: Duration = Duration::from_secs(5);
 
 /// Configuration for one isolated Lua script instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,11 @@ pub struct ScriptConfig {
     pub instruction_budget: u64,
     /// Maximum memory allocated by this Lua VM, including its standard libraries.
     pub memory_limit_bytes: usize,
+    /// Maximum elapsed time for top-level evaluation and each lifecycle callback.
+    ///
+    /// The VM checks elapsed time every instruction hook interval. Long native
+    /// host calls cannot be interrupted by this Lua instruction hook.
+    pub time_budget: Duration,
 }
 
 impl Default for ScriptConfig {
@@ -65,6 +77,7 @@ impl Default for ScriptConfig {
         Self {
             instruction_budget: 100_000,
             memory_limit_bytes: DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES,
+            time_budget: DEFAULT_SCRIPT_TIME_BUDGET,
         }
     }
 }
@@ -118,6 +131,16 @@ pub enum ScriptError {
     /// The VM allocator could not apply the configured memory limit.
     #[error("failed to configure Lua VM memory limit: {0}")]
     MemoryLimitConfiguration(#[source] mlua::Error),
+    /// Configured elapsed-time budget is outside the supported range.
+    #[error("Lua script time budget {requested:?} is outside {minimum:?}..={maximum:?}")]
+    InvalidTimeBudget {
+        /// Requested time budget.
+        requested: Duration,
+        /// Minimum supported time budget.
+        minimum: Duration,
+        /// Maximum supported time budget.
+        maximum: Duration,
+    },
     /// The source exceeds the configured hard size limit.
     #[error("script source is {actual} bytes; maximum is {maximum} bytes")]
     SourceTooLarge { actual: usize, maximum: usize },
@@ -267,6 +290,8 @@ pub struct ScriptInstance {
     paused: bool,
     instruction_budget: u64,
     memory_limit_bytes: usize,
+    time_budget: Duration,
+    callback_started_at: Rc<Cell<Instant>>,
     executed_instructions: Arc<AtomicU64>,
     world_identity: Option<WorldIdentity>,
     attached_entity: Option<Entity>,
@@ -302,6 +327,13 @@ impl ScriptInstance {
                 requested: config.memory_limit_bytes,
                 minimum: MIN_SCRIPT_MEMORY_LIMIT_BYTES,
                 maximum: MAX_SCRIPT_MEMORY_LIMIT_BYTES,
+            });
+        }
+        if !(MIN_SCRIPT_TIME_BUDGET..=MAX_SCRIPT_TIME_BUDGET).contains(&config.time_budget) {
+            return Err(ScriptError::InvalidTimeBudget {
+                requested: config.time_budget,
+                minimum: MIN_SCRIPT_TIME_BUDGET,
+                maximum: MAX_SCRIPT_TIME_BUDGET,
             });
         }
         if source.len() > MAX_SCRIPT_SOURCE_BYTES {
@@ -352,6 +384,9 @@ impl ScriptInstance {
         let executed_instructions = Arc::new(AtomicU64::new(0));
         let instruction_counter = Arc::clone(&executed_instructions);
         let instruction_budget = config.instruction_budget;
+        let callback_started_at = Rc::new(Cell::new(Instant::now()));
+        let hook_started_at = Rc::clone(&callback_started_at);
+        let time_budget = config.time_budget;
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(INSTRUCTION_CHECK_INTERVAL),
             move |_, _| {
@@ -361,6 +396,11 @@ impl ScriptInstance {
                 if executed > instruction_budget {
                     return Err(mlua::Error::RuntimeError(format!(
                         "instruction budget exceeded ({instruction_budget})"
+                    )));
+                }
+                if hook_started_at.get().elapsed() > time_budget {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "script time budget exceeded ({time_budget:?})"
                     )));
                 }
                 Ok(VmState::Continue)
@@ -404,6 +444,8 @@ impl ScriptInstance {
             paused: false,
             instruction_budget,
             memory_limit_bytes: config.memory_limit_bytes,
+            time_budget: config.time_budget,
+            callback_started_at,
             executed_instructions,
             world_identity: None,
             attached_entity: None,
@@ -1319,6 +1361,7 @@ impl ScriptInstance {
         A: mlua::IntoLuaMulti,
     {
         self.executed_instructions.store(0, Ordering::Relaxed);
+        self.callback_started_at.set(Instant::now());
         callback
             .call::<()>(args)
             .map_err(|error| ScriptError::Execution {
@@ -1346,6 +1389,12 @@ impl ScriptInstance {
     #[must_use]
     pub fn memory_used_bytes(&self) -> usize {
         self.lua.used_memory()
+    }
+
+    /// Returns the configured per-chunk and per-callback elapsed-time budget.
+    #[must_use]
+    pub const fn time_budget(&self) -> Duration {
+        self.time_budget
     }
 }
 
