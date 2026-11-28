@@ -2,10 +2,14 @@
 #![forbid(unsafe_code)]
 
 mod gltf_scene;
+mod render_scene;
 
 pub use gltf_scene::{
     GltfMeshInstance, GltfNodeName, GltfSceneInstance, GltfSceneInstantiationError,
     ImportedNodeEntity, instantiate_default_gltf_scene, instantiate_gltf_scene,
+};
+pub use render_scene::{
+    RenderMeshInstance, RenderSceneExtractionError, RenderSceneSnapshot, extract_render_scene,
 };
 
 /// Returns the crate's stable package name for diagnostics and tooling.
