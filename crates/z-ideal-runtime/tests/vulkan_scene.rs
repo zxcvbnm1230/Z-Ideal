@@ -13,20 +13,20 @@ use z_ideal_renderer::{
     DescriptorSetLayoutConfig, EnvironmentLightingMaps, FenceWaitResult, GraphicsPipelineConfig,
     ImageConfig, ImageDescriptorWrite, ImageViewConfig, MeshUploadError,
     RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
-    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage,
+    RenderPassDependency, RenderPassSubpassConfig, SamplerConfig, ShaderCompileConfig, ShaderStage,
     TextureColorSpace, TextureUploadError, VulkanBuffer, VulkanCommandPool, VulkanConfig,
     VulkanDescriptorPool, VulkanDescriptorSetLayout, VulkanDevice, VulkanEnvironmentCube,
     VulkanFramebuffer, VulkanGraphicsPipeline, VulkanHdrColorTarget, VulkanImage, VulkanInstance,
-    VulkanPipelineLayout, VulkanQueue, VulkanRenderPass, VulkanShaderModule, VulkanTexture2D,
-    compile_glsl,
+    VulkanPipelineLayout, VulkanQueue, VulkanRenderPass, VulkanSampler, VulkanShaderModule,
+    VulkanTexture2D, compile_glsl,
 };
 use z_ideal_runtime::{
     GltfMaterialTextureBinding, GltfMaterialTextureSet, GltfMaterialTextureSlot, GltfMeshInstance,
-    GltfPbrLocalLight, GltfPbrLocalLightKind, GltfPbrSceneUniform, RenderMeshInstance,
-    RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError, VulkanSceneRenderer,
-    VulkanSceneViewport, VulkanShadowRenderer, compile_gltf_pbr_shaders, compile_shadow_shaders,
-    extract_render_scene, instantiate_default_gltf_scene, write_gltf_material_descriptors,
-    write_gltf_pbr_scene_descriptor,
+    GltfPbrEnvironmentResources, GltfPbrLocalLight, GltfPbrLocalLightKind, GltfPbrSceneUniform,
+    RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes, VulkanSceneMeshesError,
+    VulkanSceneRenderer, VulkanSceneViewport, VulkanShadowRenderer, compile_gltf_pbr_shaders,
+    compile_shadow_shaders, extract_render_scene, instantiate_default_gltf_scene,
+    write_gltf_material_descriptors, write_gltf_pbr_scene_descriptor,
 };
 use z_ideal_scene::World;
 
@@ -708,6 +708,117 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let specular_view = specular_cube
             .create_view()
             .expect("create prefiltered specular cube view");
+        let shadow_image = VulkanImage::new(
+            &device,
+            ImageConfig {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D {
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                },
+                format: vk::Format::D32_SFLOAT,
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+                tiling: vk::ImageTiling::OPTIMAL,
+                usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                flags: vk::ImageCreateFlags::empty(),
+            },
+        )
+        .expect("create directional shadow depth image");
+        let shadow_view = shadow_image
+            .create_view(ImageViewConfig {
+                aspect: vk::ImageAspectFlags::DEPTH,
+                ..ImageViewConfig::default()
+            })
+            .expect("create directional shadow depth view");
+        let shadow_sampler = VulkanSampler::new(
+            &device,
+            SamplerConfig {
+                mag_filter: vk::Filter::NEAREST,
+                min_filter: vk::Filter::NEAREST,
+                mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+                address_mode_u: vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                address_mode_w: vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                border_color: vk::BorderColor::FLOAT_OPAQUE_WHITE,
+                compare_op: Some(vk::CompareOp::LESS_OR_EQUAL),
+                max_lod: 0.0,
+                ..SamplerConfig::default()
+            },
+        )
+        .expect("create directional shadow comparison sampler");
+        let shadow_render_pass = VulkanRenderPass::new(
+            &device,
+            RenderPassConfig {
+                attachments: vec![RenderPassAttachmentConfig {
+                    format: vk::Format::D32_SFLOAT,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: vk::ImageLayout::UNDEFINED,
+                    final_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                }],
+                subpasses: vec![RenderPassSubpassConfig {
+                    depth_stencil_attachment: Some(RenderPassAttachmentReference {
+                        attachment: 0,
+                        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    }),
+                    ..RenderPassSubpassConfig::default()
+                }],
+                dependencies: vec![RenderPassDependency {
+                    source_subpass: 0,
+                    destination_subpass: vk::SUBPASS_EXTERNAL,
+                    source_stage_mask: vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    destination_stage_mask: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    source_access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    destination_access_mask: vk::AccessFlags::SHADER_READ,
+                    flags: vk::DependencyFlags::BY_REGION,
+                }],
+            },
+        )
+        .expect("create directional shadow clear render pass");
+        let shadow_framebuffer = VulkanFramebuffer::new(
+            &shadow_render_pass,
+            &[&shadow_view],
+            vk::Extent2D {
+                width: 32,
+                height: 32,
+            },
+            1,
+        )
+        .expect("create directional shadow framebuffer");
+        let (shadow_vertex_artifact, shadow_fragment_artifact) =
+            compile_shadow_shaders().expect("compile directional shadow shaders");
+        let shadow_vertex = VulkanShaderModule::new(&device, shadow_vertex_artifact)
+            .expect("create directional shadow vertex shader");
+        let shadow_fragment = VulkanShaderModule::new(&device, shadow_fragment_artifact)
+            .expect("create directional shadow fragment shader");
+        let shadow_push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(64)];
+        let shadow_layout = VulkanPipelineLayout::new(&device, &[], &shadow_push_constants)
+            .expect("create directional shadow pipeline layout");
+        let shadow_pipeline_config = GraphicsPipelineConfig {
+            vertex_bindings: vec![z_ideal_renderer::MeshGpu::vertex_binding()],
+            vertex_attributes: vec![z_ideal_renderer::MeshGpu::vertex_attributes()[0]],
+            depth_test_enable: true,
+            depth_write_enable: true,
+            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            ..GraphicsPipelineConfig::default()
+        };
+        let shadow_renderer = VulkanShadowRenderer::new(
+            &shadow_layout,
+            &shadow_vertex,
+            &shadow_fragment,
+            &shadow_render_pass,
+            &shadow_pipeline_config,
+        )
+        .expect("create directional shadow renderer");
 
         let material_layout = VulkanDescriptorSetLayout::new(
             &device,
@@ -750,6 +861,12 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                         descriptor_count: 1,
                         stage_flags: vk::ShaderStageFlags::FRAGMENT,
                     },
+                    DescriptorBinding {
+                        binding: 3,
+                        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    },
                 ],
             },
         )
@@ -765,7 +882,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                     },
                     DescriptorPoolSize {
                         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 7,
+                        descriptor_count: 8,
                     },
                 ],
             },
@@ -789,7 +906,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let mut scene_buffer = VulkanBuffer::new(
             &device,
             BufferConfig {
-                size: 352,
+                size: 432,
                 usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
                 memory: BufferMemoryLocation::Upload,
             },
@@ -808,11 +925,13 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             GltfPbrSceneUniform {
                 camera_position: [0.0, 0.0, 5.0],
                 light_direction: [0.0, 0.0, -1.0],
-                light_intensity: 0.0,
+                light_intensity: 1.0,
                 light_color: [1.0, 1.0, 1.0],
                 ambient_color: [0.0, 0.0, 0.0],
                 environment_intensity: 1.0,
                 environment_max_lod: (specular_cube.mip_levels() - 1) as f32,
+                light_view_projection: (scene.projection * scene.view).to_cols_array_2d(),
+                shadow_parameters: [1.0, 0.001, 1.0, 0.0],
                 local_lights: [
                     GltfPbrLocalLight {
                         position: [0.0, 0.0, 2.0],
@@ -830,10 +949,20 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 ],
                 local_light_count: 1,
             },
-            &irradiance_view,
-            irradiance_cube.sampler(),
-            &specular_view,
-            specular_cube.sampler(),
+            GltfPbrEnvironmentResources {
+                diffuse_irradiance: z_ideal_runtime::GltfMaterialTextureResource {
+                    view: &irradiance_view,
+                    sampler: irradiance_cube.sampler(),
+                },
+                prefiltered_specular: z_ideal_runtime::GltfMaterialTextureResource {
+                    view: &specular_view,
+                    sampler: specular_cube.sampler(),
+                },
+                directional_shadow: z_ideal_runtime::GltfMaterialTextureResource {
+                    view: &shadow_view,
+                    sampler: &shadow_sampler,
+                },
+            },
         )
         .expect("write scene lighting descriptor");
 
@@ -951,6 +1080,43 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         gpu_scene
             .record_upload_barriers(&mut recording)
             .expect("synchronize PBR mesh uploads");
+        let shadow_clear = [vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        }];
+        recording
+            .begin_render_pass(&shadow_render_pass, &shadow_framebuffer, &shadow_clear)
+            .expect("begin directional shadow-map pass");
+        let shadow_draws = shadow_renderer
+            .record(
+                &gpu_scene,
+                &scene,
+                &mut recording,
+                VulkanSceneViewport {
+                    viewport: vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 32.0,
+                        height: 32.0,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    },
+                    scissor: vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: 32,
+                            height: 32,
+                        },
+                    },
+                },
+            )
+            .expect("record directional shadow mesh draws");
+        assert_eq!(shadow_draws, 1);
+        recording
+            .end_render_pass()
+            .expect("finish directional shadow-map pass");
         recording
             .begin_render_pass(&render_pass, &framebuffer, &clear)
             .expect("begin PBR render pass");

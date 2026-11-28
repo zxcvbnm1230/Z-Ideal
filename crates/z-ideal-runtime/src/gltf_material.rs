@@ -121,7 +121,9 @@ fn validate_scene_uniform(scene: GltfPbrSceneUniform) -> Result<(), GltfMaterial
         .chain([scene.light_intensity])
         .chain(scene.light_color)
         .chain(scene.ambient_color)
-        .chain([scene.environment_intensity, scene.environment_max_lod]);
+        .chain([scene.environment_intensity, scene.environment_max_lod])
+        .chain(scene.light_view_projection.into_iter().flatten())
+        .chain(scene.shadow_parameters);
     if values.clone().any(|value| !value.is_finite())
         || scene.light_direction.iter().all(|value| *value == 0.0)
         || scene.light_intensity < 0.0
@@ -129,6 +131,11 @@ fn validate_scene_uniform(scene: GltfPbrSceneUniform) -> Result<(), GltfMaterial
         || scene.ambient_color.iter().any(|value| *value < 0.0)
         || scene.environment_intensity < 0.0
         || scene.environment_max_lod < 0.0
+        || scene.shadow_parameters[0] < 0.0
+        || (scene.shadow_parameters[0] != 0.0 && scene.shadow_parameters[0] != 1.0)
+        || scene.shadow_parameters[1] < 0.0
+        || scene.shadow_parameters[2] < 0.0
+        || scene.shadow_parameters[2] > 1.0
         || scene.local_light_count as usize > MAX_GLTF_PBR_LOCAL_LIGHTS
     {
         return Err(GltfMaterialError::InvalidSceneValues);
@@ -275,6 +282,10 @@ pub struct GltfPbrSceneUniform {
     pub environment_intensity: f32,
     /// Maximum roughness-prefiltered specular mip level.
     pub environment_max_lod: f32,
+    /// Column-major light view-projection matrix used for the directional shadow map.
+    pub light_view_projection: [[f32; 4]; 4],
+    /// Shadow enable (0 or 1), depth bias, strength (0..=1), and reserved value.
+    pub shadow_parameters: [f32; 4],
     /// Fixed-capacity local-light storage. Only the first `local_light_count` entries are active.
     pub local_lights: [GltfPbrLocalLight; MAX_GLTF_PBR_LOCAL_LIGHTS],
     /// Number of active entries in `local_lights`, at most four.
@@ -282,9 +293,9 @@ pub struct GltfPbrSceneUniform {
 }
 
 impl GltfPbrSceneUniform {
-    /// Encodes five global std140 vectors, a light count vector, and four 64-byte light records.
+    /// Encodes global vectors, four light records, a light VP matrix, and shadow parameters.
     #[must_use]
-    pub fn to_std140_bytes(self) -> [u8; 352] {
+    pub fn to_std140_bytes(self) -> [u8; 432] {
         let vectors = [
             [
                 self.camera_position[0],
@@ -317,7 +328,7 @@ impl GltfPbrSceneUniform {
                 0.0,
             ],
         ];
-        let mut bytes = [0_u8; 352];
+        let mut bytes = [0_u8; 432];
         for (index, value) in vectors.into_iter().flatten().enumerate() {
             let offset = index * 4;
             bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -359,6 +370,14 @@ impl GltfPbrSceneUniform {
                 let offset = base + vector_index * 4;
                 bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
             }
+        }
+        for (index, value) in self.light_view_projection.into_iter().flatten().enumerate() {
+            let offset = 352 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, value) in self.shadow_parameters.into_iter().enumerate() {
+            let offset = 416 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
     }
@@ -419,34 +438,43 @@ pub(crate) fn apply_gltf_material_pipeline_variant(
     Ok(())
 }
 
+/// Borrowed environment and shadow textures consumed by the PBR scene descriptor.
+#[derive(Clone, Copy)]
+pub struct GltfPbrEnvironmentResources<'resource, 'image, 'device> {
+    /// Diffuse irradiance cube, sampled with the world-space surface normal.
+    pub diffuse_irradiance: GltfMaterialTextureResource<'resource, 'image, 'device>,
+    /// GGX roughness-prefiltered specular cube.
+    pub prefiltered_specular: GltfMaterialTextureResource<'resource, 'image, 'device>,
+    /// Directional-light depth image with a comparison sampler.
+    pub directional_shadow: GltfMaterialTextureResource<'resource, 'image, 'device>,
+}
+
 /// Writes the PBR scene uniform and image-based lighting resources to descriptor set 1.
 ///
-/// Binding 0 is the 352-byte std140 scene block; bindings 1 and 2 are combined
-/// cube samplers for diffuse irradiance and roughness-prefiltered specular radiance.
+/// Binding 0 is the 432-byte std140 scene block; bindings 1 and 2 are combined
+/// cube samplers for diffuse irradiance and roughness-prefiltered specular radiance;
+/// binding 3 is a comparison sampler for the directional-light depth map.
 /// The caller owns the views, images, samplers, buffer, and descriptor set. The
 /// returned lease borrows all referenced resources for the duration of GPU use.
 pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 'device>(
     descriptor_set: &'set mut VulkanDescriptorSet<'pool, 'layout, 'device>,
     uniform_buffer: &'resource mut VulkanBuffer<'device>,
     scene: GltfPbrSceneUniform,
-    irradiance_view: &'image VulkanImageView<'_, 'device>,
-    irradiance_sampler: &'resource VulkanSampler<'device>,
-    specular_view: &'image VulkanImageView<'_, 'device>,
-    specular_sampler: &'resource VulkanSampler<'device>,
+    environment: GltfPbrEnvironmentResources<'resource, 'image, 'device>,
 ) -> Result<
     DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device>,
     GltfMaterialError,
 > {
     validate_scene_uniform(scene)?;
     let bindings = &descriptor_set.layout().config().bindings;
-    if bindings.len() != 3
+    if bindings.len() != 4
         || bindings.iter().any(|binding| {
             let expected_type = if binding.binding == 0 {
                 vk::DescriptorType::UNIFORM_BUFFER
             } else {
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER
             };
-            binding.binding > 2
+            binding.binding > 3
                 || binding.descriptor_type != expected_type
                 || binding.descriptor_count != 1
                 || !binding.stage_flags.contains(vk::ShaderStageFlags::FRAGMENT)
@@ -454,7 +482,7 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
     {
         return Err(GltfMaterialError::DescriptorLayoutMismatch);
     }
-    if uniform_buffer.size() < 352 {
+    if uniform_buffer.size() < 432 {
         return Err(GltfMaterialError::UniformBufferTooSmall);
     }
     uniform_buffer.write(0, &scene.to_std140_bytes())?;
@@ -464,21 +492,28 @@ pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 
             array_element: 0,
             buffer: uniform_buffer,
             offset: 0,
-            range: 352,
+            range: 432,
         }),
         DescriptorResourceWrite::Image(ImageDescriptorWrite {
             binding: 1,
             array_element: 0,
-            view: irradiance_view,
-            sampler: Some(irradiance_sampler),
+            view: environment.diffuse_irradiance.view,
+            sampler: Some(environment.diffuse_irradiance.sampler),
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }),
         DescriptorResourceWrite::Image(ImageDescriptorWrite {
             binding: 2,
             array_element: 0,
-            view: specular_view,
-            sampler: Some(specular_sampler),
+            view: environment.prefiltered_specular.view,
+            sampler: Some(environment.prefiltered_specular.sampler),
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }),
+        DescriptorResourceWrite::Image(ImageDescriptorWrite {
+            binding: 3,
+            array_element: 0,
+            view: environment.directional_shadow.view,
+            sampler: Some(environment.directional_shadow.sampler),
+            image_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
         }),
     ])?)
 }
@@ -872,6 +907,13 @@ mod tests {
             ambient_color: [0.1; 3],
             environment_intensity: 1.0,
             environment_max_lod: 2.0,
+            light_view_projection: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            shadow_parameters: [0.0, 0.001, 1.0, 0.0],
             local_lights: [GltfPbrLocalLight::default(); MAX_GLTF_PBR_LOCAL_LIGHTS],
             local_light_count: 0,
         };
@@ -886,6 +928,18 @@ mod tests {
             Err(GltfMaterialError::InvalidSceneValues)
         ));
         scene.light_intensity = 1.0;
+        scene.shadow_parameters[1] = f32::NAN;
+        assert!(matches!(
+            validate_scene_uniform(scene),
+            Err(GltfMaterialError::InvalidSceneValues)
+        ));
+        scene.shadow_parameters[1] = 0.001;
+        scene.shadow_parameters[0] = 0.5;
+        assert!(matches!(
+            validate_scene_uniform(scene),
+            Err(GltfMaterialError::InvalidSceneValues)
+        ));
+        scene.shadow_parameters[0] = 0.0;
         scene.local_light_count = (MAX_GLTF_PBR_LOCAL_LIGHTS as u32) + 1;
         assert!(matches!(
             validate_scene_uniform(scene),
@@ -915,11 +969,18 @@ mod tests {
             ambient_color: [0.1, 0.2, 0.3],
             environment_intensity: 0.75,
             environment_max_lod: 4.0,
+            light_view_projection: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            shadow_parameters: [0.0, 0.001, 1.0, 0.0],
             local_lights: [GltfPbrLocalLight::default(); MAX_GLTF_PBR_LOCAL_LIGHTS],
             local_light_count: 0,
         };
         let bytes = scene.to_std140_bytes();
-        assert_eq!(bytes.len(), 352);
+        assert_eq!(bytes.len(), 432);
         assert_eq!(
             f32::from_ne_bytes(bytes[28..32].try_into().expect("float")),
             4.0
@@ -939,6 +1000,14 @@ mod tests {
         assert_eq!(
             u32::from_ne_bytes(bytes[80..84].try_into().expect("count")),
             0
+        );
+        assert_eq!(
+            f32::from_ne_bytes(bytes[352..356].try_into().expect("light matrix")),
+            1.0
+        );
+        assert_eq!(
+            f32::from_ne_bytes(bytes[416..420].try_into().expect("shadow enable")),
+            0.0
         );
         assert_eq!(
             f32::from_ne_bytes(bytes[96..100].try_into().expect("light position")),

@@ -56,7 +56,7 @@ mod tests {
         );
         let mut descriptors = fragment.reflection().descriptors.clone();
         descriptors.sort_unstable_by_key(|binding| (binding.set, binding.binding));
-        assert_eq!(descriptors.len(), 9);
+        assert_eq!(descriptors.len(), 10);
         assert!(descriptors.iter().any(|binding| {
             binding.set == 0
                 && binding.binding == 0
@@ -74,7 +74,7 @@ mod tests {
                 && binding.binding == 0
                 && binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER
         }));
-        for binding in 1..=2 {
+        for binding in 1..=3 {
             assert!(descriptors.iter().any(|descriptor| {
                 descriptor.set == 1
                     && descriptor.binding == binding

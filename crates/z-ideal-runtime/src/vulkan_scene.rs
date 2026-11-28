@@ -190,6 +190,54 @@ impl<'device> VulkanSceneMeshes<'device> {
         self.record_draws_with_materials(snapshot, recording, layout, |_, _, _| Ok(()))
     }
 
+    /// Records every snapshot mesh primitive using the 64-byte transform contract.
+    ///
+    /// This is used by depth-only passes whose vertex shader needs only MVP and does
+    /// not consume world-space model data. The caller binds a compatible pipeline.
+    pub fn record_shadow_draws<'recording, 'pool>(
+        &'recording self,
+        snapshot: &RenderSceneSnapshot,
+        recording: &mut CommandBufferRecording<'recording, 'pool, 'device>,
+        layout: &'recording VulkanPipelineLayout<'_, 'device>,
+    ) -> Result<usize, VulkanSceneMeshesError> {
+        let view_projection = snapshot.projection * snapshot.view;
+        if !view_projection.is_finite() {
+            return Err(VulkanSceneMeshesError::NonFiniteViewProjection);
+        }
+        let mut draw_count = 0;
+        for instance in &snapshot.meshes {
+            let mesh_key = (
+                instance.source.source_uri.clone(),
+                instance.source.mesh_index,
+            );
+            let primitive_count =
+                self.primitive_counts
+                    .get(&mesh_key)
+                    .copied()
+                    .ok_or_else(|| VulkanSceneMeshesError::MeshNotUploaded {
+                        uri: instance.source.source_uri.clone(),
+                        mesh_index: instance.source.mesh_index,
+                    })?;
+            for primitive_index in 0..primitive_count {
+                let key = (
+                    instance.source.source_uri.clone(),
+                    instance.source.mesh_index,
+                    primitive_index,
+                );
+                let mesh = self.meshes.get(&key).ok_or_else(|| {
+                    VulkanSceneMeshesError::PrimitiveNotUploaded {
+                        uri: key.0.clone(),
+                        mesh_index: key.1,
+                        primitive_index,
+                    }
+                })?;
+                mesh.record_draw(recording, layout, view_projection, instance.model)?;
+                draw_count += 1;
+            }
+        }
+        Ok(draw_count)
+    }
+
     /// Records every primitive while invoking a caller-provided material binder before each draw.
     ///
     /// The callback receives the optional imported material pinned by this adapter and can

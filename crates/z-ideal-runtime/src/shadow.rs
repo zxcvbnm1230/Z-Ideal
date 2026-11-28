@@ -102,7 +102,7 @@ impl<'pipeline, 'layouts, 'device> VulkanShadowRenderer<'pipeline, 'layouts, 'de
         recording.bind_graphics_pipeline(&self.pipeline)?;
         recording.set_viewport(viewport.viewport)?;
         recording.set_scissor(viewport.scissor)?;
-        Ok(meshes.record_draws(light_snapshot, recording, self.layout)?)
+        Ok(meshes.record_shadow_draws(light_snapshot, recording, self.layout)?)
     }
 }
 

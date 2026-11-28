@@ -11,9 +11,9 @@ mod vulkan_scene;
 
 pub use gltf_material::{
     GltfMaterialError, GltfMaterialTextureResource, GltfMaterialTextureResources,
-    GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform, GltfPbrLocalLight,
-    GltfPbrLocalLightKind, GltfPbrSceneUniform, MAX_GLTF_PBR_LOCAL_LIGHTS,
-    apply_gltf_material_pipeline_state, write_gltf_material_descriptors,
+    GltfMaterialTextureSet, GltfMaterialTextureViews, GltfMaterialUniform,
+    GltfPbrEnvironmentResources, GltfPbrLocalLight, GltfPbrLocalLightKind, GltfPbrSceneUniform,
+    MAX_GLTF_PBR_LOCAL_LIGHTS, apply_gltf_material_pipeline_state, write_gltf_material_descriptors,
     write_gltf_pbr_scene_descriptor,
 };
 pub use gltf_pbr::{GLTF_PBR_FRAGMENT_SHADER, GLTF_PBR_VERTEX_SHADER, compile_gltf_pbr_shaders};

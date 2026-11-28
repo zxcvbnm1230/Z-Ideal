@@ -37,10 +37,13 @@ layout(set = 1, binding = 0, std140) uniform SceneData {
     vec4 environment_intensity_max_lod;
     uvec4 local_light_count;
     LocalLight local_lights[4];
+    mat4 light_view_projection;
+    vec4 shadow_parameters;
 } scene;
 
 layout(set = 1, binding = 1) uniform samplerCube diffuse_irradiance_map;
 layout(set = 1, binding = 2) uniform samplerCube prefiltered_specular_map;
+layout(set = 1, binding = 3) uniform sampler2DShadow directional_shadow_map;
 
 vec2 material_uv(uint set_index) {
     return set_index == 1u ? uv1 : uv0;
@@ -94,6 +97,33 @@ vec3 fresnel_schlick_roughness(float cosine, vec3 f0, float roughness) {
          * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
 }
 
+float directional_shadow_visibility(vec3 position) {
+    if (scene.shadow_parameters.x < 0.5) {
+        return 1.0;
+    }
+    vec4 light_clip = scene.light_view_projection * vec4(position, 1.0);
+    if (light_clip.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 projected = light_clip.xyz / light_clip.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0
+        || projected.z < 0.0 || projected.z > 1.0) {
+        return 1.0;
+    }
+    ivec2 dimensions = textureSize(directional_shadow_map, 0);
+    vec2 texel = 1.0 / vec2(dimensions);
+    float reference_depth = projected.z - scene.shadow_parameters.y;
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            visibility += texture(directional_shadow_map,
+                                  vec3(uv + vec2(x, y) * texel, reference_depth));
+        }
+    }
+    return mix(1.0, visibility / 9.0, scene.shadow_parameters.z);
+}
+
 vec3 evaluate_direct_brdf(vec3 n, vec3 v, vec3 l, vec3 base_color,
                           vec3 f0, float metallic, float roughness,
                           vec3 radiance) {
@@ -131,9 +161,10 @@ void main() {
     vec3 v = normalize(scene.camera_position.xyz - world_position);
     vec3 f0 = mix(vec3(0.04), base.rgb, metallic);
     vec3 directional_l = normalize(-scene.light_direction_intensity.xyz);
+    float shadow_visibility = directional_shadow_visibility(world_position);
     vec3 direct = evaluate_direct_brdf(
         n, v, directional_l, base.rgb, f0, metallic, roughness,
-        scene.light_color.rgb * scene.light_direction_intensity.w);
+        scene.light_color.rgb * scene.light_direction_intensity.w) * shadow_visibility;
 
     // The fixed-capacity array preserves caller order and bounds fragment work.
     for (uint index = 0u; index < min(scene.local_light_count.x, 4u); ++index) {
