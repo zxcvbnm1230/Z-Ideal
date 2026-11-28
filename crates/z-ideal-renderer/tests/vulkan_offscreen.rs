@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use z_ideal_assets::{ImportedPrimitive, PrimitiveTopology};
+use z_ideal_math::Mat4;
 use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferMemoryLocation, BufferOwnershipTransfer, CommandPoolConfig,
     FenceWaitResult, GraphicsPipelineConfig, ImageConfig, ImageViewConfig, MeshGpu,
@@ -47,24 +48,52 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     let image_view = image
         .create_view(ImageViewConfig::default())
         .expect("create offscreen image view");
+    let depth_config = ImageConfig {
+        format: vk::Format::D32_SFLOAT,
+        usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        ..image_config
+    };
+    let depth_image = VulkanImage::new(&device, depth_config).expect("create depth image");
+    let depth_view = depth_image
+        .create_view(ImageViewConfig {
+            aspect: vk::ImageAspectFlags::DEPTH,
+            ..ImageViewConfig::default()
+        })
+        .expect("create depth image view");
     let render_pass = VulkanRenderPass::new(
         &device,
         RenderPassConfig {
-            attachments: vec![RenderPassAttachmentConfig {
-                format: image_config.format,
-                samples: vk::SampleCountFlags::TYPE_1,
-                load_op: vk::AttachmentLoadOp::CLEAR,
-                store_op: vk::AttachmentStoreOp::STORE,
-                stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-                stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-                initial_layout: vk::ImageLayout::UNDEFINED,
-                final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            }],
+            attachments: vec![
+                RenderPassAttachmentConfig {
+                    format: image_config.format,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: vk::ImageLayout::UNDEFINED,
+                    final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                },
+                RenderPassAttachmentConfig {
+                    format: depth_config.format,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    load_op: vk::AttachmentLoadOp::CLEAR,
+                    store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: vk::ImageLayout::UNDEFINED,
+                    final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                },
+            ],
             subpasses: vec![RenderPassSubpassConfig {
                 color_attachments: vec![RenderPassAttachmentReference {
                     attachment: 0,
                     layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 }],
+                depth_stencil_attachment: Some(RenderPassAttachmentReference {
+                    attachment: 1,
+                    layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                }),
                 ..RenderPassSubpassConfig::default()
             }],
             dependencies: vec![RenderPassDependency {
@@ -81,7 +110,7 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     .expect("create offscreen render pass");
     let framebuffer = VulkanFramebuffer::new(
         &render_pass,
-        &[&image_view],
+        &[&image_view, &depth_view],
         vk::Extent2D {
             width: WIDTH,
             height: HEIGHT,
@@ -90,20 +119,29 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     )
     .expect("create offscreen framebuffer");
 
-    let primitive = ImportedPrimitive {
+    let near_primitive = ImportedPrimitive {
         mode: PrimitiveTopology::Triangles,
-        positions: vec![[-0.8, -0.8, 0.0], [0.8, -0.8, 0.0], [0.0, 0.8, 0.0]],
+        positions: vec![[-0.8, -0.8, 0.2], [0.8, -0.8, 0.2], [0.0, 0.8, 0.2]],
         normals: None,
-        tex_coords_0: Some(vec![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+        tex_coords_0: Some(vec![[0.0, 1.0]; 3]),
         indices: vec![0, 1, 2],
         material_index: None,
     };
-    let mesh = MeshGpu::upload(&device, &primitive).expect("upload imported triangle mesh");
+    let far_primitive = ImportedPrimitive {
+        mode: PrimitiveTopology::Triangles,
+        positions: vec![[-0.8, -0.8, 0.8], [0.8, -0.8, 0.8], [0.0, 0.8, 0.8]],
+        normals: None,
+        tex_coords_0: Some(vec![[1.0, 0.0]; 3]),
+        indices: vec![0, 1, 2],
+        material_index: None,
+    };
+    let near_mesh = MeshGpu::upload(&device, &near_primitive).expect("upload near triangle mesh");
+    let far_mesh = MeshGpu::upload(&device, &far_primitive).expect("upload far triangle mesh");
 
     let vertex_shader = VulkanShaderModule::new(
         &device,
         compile_glsl(
-            "#version 450\nlayout(location=0) in vec3 position;\nlayout(location=1) in vec2 tex_coord;\nlayout(location=0) out vec2 uv;\nvoid main() { gl_Position = vec4(position, 1.0); uv = tex_coord; }",
+            "#version 450\nlayout(location=0) in vec3 position;\nlayout(location=1) in vec2 tex_coord;\nlayout(location=0) out vec2 uv;\nlayout(push_constant) uniform Draw { mat4 mvp; } draw_data;\nvoid main() { gl_Position = draw_data.mvp * vec4(position, 1.0); uv = tex_coord; }",
             &ShaderCompileConfig::new(ShaderStage::Vertex),
         )
         .expect("compile triangle vertex shader"),
@@ -118,8 +156,12 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         .expect("compile triangle fragment shader"),
     )
     .expect("create triangle fragment shader module");
-    let pipeline_layout = VulkanPipelineLayout::new(&device, &[], &[])
-        .expect("create empty graphics pipeline layout");
+    let push_constant = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64)];
+    let pipeline_layout = VulkanPipelineLayout::new(&device, &[], &push_constant)
+        .expect("create camera-matrix graphics pipeline layout");
     let graphics_pipeline = VulkanGraphicsPipeline::new(
         &pipeline_layout,
         &vertex_shader,
@@ -128,6 +170,9 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         &GraphicsPipelineConfig {
             vertex_bindings: vec![MeshGpu::vertex_binding()],
             vertex_attributes: MeshGpu::vertex_attributes().to_vec(),
+            depth_test_enable: true,
+            depth_write_enable: true,
+            depth_compare_op: vk::CompareOp::LESS,
             ..GraphicsPipelineConfig::default()
         },
     )
@@ -207,11 +252,19 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         .expect("allocate primary command buffer");
     let queue = VulkanQueue::graphics(&device);
 
-    let clear = [vk::ClearValue {
-        color: vk::ClearColorValue {
-            float32: [0.0, 0.0, 0.0, 1.0],
+    let clear = [
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
         },
-    }];
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        },
+    ];
     let region = [vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(0)
@@ -239,14 +292,28 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
             vk::DependencyFlags::empty(),
             &[
                 BufferBarrier {
-                    buffer: mesh.vertex_buffer(),
+                    buffer: near_mesh.vertex_buffer(),
                     source_access: vk::AccessFlags::HOST_WRITE,
                     destination_access: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
                     offset: 0,
                     size: vk::WHOLE_SIZE,
                 },
                 BufferBarrier {
-                    buffer: mesh.index_buffer(),
+                    buffer: near_mesh.index_buffer(),
+                    source_access: vk::AccessFlags::HOST_WRITE,
+                    destination_access: vk::AccessFlags::INDEX_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+                BufferBarrier {
+                    buffer: far_mesh.vertex_buffer(),
+                    source_access: vk::AccessFlags::HOST_WRITE,
+                    destination_access: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                },
+                BufferBarrier {
+                    buffer: far_mesh.index_buffer(),
                     source_access: vk::AccessFlags::HOST_WRITE,
                     destination_access: vk::AccessFlags::INDEX_READ,
                     offset: 0,
@@ -281,15 +348,22 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
             },
         })
         .expect("set offscreen scissor");
-    recording
-        .bind_vertex_buffers(0, &[mesh.vertex_buffer()], &[0])
-        .expect("bind triangle vertex buffer");
-    recording
-        .bind_index_buffer(mesh.index_buffer(), 0, mesh.index_type())
-        .expect("bind triangle index buffer");
-    recording
-        .draw_indexed(mesh.index_count(), 1, 0, 0, 0)
-        .expect("draw imported triangle mesh");
+    near_mesh
+        .record_draw(
+            &mut recording,
+            &pipeline_layout,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+        )
+        .expect("draw nearer triangle with camera/model matrix");
+    far_mesh
+        .record_draw(
+            &mut recording,
+            &pipeline_layout,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+        )
+        .expect("draw farther triangle behind the depth-tested near triangle");
     recording
         .end_render_pass()
         .expect("end offscreen render pass");
@@ -399,16 +473,11 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
         .expect("read back pixels from the second pooled buffer");
     assert_eq!(pixels, second_pixels, "pooled readback buffers disagree");
     let center = &pixels[((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize..][..4];
-    assert!(center[0] > 20, "triangle red channel too small: {center:?}");
-    assert!(
-        center[1] > 20,
-        "triangle green channel too small: {center:?}"
+    assert_eq!(
+        center,
+        &[0, 255, 127, 255],
+        "farther mesh overwrote the nearer mesh: {center:?}"
     );
-    assert!(
-        center[2] > 20,
-        "triangle blue channel too small: {center:?}"
-    );
-    assert_eq!(center[3], 255, "unexpected triangle alpha: {center:?}");
     let corner = &pixels[0..4];
     assert_eq!(
         corner,
@@ -520,6 +589,7 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(vertex_shader);
     drop(framebuffer);
     drop(render_pass);
+    drop(depth_view);
     drop(image_view);
     drop(transfer_destination);
     drop(transfer_intermediate);
@@ -528,7 +598,9 @@ fn offscreen_triangle_draw_copy_readback_is_deterministic_and_validation_clean()
     drop(transfer_semaphore);
     drop(second_readback);
     drop(readback);
-    drop(mesh);
+    drop(far_mesh);
+    drop(near_mesh);
+    drop(depth_image);
     drop(image);
     drop(command_pool);
     drop(device);

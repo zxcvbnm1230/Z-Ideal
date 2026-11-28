@@ -1,8 +1,12 @@
 //! Validated indexed triangle-mesh upload into Vulkan vertex and index buffers.
 use ash::vk;
 use z_ideal_assets::{ImportedPrimitive, PrimitiveTopology};
+use z_ideal_math::Mat4;
 
-use crate::{BufferConfig, BufferMemoryLocation, VulkanBuffer, VulkanDevice, VulkanError};
+use crate::{
+    BufferConfig, BufferMemoryLocation, CommandBufferRecording, VulkanBuffer, VulkanDevice,
+    VulkanError, VulkanPipelineLayout,
+};
 
 /// Interleaved vertex layout used by the first unlit mesh pipeline.
 #[repr(C)]
@@ -113,6 +117,38 @@ impl<'device> MeshGpu<'device> {
     pub const fn index_type(&self) -> vk::IndexType {
         vk::IndexType::UINT32
     }
+
+    /// Records an indexed draw using camera and object transforms.
+    ///
+    /// The graphics pipeline must already be bound and use a 64-byte vertex-stage
+    /// push-constant range at offset zero containing one column-major `mat4`. The
+    /// supplied view-projection and model matrices are multiplied on the CPU and
+    /// uploaded as that matrix. The caller remains responsible for the render pass,
+    /// viewport/scissor, and host-write-to-vertex-input synchronization.
+    pub fn record_draw<'recording, 'pool>(
+        &'recording self,
+        recording: &mut CommandBufferRecording<'recording, 'pool, 'device>,
+        layout: &'recording VulkanPipelineLayout<'_, 'device>,
+        view_projection: Mat4,
+        model: Mat4,
+    ) -> Result<(), MeshDrawError> {
+        let mvp = view_projection * model;
+        if !view_projection.is_finite() || !model.is_finite() || !mvp.is_finite() {
+            return Err(MeshDrawError::NonFiniteTransform);
+        }
+        let bytes = encode_matrix(mvp);
+        recording.push_constants(
+            vk::PipelineBindPoint::GRAPHICS,
+            layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            &bytes,
+        )?;
+        recording.bind_vertex_buffers(0, &[&self.vertex_buffer], &[0])?;
+        recording.bind_index_buffer(&self.index_buffer, 0, self.index_type())?;
+        recording.draw_indexed(self.index_count, 1, 0, 0, 0)?;
+        Ok(())
+    }
     /// Returns the binding description for the interleaved vertex layout.
     pub const fn vertex_binding() -> vk::VertexInputBindingDescription {
         vk::VertexInputBindingDescription {
@@ -210,6 +246,26 @@ fn encode_indices(indices: &[u32]) -> Result<Vec<u8>, MeshUploadError> {
     Ok(bytes)
 }
 
+/// Failures while recording a camera-driven mesh draw.
+#[derive(Debug, thiserror::Error)]
+pub enum MeshDrawError {
+    /// A camera, model, or combined transform matrix contains non-finite values.
+    #[error("mesh draw transform matrices must be finite")]
+    NonFiniteTransform,
+    /// Command recording rejected the draw or push-constant write.
+    #[error(transparent)]
+    Vulkan(#[from] VulkanError),
+}
+
+fn encode_matrix(matrix: Mat4) -> [u8; 64] {
+    let mut bytes = [0_u8; 64];
+    for (index, value) in matrix.to_cols_array().into_iter().enumerate() {
+        let offset = index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
 /// Mesh upload validation and allocation failures.
 #[derive(Debug, thiserror::Error)]
 pub enum MeshUploadError {
@@ -240,9 +296,10 @@ pub enum MeshUploadError {
 mod tests {
     use super::{
         MeshUploadError, MeshVertex, PrimitiveTopology, build_vertices, encode_indices,
-        encode_vertices,
+        encode_matrix, encode_vertices,
     };
     use z_ideal_assets::ImportedPrimitive;
+    use z_ideal_math::Mat4;
 
     fn triangle() -> ImportedPrimitive {
         ImportedPrimitive {
@@ -280,6 +337,21 @@ mod tests {
                 .iter()
                 .all(|vertex| vertex.tex_coords_0 == [0.0, 0.0])
         );
+    }
+
+    #[test]
+    fn matrix_push_constant_encoding_is_column_major_and_exactly_64_bytes() {
+        let matrix = Mat4::from_cols_array(&[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ]);
+        let bytes = encode_matrix(matrix);
+        assert_eq!(bytes.len(), 64);
+        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+            assert_eq!(
+                f32::from_ne_bytes(chunk.try_into().expect("four bytes")),
+                index as f32 + 1.0
+            );
+        }
     }
 
     #[test]

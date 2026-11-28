@@ -2264,6 +2264,7 @@ dependencies = [
  "tracing",
  "winit",
  "z-ideal-assets",
+ "z-ideal-math",
 ]
 
 [[package]]
