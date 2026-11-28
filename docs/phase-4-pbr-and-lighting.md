@@ -1,6 +1,6 @@
 # Phase 4 — PBR and lighting
 
-**Status:** in progress. The first increments add bounded, scene-linear Radiance RGBE equirectangular import, a linear RGBA32F Vulkan upload path, and six-face cube conversion/upload. Diffuse irradiance convolution, roughness-prefiltered specular maps, and image-based lighting in the PBR shader are not implemented yet.
+**Status:** in progress. Implemented foundations now include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, and GGX roughness-prefiltered specular mip generation/upload. The existing PBR shader does not yet consume these environment maps; image-based lighting integration remains outstanding.
 
 ## Roadmap scope
 
@@ -26,17 +26,18 @@
 
 - `VulkanTexture2D::from_hdr_environment` converts imported RGB radiance into linear RGBA32F storage, preserving values above one and adding an opaque alpha channel. It explicitly checks the format features required for sampling and linear mip blits. The generated ordinary mip chain is not roughness prefiltering.
 - `EnvironmentCubeMap::from_equirectangular` bilinearly resamples the source into Vulkan cube layer order (+X, -X, +Y, -Y, +Z, -Z), wrapping longitude and clamping at the poles. Output is bounded to 512 MiB and face dimensions up to 4,096.
-- `VulkanEnvironmentCube` uploads the six RGBA32F faces into a cube-compatible image, creates a cube view and clamp-to-edge sampler, and records staging/image barriers with retained resource lifetimes. It validates sampled-image and linear-filter format support rather than silently substituting a format.
-- CPU tests cover all-face constant-radiance preservation, directional face orientation, invalid inputs, and storage bounds. A validation-layer GPU test uploads both the equirectangular float texture and cube image, copies all six cube faces back, checks exact float values, and verifies no Vulkan validation errors on the NVIDIA development device.
+- `EnvironmentLightingMaps::from_equirectangular` produces a cosine-weighted diffuse irradiance cube and GGX importance-sampled specular mip chain using deterministic Hammersley points. Diffuse values store the hemispherical irradiance integral (the PBR Lambert term divides by PI); specular mip roughness increases linearly from zero to one.
+- Convolution validates the source and options, bounds sample count to 4,096, generated storage to 512 MiB, and total work to 100 million source samples. Invalid numeric output is rejected. The implementation is a deterministic CPU reference path, not a GPU compute convolution.
+- `VulkanEnvironmentCube::from_cube_mips` uploads explicit mip contents into a cube-compatible RGBA32F image, creates a full-chain cube view and trilinear clamp-to-edge sampler, and records staging/image barriers with retained resource lifetimes. It validates sampled-image, transfer-source/destination, and linear-filter format support. It does not generate GGX levels by ordinary box-filtered mip blits.
+- CPU tests cover all-face constant-radiance preservation, directional face orientation, diffuse integral normalization, deterministic convolution, and the reduction/spreading of a directional HDR lobe as roughness increases. The validation-layer GPU regression uploads irradiance and a two-level GGX chain, copies both specular levels back, checks exact float values, and verifies no Vulkan validation errors on the NVIDIA development device.
 
 ## Remaining work
 
-- Generate diffuse irradiance convolution and roughness-prefiltered specular environment levels; validate shader interfaces and numerical behavior.
-- Extend the PBR scene/material contract to sample environment lighting and combine it with direct lighting in linear space.
+- Extend the PBR scene/material contract to sample diffuse irradiance and roughness-prefiltered specular maps and combine them with direct lighting in linear space.
 - Add point/spot light data and bounded light evaluation, with explicit limits and deterministic selection/order.
 - Implement filtered shadow maps and SSAO as independently testable render stages.
 - Add reference scenes and image regression comparisons with documented tolerances on supported Vulkan CI and hardware runners.
 
 ## Current validation
 
-HDRI importer and cube conversion CPU tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` was manually run on the NVIDIA GeForce 940MX with Khronos validation enabled; 2D texture and six-face cube readback passed with no validation errors. Cross-platform CI is required before this increment is considered merged. Irradiance/specular prefiltering and lighting integration remain outstanding.
+HDRI import, cube conversion, and convolution reference tests are covered by workspace tests. The ignored `z-ideal-renderer` test `hdr_environment_upload_preserves_linear_radiance_and_is_validation_clean` uploads the 2D HDR texture, base cube, diffuse irradiance cube, and a two-level GGX specular cube; it reads the base cube and both specular levels back and compares exact float values. It passed manually on the NVIDIA GeForce 940MX with Khronos validation enabled. IBL shader/descriptor integration, expanded lights, shadows, SSAO, and reference-scene image regression remain outstanding.

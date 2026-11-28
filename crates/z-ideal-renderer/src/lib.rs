@@ -43,7 +43,8 @@ pub use descriptor::{
     VulkanDescriptorSet, VulkanDescriptorSetLayout,
 };
 pub use environment::{
-    EnvironmentCubeError, EnvironmentCubeFace, EnvironmentCubeMap, VulkanEnvironmentCube,
+    EnvironmentCubeError, EnvironmentCubeFace, EnvironmentCubeMap, EnvironmentLightingMaps,
+    VulkanEnvironmentCube,
 };
 pub use frame::{FrameStart, FrameTicket, VulkanFrameScheduler};
 pub use graphics_pipeline::{GraphicsPipelineConfig, VulkanGraphicsPipeline};

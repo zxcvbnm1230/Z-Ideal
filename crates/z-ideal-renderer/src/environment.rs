@@ -50,6 +50,146 @@ impl EnvironmentCubeFace {
     ];
 }
 
+/// Deterministically convolved diffuse irradiance and roughness-prefiltered specular cubes.
+///
+/// Diffuse values store the cosine-weighted hemispherical irradiance integral (not irradiance
+/// divided by PI). Specular mip zero is the sharp environment and the final mip is the roughest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvironmentLightingMaps {
+    irradiance: EnvironmentCubeMap,
+    specular: Vec<EnvironmentCubeMap>,
+}
+
+impl EnvironmentLightingMaps {
+    /// Convolves an equirectangular HDRI using deterministic Hammersley/GGX sampling.
+    ///
+    /// `sample_count` applies independently to every output texel. The operation is bounded
+    /// to 100 million source samples and generated image storage is bounded to 512 MiB.
+    pub fn from_equirectangular(
+        source: &HdrEnvironmentMap,
+        irradiance_face_size: u32,
+        specular_face_size: u32,
+        specular_mip_levels: u32,
+        sample_count: u32,
+    ) -> Result<Self, EnvironmentCubeError> {
+        validate_source(source)?;
+        if irradiance_face_size == 0
+            || specular_face_size == 0
+            || irradiance_face_size > MAX_CUBE_FACE_SIZE
+            || specular_face_size > MAX_CUBE_FACE_SIZE
+            || sample_count == 0
+            || sample_count > 4_096
+            || specular_mip_levels == 0
+            || specular_mip_levels > u32::BITS - specular_face_size.leading_zeros()
+        {
+            return Err(EnvironmentCubeError::InvalidConvolutionOptions);
+        }
+        let mut specular_sizes = Vec::with_capacity(specular_mip_levels as usize);
+        for level in 0..specular_mip_levels {
+            specular_sizes.push((specular_face_size >> level).max(1));
+        }
+        let output_pixels = u64::from(irradiance_face_size)
+            .checked_mul(u64::from(irradiance_face_size))
+            .and_then(|value| value.checked_mul(6))
+            .and_then(|value| {
+                specular_sizes.iter().try_fold(value, |total, size| {
+                    total.checked_add(u64::from(*size) * u64::from(*size) * 6)
+                })
+            })
+            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+        let output_bytes = output_pixels
+            .checked_mul(16)
+            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+        let work = output_pixels
+            .checked_mul(u64::from(sample_count))
+            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+        if output_bytes > MAX_CUBE_STORAGE_BYTES || work > 100_000_000 {
+            return Err(EnvironmentCubeError::ResourceLimitExceeded);
+        }
+        let irradiance = convolve_cube(irradiance_face_size, |normal| {
+            let (tangent, bitangent) = tangent_basis(normal);
+            let mut sum = [0.0_f32; 3];
+            for index in 0..sample_count {
+                let xi = hammersley(index, sample_count);
+                let radius = xi[0].sqrt();
+                let phi = 2.0 * PI * xi[1];
+                let local = [radius * phi.cos(), radius * phi.sin(), (1.0 - xi[0]).sqrt()];
+                let direction = local_to_world(local, tangent, bitangent, normal);
+                let radiance = sample_equirectangular(source, direction);
+                for channel in 0..3 {
+                    sum[channel] += radiance[channel];
+                }
+            }
+            for channel in &mut sum {
+                *channel *= PI / sample_count as f32;
+            }
+            sum
+        })?;
+        let mut specular = Vec::with_capacity(specular_sizes.len());
+        for (level, size) in specular_sizes.into_iter().enumerate() {
+            let roughness = if specular_mip_levels == 1 {
+                0.0
+            } else {
+                level as f32 / (specular_mip_levels - 1) as f32
+            };
+            specular.push(convolve_cube(size, |normal| {
+                if roughness <= f32::EPSILON {
+                    return sample_equirectangular(source, normal);
+                }
+                let (tangent, bitangent) = tangent_basis(normal);
+                let mut sum = [0.0_f32; 3];
+                let mut total_weight = 0.0_f32;
+                for index in 0..sample_count {
+                    let xi = hammersley(index, sample_count);
+                    let phi = 2.0 * PI * xi[0];
+                    let alpha = roughness * roughness;
+                    let alpha_squared = alpha * alpha;
+                    let cos_theta = ((1.0 - xi[1]) / (1.0 + (alpha_squared - 1.0) * xi[1])).sqrt();
+                    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+                    let half_local = [sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta];
+                    let half_vector = local_to_world(half_local, tangent, bitangent, normal);
+                    let view_dot_half = dot(normal, half_vector).max(0.0);
+                    let light = normalize([
+                        2.0 * view_dot_half * half_vector[0] - normal[0],
+                        2.0 * view_dot_half * half_vector[1] - normal[1],
+                        2.0 * view_dot_half * half_vector[2] - normal[2],
+                    ]);
+                    let n_dot_l = dot(normal, light).max(0.0);
+                    if n_dot_l > 0.0 {
+                        let radiance = sample_equirectangular(source, light);
+                        for channel in 0..3 {
+                            sum[channel] += radiance[channel] * n_dot_l;
+                        }
+                        total_weight += n_dot_l;
+                    }
+                }
+                if total_weight > 0.0 {
+                    for channel in &mut sum {
+                        *channel /= total_weight;
+                    }
+                }
+                sum
+            })?);
+        }
+        Ok(Self {
+            irradiance,
+            specular,
+        })
+    }
+
+    /// Returns the diffuse irradiance cube; values are not divided by PI.
+    #[must_use]
+    pub const fn irradiance(&self) -> &EnvironmentCubeMap {
+        &self.irradiance
+    }
+
+    /// Returns the GGX-prefiltered specular cube mip chain, sharpest first.
+    #[must_use]
+    pub fn specular_mips(&self) -> &[EnvironmentCubeMap] {
+        &self.specular
+    }
+}
+
 /// A CPU-side, scene-linear RGBA32F cube environment with six square faces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvironmentCubeMap {
@@ -67,19 +207,8 @@ impl EnvironmentCubeMap {
         source: &HdrEnvironmentMap,
         face_size: u32,
     ) -> Result<Self, EnvironmentCubeError> {
-        if face_size == 0
-            || face_size > MAX_CUBE_FACE_SIZE
-            || source.width == 0
-            || source.height == 0
-            || u64::from(source.width) != u64::from(source.height) * 2
-            || usize::try_from(u64::from(source.width) * u64::from(source.height)).ok()
-                != Some(source.pixels.len())
-            || source
-                .pixels
-                .iter()
-                .flatten()
-                .any(|value| !value.is_finite() || *value < 0.0)
-        {
+        validate_source(source)?;
+        if face_size == 0 || face_size > MAX_CUBE_FACE_SIZE {
             return Err(EnvironmentCubeError::InvalidSourceOrFaceSize);
         }
         let output_bytes = u64::from(face_size)
@@ -135,25 +264,6 @@ impl EnvironmentCubeMap {
     pub fn faces(&self) -> &[Vec<[f32; 4]>; 6] {
         &self.faces
     }
-
-    fn to_staging_bytes(&self) -> Result<Vec<u8>, EnvironmentCubeError> {
-        let pixel_count = self.faces.iter().map(Vec::len).sum::<usize>();
-        let byte_count = pixel_count
-            .checked_mul(16)
-            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(byte_count)
-            .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
-        for face in &self.faces {
-            for pixel in face {
-                for channel in pixel {
-                    bytes.extend_from_slice(&channel.to_ne_bytes());
-                }
-            }
-        }
-        Ok(bytes)
-    }
 }
 
 /// Failures while converting or uploading an environment cube.
@@ -162,9 +272,15 @@ pub enum EnvironmentCubeError {
     /// The source is not a valid equirectangular map or face size is invalid.
     #[error("environment source or cube face size is invalid")]
     InvalidSourceOrFaceSize,
+    /// Convolution dimensions, mip count, or sample count are invalid.
+    #[error("environment convolution options are invalid")]
+    InvalidConvolutionOptions,
     /// Cube output would exceed the fixed decoded storage budget.
     #[error("environment cube output exceeds the 512 MiB storage budget")]
     ResourceLimitExceeded,
+    /// Convolution produced a non-finite or negative radiance value.
+    #[error("environment convolution produced invalid radiance")]
+    InvalidConvolutionResult,
     /// The selected device cannot sample and linearly filter RGBA32F images.
     #[error(
         "Vulkan format {format:?} lacks environment cube features {required:?}; available {available:?}"
@@ -201,9 +317,52 @@ impl<'device> VulkanEnvironmentCube<'device> {
         face_size: u32,
     ) -> Result<Self, EnvironmentCubeError> {
         let cube = EnvironmentCubeMap::from_equirectangular(source, face_size)?;
+        Self::from_cube_mips(device, std::slice::from_ref(&cube))
+    }
+
+    /// Creates a cube image from a validated mip chain in sharpest-to-roughest order.
+    ///
+    /// Every level must have six faces and dimensions `max(base_size >> level, 1)`.
+    /// The image, staging allocation, and sampler are owned together. All mip levels are
+    /// uploaded explicitly; ordinary Vulkan mip blits are not used to approximate GGX filtering.
+    pub fn from_cube_mips(
+        device: &'device VulkanDevice,
+        mips: &[EnvironmentCubeMap],
+    ) -> Result<Self, EnvironmentCubeError> {
+        let Some(base) = mips.first() else {
+            return Err(EnvironmentCubeError::InvalidConvolutionOptions);
+        };
+        let base_size = base.face_size;
+        let max_levels = u32::BITS - base_size.leading_zeros();
+        if base_size == 0
+            || base_size > MAX_CUBE_FACE_SIZE
+            || mips.len() > max_levels as usize
+            || mips.iter().enumerate().any(|(level, mip)| {
+                mip.face_size != (base_size >> level).max(1)
+                    || mip.faces.iter().any(|face| {
+                        face.len()
+                            != (mip.face_size as usize).saturating_mul(mip.face_size as usize)
+                    })
+            })
+        {
+            return Err(EnvironmentCubeError::InvalidConvolutionOptions);
+        }
+        let total_pixels = mips
+            .iter()
+            .try_fold(0_u64, |total, mip| {
+                total.checked_add(u64::from(mip.face_size) * u64::from(mip.face_size) * 6)
+            })
+            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+        let total_bytes = total_pixels
+            .checked_mul(16)
+            .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+        if total_bytes > MAX_CUBE_STORAGE_BYTES {
+            return Err(EnvironmentCubeError::ResourceLimitExceeded);
+        }
         let format = vk::Format::R32G32B32A32_SFLOAT;
         let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::TRANSFER_DST
+            | vk::FormatFeatureFlags::TRANSFER_SRC
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         // SAFETY: Physical-device properties belong to the instance retained by this device.
         let properties = unsafe {
@@ -228,7 +387,7 @@ impl<'device> VulkanEnvironmentCube<'device> {
                 .get_physical_device_properties(device.physical_device)
                 .limits
         };
-        if face_size > limits.max_image_dimension_cube {
+        if base_size > limits.max_image_dimension_cube {
             return Err(EnvironmentCubeError::InvalidSourceOrFaceSize);
         }
         let image = VulkanImage::new(
@@ -236,12 +395,13 @@ impl<'device> VulkanEnvironmentCube<'device> {
             ImageConfig {
                 image_type: vk::ImageType::TYPE_2D,
                 extent: vk::Extent3D {
-                    width: face_size,
-                    height: face_size,
+                    width: base_size,
+                    height: base_size,
                     depth: 1,
                 },
                 format,
-                mip_levels: 1,
+                mip_levels: u32::try_from(mips.len())
+                    .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?,
                 array_layers: 6,
                 samples: vk::SampleCountFlags::TYPE_1,
                 tiling: vk::ImageTiling::OPTIMAL,
@@ -251,29 +411,41 @@ impl<'device> VulkanEnvironmentCube<'device> {
                 flags: vk::ImageCreateFlags::CUBE_COMPATIBLE,
             },
         )?;
-        let bytes = cube.to_staging_bytes()?;
-        let staging = VulkanBuffer::new(
+        let byte_count = usize::try_from(total_bytes)
+            .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(byte_count)
+            .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
+        for mip in mips {
+            for face in &mip.faces {
+                for pixel in face {
+                    for channel in pixel {
+                        bytes.extend_from_slice(&channel.to_ne_bytes());
+                    }
+                }
+            }
+        }
+        let mut staging = VulkanBuffer::new(
             device,
             BufferConfig {
-                size: u64::try_from(bytes.len())
-                    .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?,
+                size: total_bytes,
                 usage: vk::BufferUsageFlags::TRANSFER_SRC,
                 memory: BufferMemoryLocation::Upload,
             },
         )?;
-        let mut staging = staging;
         staging.write(0, &bytes)?;
         let sampler = VulkanSampler::new(
             device,
             SamplerConfig {
                 mag_filter: vk::Filter::LINEAR,
                 min_filter: vk::Filter::LINEAR,
-                mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+                mipmap_mode: vk::SamplerMipmapMode::LINEAR,
                 address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
                 address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
                 address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
                 min_lod: 0.0,
-                max_lod: 0.0,
+                max_lod: (mips.len() - 1) as f32,
                 ..SamplerConfig::default()
             },
         )?;
@@ -291,6 +463,12 @@ impl<'device> VulkanEnvironmentCube<'device> {
         &self.image
     }
 
+    /// Returns the number of explicitly uploaded mip levels.
+    #[must_use]
+    pub const fn mip_levels(&self) -> u32 {
+        self.image.config().mip_levels
+    }
+
     /// Returns the cube sampler.
     #[must_use]
     pub const fn sampler(&self) -> &VulkanSampler<'device> {
@@ -301,7 +479,7 @@ impl<'device> VulkanEnvironmentCube<'device> {
     pub fn create_view(&self) -> Result<VulkanImageView<'_, 'device>, VulkanError> {
         self.image.create_view(ImageViewConfig {
             view_type: vk::ImageViewType::CUBE,
-            level_count: 1,
+            level_count: self.image.config().mip_levels,
             layer_count: 6,
             ..ImageViewConfig::default()
         })
@@ -352,31 +530,41 @@ impl<'device> VulkanEnvironmentCube<'device> {
                 destination_access: vk::AccessFlags::TRANSFER_WRITE,
                 aspect: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: self.image.config().mip_levels,
                 base_array_layer: 0,
                 layer_count: 6,
             }],
         )?;
-        let face_bytes = u64::from(self.image.config().extent.width)
-            * u64::from(self.image.config().extent.height)
-            * 16;
-        let regions: Vec<_> = (0..6_u32)
-            .map(|layer| {
-                vk::BufferImageCopy::default()
-                    .buffer_offset(face_bytes * u64::from(layer))
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(0)
-                            .base_array_layer(layer)
-                            .layer_count(1),
-                    )
-                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                    .image_extent(self.image.config().extent)
-            })
-            .collect();
+        let mut buffer_offset = 0_u64;
+        let mut regions = Vec::with_capacity(self.image.config().mip_levels as usize * 6);
+        for mip_level in 0..self.image.config().mip_levels {
+            let face_size = (self.image.config().extent.width >> mip_level).max(1);
+            let face_bytes = u64::from(face_size) * u64::from(face_size) * 16;
+            for layer in 0..6_u32 {
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(buffer_offset)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(mip_level)
+                                .base_array_layer(layer)
+                                .layer_count(1),
+                        )
+                        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                        .image_extent(vk::Extent3D {
+                            width: face_size,
+                            height: face_size,
+                            depth: 1,
+                        }),
+                );
+                buffer_offset = buffer_offset
+                    .checked_add(face_bytes)
+                    .ok_or(EnvironmentCubeError::ResourceLimitExceeded)?;
+            }
+        }
         recording.copy_buffer_to_image(
             &self.staging,
             &self.image,
@@ -396,13 +584,111 @@ impl<'device> VulkanEnvironmentCube<'device> {
                 destination_access: vk::AccessFlags::SHADER_READ,
                 aspect: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: self.image.config().mip_levels,
                 base_array_layer: 0,
                 layer_count: 6,
             }],
         )?;
         Ok(())
     }
+}
+
+fn validate_source(source: &HdrEnvironmentMap) -> Result<(), EnvironmentCubeError> {
+    if source.width == 0
+        || source.height == 0
+        || u64::from(source.width) != u64::from(source.height) * 2
+        || usize::try_from(u64::from(source.width) * u64::from(source.height)).ok()
+            != Some(source.pixels.len())
+        || source
+            .pixels
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(EnvironmentCubeError::InvalidSourceOrFaceSize);
+    }
+    Ok(())
+}
+
+fn convolve_cube(
+    face_size: u32,
+    mut filter: impl FnMut([f32; 3]) -> [f32; 3],
+) -> Result<EnvironmentCubeMap, EnvironmentCubeError> {
+    let count = usize::try_from(u64::from(face_size) * u64::from(face_size))
+        .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
+    let mut buffers = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let mut face = Vec::new();
+        face.try_reserve_exact(count)
+            .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
+        buffers.push(face);
+    }
+    let mut faces: [Vec<[f32; 4]>; 6] = buffers
+        .try_into()
+        .map_err(|_| EnvironmentCubeError::ResourceLimitExceeded)?;
+    for face in EnvironmentCubeFace::ALL {
+        for y in 0..face_size {
+            for x in 0..face_size {
+                let u = 2.0 * (x as f32 + 0.5) / face_size as f32 - 1.0;
+                let v = 2.0 * (y as f32 + 0.5) / face_size as f32 - 1.0;
+                let rgb = filter(face_direction(face, u, v));
+                if rgb.iter().any(|value| !value.is_finite() || *value < 0.0) {
+                    return Err(EnvironmentCubeError::InvalidConvolutionResult);
+                }
+                faces[face as usize].push([rgb[0], rgb[1], rgb[2], 1.0]);
+            }
+        }
+    }
+    Ok(EnvironmentCubeMap { face_size, faces })
+}
+
+fn hammersley(index: u32, count: u32) -> [f32; 2] {
+    let mut bits = index;
+    bits = bits.rotate_right(16);
+    bits = ((bits & 0x5555_5555) << 1) | ((bits & 0xAAAA_AAAA) >> 1);
+    bits = ((bits & 0x3333_3333) << 2) | ((bits & 0xCCCC_CCCC) >> 2);
+    bits = ((bits & 0x0F0F_0F0F) << 4) | ((bits & 0xF0F0_F0F0) >> 4);
+    bits = ((bits & 0x00FF_00FF) << 8) | ((bits & 0xFF00_FF00) >> 8);
+    [index as f32 / count as f32, bits as f32 * 2.328_306_4e-10]
+}
+
+fn tangent_basis(normal: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let up = if normal[1].abs() < 0.999 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let tangent = normalize(cross(up, normal));
+    let bitangent = normalize(cross(normal, tangent));
+    (tangent, bitangent)
+}
+
+fn local_to_world(
+    local: [f32; 3],
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
+    normal: [f32; 3],
+) -> [f32; 3] {
+    normalize([
+        tangent[0] * local[0] + bitangent[0] * local[1] + normal[0] * local[2],
+        tangent[1] * local[0] + bitangent[1] * local[1] + normal[1] * local[2],
+        tangent[2] * local[0] + bitangent[2] * local[1] + normal[2] * local[2],
+    ])
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalize(value: [f32; 3]) -> [f32; 3] {
+    let length = dot(value, value).sqrt();
+    [value[0] / length, value[1] / length, value[2] / length]
 }
 
 fn face_direction(face: EnvironmentCubeFace, u: f32, v: f32) -> [f32; 3] {
@@ -456,7 +742,9 @@ fn sample_equirectangular(source: &HdrEnvironmentMap, direction: [f32; 3]) -> [f
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvironmentCubeError, EnvironmentCubeFace, EnvironmentCubeMap};
+    use super::{
+        EnvironmentCubeError, EnvironmentCubeFace, EnvironmentCubeMap, EnvironmentLightingMaps,
+    };
     use z_ideal_assets::HdrEnvironmentMap;
 
     fn constant_source() -> HdrEnvironmentMap {
@@ -516,6 +804,86 @@ mod tests {
         assert!(matches!(
             EnvironmentCubeMap::from_equirectangular(&constant_source(), 4_097),
             Err(EnvironmentCubeError::InvalidSourceOrFaceSize)
+        ));
+    }
+
+    #[test]
+    fn diffuse_and_specular_convolution_preserve_constant_hdr_radiance() {
+        let maps = EnvironmentLightingMaps::from_equirectangular(&constant_source(), 2, 4, 3, 64)
+            .expect("convolve constant HDR environment");
+        for face in EnvironmentCubeFace::ALL {
+            for pixel in maps.irradiance().face(face) {
+                for (actual, expected) in pixel[..3].iter().zip([
+                    3.0 * std::f32::consts::PI,
+                    2.0 * std::f32::consts::PI,
+                    std::f32::consts::PI,
+                ]) {
+                    assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+                }
+            }
+        }
+        assert_eq!(maps.specular_mips().len(), 3);
+        assert_eq!(
+            maps.specular_mips()
+                .iter()
+                .map(EnvironmentCubeMap::face_size)
+                .collect::<Vec<_>>(),
+            [4, 2, 1]
+        );
+        for mip in maps.specular_mips() {
+            for face in EnvironmentCubeFace::ALL {
+                for pixel in mip.face(face) {
+                    assert!((pixel[0] - 3.0).abs() < 1e-4);
+                    assert!((pixel[1] - 2.0).abs() < 1e-4);
+                    assert!((pixel[2] - 1.0).abs() < 1e-4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rougher_specular_mip_spreads_a_directional_hdr_source() {
+        let mut pixels = vec![[0.0, 0.0, 0.0]; 64 * 32];
+        for y in 15..=16 {
+            for x in 47..=48 {
+                pixels[y * 64 + x] = [10.0, 5.0, 2.0];
+            }
+        }
+        let source = HdrEnvironmentMap {
+            source_path: "bright-lobe.hdr".into(),
+            width: 64,
+            height: 32,
+            pixels,
+        };
+        let maps = EnvironmentLightingMaps::from_equirectangular(&source, 1, 3, 2, 1_024)
+            .expect("convolve bright directional lobe");
+        let sharp = maps.specular_mips()[0].face(EnvironmentCubeFace::PositiveZ)[4][0];
+        let rough = maps.specular_mips()[1].face(EnvironmentCubeFace::PositiveZ)[0][0];
+        assert!(
+            sharp > 9.0,
+            "sharp specular sample should retain the source lobe: {sharp}"
+        );
+        assert!(
+            rough > 0.0 && rough < sharp,
+            "rough mip should spread and reduce the lobe: {rough} vs {sharp}"
+        );
+    }
+
+    #[test]
+    fn convolution_is_deterministic_and_rejects_excessive_work() {
+        let source = constant_source();
+        let first = EnvironmentLightingMaps::from_equirectangular(&source, 2, 4, 3, 32)
+            .expect("first deterministic convolution");
+        let second = EnvironmentLightingMaps::from_equirectangular(&source, 2, 4, 3, 32)
+            .expect("second deterministic convolution");
+        assert_eq!(first, second);
+        assert!(matches!(
+            EnvironmentLightingMaps::from_equirectangular(&source, 2, 4, 3, 0),
+            Err(EnvironmentCubeError::InvalidConvolutionOptions)
+        ));
+        assert!(matches!(
+            EnvironmentLightingMaps::from_equirectangular(&source, 512, 512, 10, 4_096),
+            Err(EnvironmentCubeError::ResourceLimitExceeded)
         ));
     }
 }
