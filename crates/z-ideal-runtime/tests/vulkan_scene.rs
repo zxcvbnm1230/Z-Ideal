@@ -622,7 +622,13 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             imported.clone(),
         )
         .expect("cache imported PBR asset");
-    let scene = snapshot(source_uri.clone(), 0);
+    let mut scene = snapshot(source_uri.clone(), 0);
+    let material_scale = Mat4::from_scale(Vec3::new(0.55, 0.55, 1.0));
+    scene.meshes[0].model = Mat4::from_translation(Vec3::new(-0.45, 0.0, 0.0)) * material_scale;
+    let mut second_material_instance = scene.meshes[0].clone();
+    second_material_instance.model =
+        Mat4::from_translation(Vec3::new(0.45, 0.0, 0.0)) * material_scale;
+    scene.meshes.push(second_material_instance);
 
     let instance = Arc::new(
         VulkanInstance::new(&VulkanConfig {
@@ -699,7 +705,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let texture_views = material_textures
             .create_views()
             .expect("create all five material texture views");
-        let _fallback_views = fallback_textures
+        let fallback_views = fallback_textures
             .create_views()
             .expect("create all five neutral fallback texture views");
         let irradiance_view = irradiance_cube
@@ -958,15 +964,15 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let descriptor_pool = VulkanDescriptorPool::new(
             &device,
             DescriptorPoolConfig {
-                max_sets: 2,
+                max_sets: 3,
                 pool_sizes: vec![
                     DescriptorPoolSize {
                         descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                        descriptor_count: 2,
+                        descriptor_count: 3,
                     },
                     DescriptorPoolSize {
                         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 9,
+                        descriptor_count: 14,
                     },
                 ],
             },
@@ -975,6 +981,9 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let mut material_set = descriptor_pool
             .allocate_set(&material_layout)
             .expect("allocate material descriptor set");
+        let mut alternate_material_set = descriptor_pool
+            .allocate_set(&material_layout)
+            .expect("allocate alternate material descriptor set");
         let mut scene_set = descriptor_pool
             .allocate_set(&scene_layout)
             .expect("allocate scene descriptor set");
@@ -987,6 +996,15 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             },
         )
         .expect("create material uniform buffer");
+        let mut alternate_material_buffer = VulkanBuffer::new(
+            &device,
+            BufferConfig {
+                size: 96,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                memory: BufferMemoryLocation::Upload,
+            },
+        )
+        .expect("create alternate material uniform buffer");
         let mut scene_buffer = VulkanBuffer::new(
             &device,
             BufferConfig {
@@ -1003,6 +1021,22 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             texture_views.descriptor_resources(&material_textures),
         )
         .expect("write complete glTF material descriptor set");
+        let mut alternate_material = material.clone();
+        alternate_material.base_color_factor = [0.2, 0.7, 0.35, 1.0];
+        alternate_material.metallic_factor = 0.8;
+        alternate_material.roughness_factor = 0.2;
+        alternate_material.base_color_texture = None;
+        alternate_material.metallic_roughness_texture = None;
+        alternate_material.normal_texture = None;
+        alternate_material.occlusion_texture = None;
+        alternate_material.emissive_texture = None;
+        let alternate_material_lease = write_gltf_material_descriptors(
+            &mut alternate_material_set,
+            &mut alternate_material_buffer,
+            &alternate_material,
+            fallback_views.descriptor_resources(&fallback_textures),
+        )
+        .expect("write alternate metallic-roughness material descriptors");
         let scene_lease = write_gltf_pbr_scene_descriptor(
             &mut scene_set,
             &mut scene_buffer,
@@ -1210,7 +1244,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                 },
             )
             .expect("record directional shadow mesh draws");
-        assert_eq!(shadow_draws, 1);
+        assert_eq!(shadow_draws, 2);
         recording
             .end_render_pass()
             .expect("finish directional shadow-map pass");
@@ -1228,6 +1262,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         recording
             .begin_render_pass(&render_pass, &framebuffer, &clear)
             .expect("begin PBR render pass");
+        let mut material_draw_index = 0;
         let draws = scene_renderer
             .record(
                 &gpu_scene,
@@ -1252,17 +1287,24 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                     },
                 },
                 |_, recording, layout| {
+                    let selected_material = if material_draw_index == 0 {
+                        material_draw_index += 1;
+                        material_lease.as_ref()
+                    } else {
+                        material_draw_index += 1;
+                        alternate_material_lease.as_ref()
+                    };
                     recording.bind_descriptor_sets(
                         vk::PipelineBindPoint::GRAPHICS,
                         layout,
                         0,
-                        &[material_lease.as_ref()],
+                        &[selected_material],
                         &[],
                     )
                 },
             )
             .expect("record material-bound runtime PBR scene");
-        assert_eq!(draws, 1);
+        assert_eq!(draws, 2);
         recording.end_render_pass().expect("end PBR render pass");
         let copy_region = [vk::BufferImageCopy::default()
             .buffer_offset(0)
@@ -1314,14 +1356,29 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             .read(0, &mut pixels)
             .expect("read PBR output pixels");
         std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
+            .expect("write temporary two-material PBR reference");
+        std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
             .expect("write temporary point/spot reference");
         std::fs::write("/tmp/zideal-pbr-reference.rgba8", &pixels)
             .expect("write temporary AO PBR reference");
-        let center = &pixels[(16 * 32 + 16) * 4..][..4];
+        let left_material_sample = &pixels[(16 * 32 + 8) * 4..][..4];
+        let right_material_sample = &pixels[(16 * 32 + 24) * 4..][..4];
         let clear = &pixels[(31 * 32 + 31) * 4..][..4];
         assert!(
-            center[0] > 25 || center[1] > 51 || center[2] > 76,
-            "PBR environment lighting did not contribute beyond emissive: {center:?}"
+            left_material_sample[0] > 25
+                || left_material_sample[1] > 51
+                || left_material_sample[2] > 76,
+            "first PBR material did not produce a lit pixel: {left_material_sample:?}"
+        );
+        assert!(
+            right_material_sample[0] > 25
+                || right_material_sample[1] > 51
+                || right_material_sample[2] > 76,
+            "alternate metallic-roughness material did not produce a lit pixel: {right_material_sample:?}"
+        );
+        assert_ne!(
+            left_material_sample, right_material_sample,
+            "material variants rendered identically"
         );
         assert_eq!(clear, &[0, 0, 0, 255], "PBR clear pixel changed: {clear:?}");
 
@@ -1355,6 +1412,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         );
 
         drop(material_lease);
+        drop(alternate_material_lease);
         drop(scene_lease);
     } // All device-owned resources are dropped before the logical device.
     drop(device);
