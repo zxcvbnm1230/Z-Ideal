@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
-use z_ideal_math::{Transform, Vec3};
+use z_ideal_math::{Mat4, Quat, Transform, Vec3};
 use z_ideal_scene::{
     Collider, ColliderShape as SceneColliderShape, Entity, RigidBody, RigidBodyType,
     World as SceneWorld, WorldError as SceneWorldError,
@@ -24,12 +24,9 @@ pub enum PhysicsSceneError {
     /// Scene operation failed.
     #[error(transparent)]
     Scene(#[from] SceneWorldError),
-    /// A physics entity must be a root entity; parented physics transforms are not yet supported.
-    #[error("physics entity {0:?} must be a root entity")]
-    ParentTransformUnsupported(Entity),
-    /// Physics entities currently require unit local scale.
-    #[error("physics entity {0:?} must have unit scale")]
-    NonUnitScale(Entity),
+    /// A sphere collider cannot represent non-uniform world scale.
+    #[error("sphere collider on physics entity {0:?} requires uniform world scale")]
+    NonUniformSphereScale(Entity),
     /// Scene transform could not be represented by a physics body.
     #[error("physics entity {0:?} has a transform that cannot be represented")]
     InvalidTransform(Entity),
@@ -89,19 +86,74 @@ struct Binding {
     handle: PhysicsBodyHandle,
     rigid_body: RigidBody,
     collider: Collider,
+    collider_scale: Vec3,
 }
 
 /// Owns a physics world and synchronizes it with one ECS scene.
 ///
-/// Physics entities must currently be root entities with unit scale. This
-/// avoids silently dropping parent-induced shear or collider scale. Static
-/// and kinematic transforms are pushed from the scene during synchronization;
-/// dynamic transforms are written back after simulation steps.
+/// Parent transforms are composed into world-space body poses. Collider scale
+/// is baked into primitive dimensions; sphere colliders require uniform world
+/// scale, while boxes support non-uniform scale. Transform hierarchies that
+/// produce shear, reflection or singular scale are rejected. Static and
+/// kinematic transforms are pushed from the scene; dynamic world poses are
+/// converted back to local transforms after simulation steps.
 pub struct PhysicsScene {
     physics: PhysicsWorld,
     bindings: HashMap<Entity, Binding>,
     retired_bindings: HashMap<PhysicsBodyHandle, Entity>,
     event_bindings: HashMap<PhysicsBodyHandle, Entity>,
+}
+
+fn decompose_world_matrix(
+    matrix: Mat4,
+    entity: Entity,
+) -> Result<(Vec3, Quat, Vec3), PhysicsSceneError> {
+    if !matrix.is_finite() || matrix.determinant().abs() <= f32::MIN_POSITIVE {
+        return Err(PhysicsSceneError::InvalidTransform(entity));
+    }
+    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+    if !scale.is_finite()
+        || scale.min_element() <= f32::MIN_POSITIVE
+        || !rotation.is_finite()
+        || !translation.is_finite()
+    {
+        return Err(PhysicsSceneError::InvalidTransform(entity));
+    }
+    let recomposed = Mat4::from_scale_rotation_translation(scale, rotation, translation);
+    if !recomposed.abs_diff_eq(matrix, 1.0e-4) {
+        return Err(PhysicsSceneError::InvalidTransform(entity));
+    }
+    Ok((translation, rotation.normalize(), scale))
+}
+
+fn hierarchy_depth(scene: &SceneWorld, entity: Entity) -> usize {
+    let mut depth = 0;
+    let mut parent = scene.parent_of(entity);
+    while let Some(current) = parent {
+        depth += 1;
+        parent = scene.parent_of(current);
+    }
+    depth
+}
+
+fn scale_collider(
+    collider: Collider,
+    scale: Vec3,
+    entity: Entity,
+) -> Result<SceneColliderShape, PhysicsSceneError> {
+    Ok(match collider.shape {
+        SceneColliderShape::Sphere { radius } => {
+            if !scale.abs_diff_eq(Vec3::splat(scale.x), 1.0e-6) {
+                return Err(PhysicsSceneError::NonUniformSphereScale(entity));
+            }
+            SceneColliderShape::Sphere {
+                radius: radius * scale.x,
+            }
+        }
+        SceneColliderShape::Box { half_extents } => SceneColliderShape::Box {
+            half_extents: half_extents * scale,
+        },
+    })
 }
 
 impl PhysicsScene {
@@ -153,27 +205,32 @@ impl PhysicsScene {
             .filter(|entity| scene.get::<Collider>(*entity).is_some())
             .collect();
 
-        // Validate the complete scene input before changing any native body.
-        // This prevents a malformed later entity from leaving earlier entities
-        // partially synchronized during the same call.
+        // Validate and decompose the complete scene input before changing any
+        // native body. World matrices that contain shear/reflection/singular
+        // scale cannot be represented by the rigid-body plus primitive-shape API.
         let mut desired = Vec::with_capacity(active.len());
         for entity in active {
-            if scene.parent_of(entity).is_some() {
-                return Err(PhysicsSceneError::ParentTransformUnsupported(entity));
-            }
-            let transform = scene.get::<Transform>(entity).copied().unwrap_or_default();
-            if !transform.scale().abs_diff_eq(Vec3::ONE, 1.0e-6) {
-                return Err(PhysicsSceneError::NonUnitScale(entity));
-            }
+            let world_matrix = scene.world_transform(entity)?;
+            let (world_position, world_rotation, collider_scale) =
+                decompose_world_matrix(world_matrix, entity)?;
             let rigid_body = *scene
                 .get::<RigidBody>(entity)
                 .ok_or(SceneWorldError::StaleEntity(entity))?;
             let collider = *scene
                 .get::<Collider>(entity)
                 .ok_or(SceneWorldError::StaleEntity(entity))?;
-            desired.push((entity, transform, rigid_body, collider));
+            let scaled_collider = scale_collider(collider, collider_scale, entity)?;
+            desired.push((
+                entity,
+                world_position,
+                world_rotation,
+                collider_scale,
+                rigid_body,
+                collider,
+                scaled_collider,
+            ));
         }
-        let active_entities: Vec<_> = desired.iter().map(|(entity, _, _, _)| *entity).collect();
+        let active_entities: Vec<_> = desired.iter().map(|(entity, ..)| *entity).collect();
 
         let mut stale: Vec<_> = self
             .bindings
@@ -190,27 +247,50 @@ impl PhysicsScene {
             }
         }
 
-        for (entity, transform, rigid_body, collider) in desired {
-            let changed = self.bindings.get(&entity).is_some_and(|binding| {
-                binding.rigid_body != rigid_body || binding.collider != collider
+        for (
+            entity,
+            world_position,
+            world_rotation,
+            collider_scale,
+            rigid_body,
+            collider,
+            scaled_collider,
+        ) in desired
+        {
+            let existing_binding = self.bindings.get(&entity).copied();
+            let changed = existing_binding.is_some_and(|binding| {
+                binding.rigid_body != rigid_body
+                    || binding.collider != collider
+                    || !binding.collider_scale.abs_diff_eq(collider_scale, 1.0e-6)
             });
-            if changed {
-                let binding = self.bindings[&entity];
+            let preserved_state = if changed {
+                let binding = existing_binding.expect("changed binding exists");
+                let state = (binding.rigid_body == rigid_body
+                    && rigid_body.body_type == RigidBodyType::Dynamic)
+                    .then(|| self.physics.body_state(binding.handle))
+                    .transpose()?;
                 self.physics.destroy_body(binding.handle)?;
                 self.retired_bindings.insert(binding.handle, entity);
                 self.bindings.remove(&entity);
-            }
+                state
+            } else {
+                None
+            };
 
             if !self.bindings.contains_key(&entity) {
+                let (position, rotation, linear_velocity) = preserved_state.map_or(
+                    (world_position, world_rotation, rigid_body.linear_velocity),
+                    |state| (state.position, state.rotation, state.linear_velocity),
+                );
                 let body_desc = RigidBodyDesc {
                     body_type: match rigid_body.body_type {
                         RigidBodyType::Static => PhysicsBodyType::Static,
                         RigidBodyType::Kinematic => PhysicsBodyType::Kinematic,
                         RigidBodyType::Dynamic => PhysicsBodyType::Dynamic,
                     },
-                    position: transform.translation(),
-                    rotation: transform.rotation(),
-                    linear_velocity: rigid_body.linear_velocity,
+                    position,
+                    rotation,
+                    linear_velocity,
                     gravity_scale: rigid_body.gravity_scale,
                     linear_damping: rigid_body.linear_damping,
                     angular_damping: rigid_body.angular_damping,
@@ -218,7 +298,7 @@ impl PhysicsScene {
                     bullet: rigid_body.bullet,
                 };
                 let collider_desc = ColliderDesc {
-                    shape: match collider.shape {
+                    shape: match scaled_collider {
                         SceneColliderShape::Sphere { radius } => ColliderShape::Sphere { radius },
                         SceneColliderShape::Box { half_extents } => {
                             ColliderShape::Box { half_extents }
@@ -240,15 +320,13 @@ impl PhysicsScene {
                         handle,
                         rigid_body,
                         collider,
+                        collider_scale,
                     },
                 );
             } else if rigid_body.body_type != RigidBodyType::Dynamic {
                 let handle = self.bindings[&entity].handle;
-                self.physics.set_body_transform(
-                    handle,
-                    transform.translation(),
-                    transform.rotation(),
-                )?;
+                self.physics
+                    .set_body_transform(handle, world_position, world_rotation)?;
             }
         }
         Ok(())
@@ -262,18 +340,42 @@ impl PhysicsScene {
         &self,
         scene: &mut SceneWorld,
     ) -> Result<(), PhysicsSceneError> {
-        for (entity, binding) in &self.bindings {
-            if binding.rigid_body.body_type != RigidBodyType::Dynamic || !scene.is_alive(*entity) {
-                continue;
-            }
+        let mut dynamic_entities: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(entity, binding)| {
+                (binding.rigid_body.body_type == RigidBodyType::Dynamic && scene.is_alive(*entity))
+                    .then_some(*entity)
+            })
+            .collect();
+        // Parent bodies must be written before children so each child's local
+        // pose is solved against the parent's newly simulated world transform.
+        dynamic_entities.sort_by_key(|entity| (hierarchy_depth(scene, *entity), *entity));
+
+        for entity in dynamic_entities {
+            let binding = self.bindings[&entity];
             let state = self.physics.body_state(binding.handle)?;
-            let existing = scene.get::<Transform>(*entity).copied().unwrap_or_default();
-            let transform = Transform::new(state.position, state.rotation, existing.scale())
-                .map_err(|_| PhysicsSceneError::InvalidTransform(*entity))?;
-            if let Some(current) = scene.get_mut::<Transform>(*entity) {
+            let existing = scene.get::<Transform>(entity).copied().unwrap_or_default();
+            let (local_position, local_rotation) = if let Some(parent) = scene.parent_of(entity) {
+                let parent_matrix = scene.world_transform(parent)?;
+                let (_, parent_rotation, _) = decompose_world_matrix(parent_matrix, parent)?;
+                let inverse = parent_matrix.inverse();
+                if !inverse.is_finite() {
+                    return Err(PhysicsSceneError::InvalidTransform(entity));
+                }
+                (
+                    inverse.transform_point3(state.position),
+                    parent_rotation.inverse() * state.rotation,
+                )
+            } else {
+                (state.position, state.rotation)
+            };
+            let transform = Transform::new(local_position, local_rotation, existing.scale())
+                .map_err(|_| PhysicsSceneError::InvalidTransform(entity))?;
+            if let Some(current) = scene.get_mut::<Transform>(entity) {
                 *current = transform;
             } else {
-                scene.insert(*entity, transform)?;
+                scene.insert(entity, transform)?;
             }
         }
         Ok(())
@@ -508,20 +610,214 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parented_physics_entities_and_non_unit_scale() {
+    fn parented_dynamic_body_uses_world_pose_and_writes_back_local_pose() {
         let mut scene = scene_with_physics_components();
-        let valid_entity = scene.spawn().expect("valid entity");
-        scene
-            .insert(valid_entity, RigidBody::default())
-            .expect("valid rigid body");
-        scene
-            .insert(valid_entity, Collider::sphere(0.5))
-            .expect("valid collider");
         let parent = scene.spawn().expect("parent");
+        let parent_transform = Transform::new(
+            Vec3::new(4.0, 2.0, 1.0),
+            Quat::from_rotation_y(0.5),
+            Vec3::ONE,
+        )
+        .expect("parent transform");
+        scene
+            .insert(parent, parent_transform)
+            .expect("insert parent transform");
+        let entity = scene.spawn().expect("child");
+        scene.set_parent(entity, Some(parent)).expect("set parent");
+        scene
+            .insert(
+                entity,
+                Transform::new(
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Quat::from_rotation_x(0.2),
+                    Vec3::ONE,
+                )
+                .expect("child transform"),
+            )
+            .expect("insert child transform");
+        scene
+            .insert(entity, RigidBody::default())
+            .expect("rigid body");
+        scene
+            .insert(entity, Collider::sphere(0.5))
+            .expect("collider");
+
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
+        physics.synchronize(&mut scene).expect("sync parented body");
+        let binding = physics.bindings[&entity];
+        let initial_state = physics
+            .physics
+            .body_state(binding.handle)
+            .expect("initial body state");
+        let initial_world_position = scene
+            .world_transform(entity)
+            .expect("world transform")
+            .transform_point3(Vec3::ZERO);
+        assert!(
+            initial_state
+                .position
+                .abs_diff_eq(initial_world_position, 1.0e-5)
+        );
+
+        for _ in 0..10 {
+            physics.step().expect("step");
+        }
+        physics
+            .writeback_dynamic_transforms(&mut scene)
+            .expect("writeback child local transform");
+        let state = physics
+            .physics
+            .body_state(binding.handle)
+            .expect("body state after simulation");
+        let world_position = scene
+            .world_transform(entity)
+            .expect("updated world transform")
+            .transform_point3(Vec3::ZERO);
+        assert!(world_position.abs_diff_eq(state.position, 1.0e-4));
+        assert!(scene.parent_of(entity).is_some());
+    }
+
+    #[test]
+    fn uniform_parent_scale_is_baked_into_sphere_radius_and_recreated_on_change() {
+        let mut scene = scene_with_physics_components();
+        let parent = scene.spawn().expect("parent");
+        scene
+            .insert(
+                parent,
+                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0)).expect("parent scale"),
+            )
+            .expect("insert parent scale");
+        let entity = scene.spawn().expect("child");
+        scene.set_parent(entity, Some(parent)).expect("set parent");
+        scene
+            .insert(
+                entity,
+                RigidBody {
+                    body_type: RigidBodyType::Static,
+                    ..RigidBody::default()
+                },
+            )
+            .expect("rigid body");
+        scene
+            .insert(entity, Collider::sphere(0.5))
+            .expect("collider");
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
+        physics.synchronize(&mut scene).expect("initial sync");
+        let ray = PhysicsRayCast::new(Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -3.0));
+        let first_hit = physics.cast_ray(ray).expect("first ray")[0];
+        assert!((first_hit.fraction - 2.0 / 3.0).abs() < 1.0e-4);
+
+        scene
+            .insert(
+                parent,
+                Transform::new(Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, Vec3::splat(3.0))
+                    .expect("updated parent scale"),
+            )
+            .expect("update parent scale");
+        physics.synchronize(&mut scene).expect("rescale collider");
+        let moved_ray = PhysicsRayCast::new(Vec3::new(5.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -3.0));
+        let second_hit = physics.cast_ray(moved_ray).expect("second ray")[0];
+        assert!((second_hit.fraction - 0.5).abs() < 1.0e-4);
+        assert_eq!(physics.body_count(), 1);
+    }
+
+    #[test]
+    fn box_colliders_support_non_uniform_parent_scale() {
+        let mut scene = scene_with_physics_components();
         let entity = scene.spawn().expect("entity");
         scene
+            .insert(
+                entity,
+                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(2.0, 1.0, 1.0))
+                    .expect("non-uniform scale"),
+            )
+            .expect("insert transform");
+        scene
+            .insert(
+                entity,
+                RigidBody {
+                    body_type: RigidBodyType::Static,
+                    ..RigidBody::default()
+                },
+            )
+            .expect("rigid body");
+        scene
+            .insert(entity, Collider::cuboid(Vec3::splat(0.5)))
+            .expect("box collider");
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
+        physics.synchronize(&mut scene).expect("sync scaled box");
+        let ray = PhysicsRayCast::new(Vec3::new(3.0, 0.0, 0.0), Vec3::new(-6.0, 0.0, 0.0));
+        let hit = physics.cast_ray(ray).expect("box ray")[0];
+        assert!((hit.fraction - 1.0 / 3.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn dynamic_parent_and_child_writeback_is_hierarchy_ordered() {
+        let mut scene = scene_with_physics_components();
+        let parent = scene.spawn().expect("parent");
+        scene
+            .insert(
+                parent,
+                Transform::new(Vec3::new(0.0, 5.0, 0.0), Quat::IDENTITY, Vec3::ONE)
+                    .expect("parent transform"),
+            )
+            .expect("insert parent transform");
+        scene
+            .insert(parent, RigidBody::default())
+            .expect("parent body");
+        scene
+            .insert(parent, Collider::sphere(0.4))
+            .expect("parent collider");
+        let child = scene.spawn().expect("child");
+        scene.set_parent(child, Some(parent)).expect("parent child");
+        scene
+            .insert(
+                child,
+                Transform::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY, Vec3::ONE)
+                    .expect("child transform"),
+            )
+            .expect("insert child transform");
+        scene
+            .insert(child, RigidBody::default())
+            .expect("child body");
+        scene
+            .insert(child, Collider::sphere(0.4))
+            .expect("child collider");
+
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
+        physics.synchronize(&mut scene).expect("sync");
+        for _ in 0..10 {
+            physics.step().expect("step");
+        }
+        physics
+            .writeback_dynamic_transforms(&mut scene)
+            .expect("hierarchical writeback");
+
+        for entity in [parent, child] {
+            let binding = physics.bindings[&entity];
+            let state = physics
+                .physics
+                .body_state(binding.handle)
+                .expect("body state");
+            let world_position = scene
+                .world_transform(entity)
+                .expect("world transform")
+                .transform_point3(Vec3::ZERO);
+            assert!(world_position.abs_diff_eq(state.position, 1.0e-4));
+        }
+    }
+
+    #[test]
+    fn dynamic_collider_rescaling_preserves_simulated_body_state() {
+        let mut scene = scene_with_physics_components();
+        let parent = scene.spawn().expect("parent");
+        scene
+            .insert(parent, Transform::default())
+            .expect("parent transform");
+        let entity = scene.spawn().expect("child");
+        scene
             .set_parent(entity, Some(parent))
-            .expect("parent entity");
+            .expect("parent child");
         scene
             .insert(entity, RigidBody::default())
             .expect("rigid body");
@@ -529,20 +825,90 @@ mod tests {
             .insert(entity, Collider::sphere(0.5))
             .expect("collider");
         let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
-        assert!(matches!(
-            physics.synchronize(&mut scene),
-            Err(PhysicsSceneError::ParentTransformUnsupported(found)) if found == entity
-        ));
-        scene.set_parent(entity, None).expect("unparent");
+        physics.synchronize(&mut scene).expect("initial sync");
+        for _ in 0..5 {
+            physics.step().expect("step");
+        }
+        let binding = physics.bindings[&entity];
+        let before = physics
+            .physics
+            .body_state(binding.handle)
+            .expect("body state before scale");
+        scene
+            .insert(
+                parent,
+                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0))
+                    .expect("scaled parent"),
+            )
+            .expect("rescale parent");
+        physics.synchronize(&mut scene).expect("rescale collider");
+        let after_binding = physics.bindings[&entity];
+        let after = physics
+            .physics
+            .body_state(after_binding.handle)
+            .expect("body state after scale");
+        assert!(after.position.abs_diff_eq(before.position, 1.0e-5));
+        assert!(
+            after
+                .linear_velocity
+                .abs_diff_eq(before.linear_velocity, 1.0e-5)
+        );
+        assert_eq!(physics.body_count(), 1);
+    }
+
+    #[test]
+    fn rejects_non_uniform_sphere_scale_and_sheared_world_transforms() {
+        let mut scene = scene_with_physics_components();
+        let entity = scene.spawn().expect("entity");
         scene
             .insert(
                 entity,
-                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0)).expect("scaled"),
+                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(2.0, 1.0, 1.0))
+                    .expect("non-uniform scale"),
             )
-            .expect("insert scaled transform");
+            .expect("insert transform");
+        scene
+            .insert(entity, RigidBody::default())
+            .expect("rigid body");
+        scene
+            .insert(entity, Collider::sphere(0.5))
+            .expect("sphere collider");
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
         assert!(matches!(
             physics.synchronize(&mut scene),
-            Err(PhysicsSceneError::NonUnitScale(found)) if found == entity
+            Err(PhysicsSceneError::NonUniformSphereScale(found)) if found == entity
+        ));
+        assert_eq!(physics.body_count(), 0);
+
+        scene
+            .remove::<RigidBody>(entity)
+            .expect("remove invalid sphere body");
+        let parent = scene.spawn().expect("parent");
+        scene
+            .insert(
+                parent,
+                Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(2.0, 1.0, 1.0))
+                    .expect("parent scale"),
+            )
+            .expect("insert parent transform");
+        let child = scene.spawn().expect("child");
+        scene.set_parent(child, Some(parent)).expect("parent child");
+        scene
+            .insert(
+                child,
+                Transform::new(Vec3::ZERO, Quat::from_rotation_z(0.5), Vec3::ONE)
+                    .expect("rotated child"),
+            )
+            .expect("insert child transform");
+        scene
+            .insert(child, RigidBody::default())
+            .expect("child rigid body");
+        scene
+            .insert(child, Collider::cuboid(Vec3::splat(0.5)))
+            .expect("child box collider");
+        assert!(matches!(
+            physics.synchronize(&mut scene),
+            Err(PhysicsSceneError::InvalidTransform(found)) if found == child
         ));
         assert_eq!(physics.body_count(), 0);
         assert_eq!(physics.physics_world().body_count(), 0);

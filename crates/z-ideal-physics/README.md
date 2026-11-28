@@ -75,17 +75,23 @@ one or more fixed steps, call writeback_dynamic_transforms to copy dynamic
 poses into scene Transform components. It does not perform presentation
 interpolation.
 
-Current transform contract: physics entities must be root entities and have
-unit local scale. Parent transforms, shear, and scaled colliders are rejected
-rather than approximated. Dynamic scene transforms are written in world space
-because parented physics entities are not yet supported. Scene entities with
-only one of RigidBody or Collider do not participate.
+PhysicsScene composes the complete ECS parent chain and submits world-space
+body poses. Dynamic world poses are converted back into local transforms after
+simulation. Parent and child dynamic bodies are written back in hierarchy order
+so a child's local pose is solved against its parent's newly simulated pose.
+
+Collider scale is baked into primitive dimensions. Box colliders support
+non-uniform positive world scale; sphere colliders require uniform positive
+world scale. Singular, reflected or sheared world matrices are rejected rather
+than approximated. If a dynamic collider's scale changes, its native shape is
+recreated while preserving the current simulated pose and velocity. Scene
+entities with only one of RigidBody or Collider do not participate.
 
 ## Current scope boundaries
 
-Shape casts, overlap queries, joints, mesh colliders, compound colliders,
-height fields, parented physics transforms and collider scaling are not
-implemented. These are later Phase 5 increments, not implemented capabilities.
+Ray casts, convex shape casts, overlap queries, parented physics transforms and
+primitive collider scaling are implemented. Joints, mesh colliders, compound
+colliders and height fields remain future Phase 5 work.
 Box3D-specific IDs and types remain private to this crate.
 
 The pinned backend is boxddd 0.4.0, an experimental 0.x safe wrapper around
@@ -100,5 +106,5 @@ world-space origins, orientations and displacements. Query category/mask bits
 use Box3D filtering. Cast results are sorted by hit fraction and stable body
 handle; overlap results are sorted by stable body handle. PhysicsScene provides
 matching methods that translate results to ECS Entity handles. Query dimensions
-are expressed in engine world units; collider scaling and parent transforms are
-not applied.
+are expressed directly in engine world units; scene collider scaling does not
+change caller-supplied query dimensions.

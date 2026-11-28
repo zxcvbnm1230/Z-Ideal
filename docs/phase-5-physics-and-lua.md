@@ -79,9 +79,13 @@ tests. This gate is not yet met.
 - writeback_dynamic_transforms copies simulated dynamic poses into scene
   Transform components after fixed simulation steps. Presentation
   interpolation remains separate.
-- Physics entities are currently required to be root entities with unit local
-  scale. Parent transforms and scaled colliders return explicit errors; they
-  are not silently approximated.
+- PhysicsScene composes parent transforms into world-space body poses and
+  writes dynamic poses back into local transforms. Dynamic parent/child
+  writeback is hierarchy ordered.
+- Box colliders bake positive non-uniform world scale into half extents;
+  sphere colliders require uniform positive scale. Singular, reflected or
+  sheared world transforms are rejected. Dynamic collider rescaling recreates
+  the native shape while preserving current pose and linear velocity.
 - Entities with only one of RigidBody or Collider do not participate.
 
 ### Collision filtering, queries and events
@@ -107,8 +111,7 @@ tests. This gate is not yet met.
   shape-query hits and event snapshots, including the entity identity for a
   body removed during the immediately preceding synchronization.
 
-Parent transforms, collider scaling, joints, mesh/compound/height-field
-colliders are not implemented.
+Joints, mesh/compound colliders and height fields are not implemented.
 
 ### Lua VM, lifecycle and scene API
 
@@ -148,7 +151,7 @@ colliders are not implemented.
 - Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
-- Current focused coverage: 62 scripting tests, 46 scene tests, 40 physics,
+- Current focused coverage: 62 scripting tests, 46 scene tests, 45 physics,
   53 asset and 30 runtime tests pass on the development host. These are
   focused results, not the full workspace gate.
 
@@ -209,8 +212,8 @@ supported desktop targets.
 
 ## Remaining work
 
-- Add joints, mesh/compound/height-field colliders, parent-transform support and
-  collider scaling only when the public scene/physics contracts are specified.
+- Add joints, mesh/compound colliders and height fields only when their public
+  scene/physics contracts are specified.
 - Connect RuntimeSimulation to packaged startup, PlatformEventLoop, renderer
   frame submission and editor play mode; invoke the script package pipeline
   from the project build workflow.
