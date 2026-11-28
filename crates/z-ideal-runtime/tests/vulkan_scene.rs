@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use ash::vk;
 use z_ideal_assets::{
-    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, GltfImporter, ImportedImage,
-    ImportedMesh, ImportedPrimitive, ImportedTexture, PrimitiveTopology, TextureWrapMode,
+    AssetCache, AssetId, AssetKind, AssetUri, GltfImport, GltfImporter, HdrEnvironmentMap,
+    ImportedImage, ImportedMesh, ImportedPrimitive, ImportedTexture, PrimitiveTopology,
+    TextureWrapMode,
 };
 use z_ideal_math::{Mat4, PerspectiveCamera, Quat, Transform, Vec3};
 use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferDescriptorWrite, BufferMemoryLocation, CommandPoolConfig,
     DescriptorBinding, DescriptorPoolConfig, DescriptorPoolSize, DescriptorResourceWrite,
-    DescriptorSetLayoutConfig, FenceWaitResult, GraphicsPipelineConfig, ImageConfig,
-    ImageDescriptorWrite, ImageViewConfig, MeshUploadError, RenderPassAttachmentConfig,
-    RenderPassAttachmentReference, RenderPassConfig, RenderPassDependency, RenderPassSubpassConfig,
-    ShaderCompileConfig, ShaderStage, TextureColorSpace, TextureUploadError, VulkanBuffer,
-    VulkanCommandPool, VulkanConfig, VulkanDescriptorPool, VulkanDescriptorSetLayout, VulkanDevice,
+    DescriptorSetLayoutConfig, EnvironmentLightingMaps, FenceWaitResult, GraphicsPipelineConfig,
+    ImageConfig, ImageDescriptorWrite, ImageViewConfig, MeshUploadError,
+    RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
+    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage,
+    TextureColorSpace, TextureUploadError, VulkanBuffer, VulkanCommandPool, VulkanConfig,
+    VulkanDescriptorPool, VulkanDescriptorSetLayout, VulkanDevice, VulkanEnvironmentCube,
     VulkanFramebuffer, VulkanGraphicsPipeline, VulkanHdrColorTarget, VulkanImage, VulkanInstance,
     VulkanPipelineLayout, VulkanQueue, VulkanRenderPass, VulkanShaderModule, VulkanTexture2D,
     compile_glsl,
@@ -633,6 +635,23 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
     {
         let gpu_scene =
             VulkanSceneMeshes::upload(&device, &cache, &scene).expect("upload PBR scene mesh");
+        let hdr_environment = HdrEnvironmentMap {
+            source_path: "pbr-test-environment.hdr".into(),
+            width: 4,
+            height: 2,
+            pixels: vec![[0.5, 0.4, 0.3]; 8],
+        };
+        let lighting_maps =
+            EnvironmentLightingMaps::from_equirectangular(&hdr_environment, 2, 4, 3, 64)
+                .expect("generate deterministic PBR IBL test maps");
+        let irradiance_cube = VulkanEnvironmentCube::from_cube_mips(
+            &device,
+            std::slice::from_ref(lighting_maps.irradiance()),
+        )
+        .expect("create diffuse irradiance cube");
+        let specular_cube =
+            VulkanEnvironmentCube::from_cube_mips(&device, lighting_maps.specular_mips())
+                .expect("create GGX-prefiltered specular cube");
 
         let material_textures = GltfMaterialTextureSet::from_import(&device, &imported, material)
             .expect("create semantic material textures and neutral fallbacks");
@@ -659,6 +678,12 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         fallback_textures
             .record_upload(&mut upload_recording)
             .expect("record all five neutral fallback texture uploads");
+        irradiance_cube
+            .record_upload(&mut upload_recording)
+            .expect("record diffuse irradiance cube upload");
+        specular_cube
+            .record_upload(&mut upload_recording)
+            .expect("record GGX specular mip-chain upload");
         let upload_executable = upload_recording.end().expect("finish material uploads");
         let mut upload_submission = VulkanQueue::graphics(&device)
             .submit(upload_executable, &[], &[], &[])
@@ -676,6 +701,12 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let _fallback_views = fallback_textures
             .create_views()
             .expect("create all five neutral fallback texture views");
+        let irradiance_view = irradiance_cube
+            .create_view()
+            .expect("create diffuse irradiance cube view");
+        let specular_view = specular_cube
+            .create_view()
+            .expect("create prefiltered specular cube view");
 
         let material_layout = VulkanDescriptorSetLayout::new(
             &device,
@@ -699,12 +730,26 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let scene_layout = VulkanDescriptorSetLayout::new(
             &device,
             DescriptorSetLayoutConfig {
-                bindings: vec![DescriptorBinding {
-                    binding: 0,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                    descriptor_count: 1,
-                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
-                }],
+                bindings: vec![
+                    DescriptorBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    },
+                    DescriptorBinding {
+                        binding: 1,
+                        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    },
+                    DescriptorBinding {
+                        binding: 2,
+                        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    },
+                ],
             },
         )
         .expect("create scene descriptor layout");
@@ -719,7 +764,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
                     },
                     DescriptorPoolSize {
                         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 5,
+                        descriptor_count: 7,
                     },
                 ],
             },
@@ -743,7 +788,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let mut scene_buffer = VulkanBuffer::new(
             &device,
             BufferConfig {
-                size: 64,
+                size: 80,
                 usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
                 memory: BufferMemoryLocation::Upload,
             },
@@ -762,10 +807,16 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
             GltfPbrSceneUniform {
                 camera_position: [0.0, 0.0, 5.0],
                 light_direction: [0.0, 0.0, -1.0],
-                light_intensity: 2.0,
+                light_intensity: 0.0,
                 light_color: [1.0, 1.0, 1.0],
-                ambient_color: [0.1, 0.1, 0.1],
+                ambient_color: [0.0, 0.0, 0.0],
+                environment_intensity: 1.0,
+                environment_max_lod: (specular_cube.mip_levels() - 1) as f32,
             },
+            &irradiance_view,
+            irradiance_cube.sampler(),
+            &specular_view,
+            specular_cube.sampler(),
         )
         .expect("write scene lighting descriptor");
 
@@ -975,7 +1026,7 @@ fn gltf_pbr_material_descriptors_and_shader_pipeline_record_validation_clean() {
         let clear = &pixels[(31 * 32 + 31) * 4..][..4];
         assert!(
             center[0] > 25 || center[1] > 51 || center[2] > 76,
-            "PBR direct/ambient lighting did not contribute beyond emissive: {center:?}"
+            "PBR environment lighting did not contribute beyond emissive: {center:?}"
         );
         assert_eq!(clear, &[0, 0, 0, 255], "PBR clear pixel changed: {clear:?}");
 

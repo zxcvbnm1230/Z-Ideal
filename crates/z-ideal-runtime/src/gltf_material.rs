@@ -120,12 +120,15 @@ fn validate_scene_uniform(scene: GltfPbrSceneUniform) -> Result<(), GltfMaterial
         .chain(scene.light_direction)
         .chain([scene.light_intensity])
         .chain(scene.light_color)
-        .chain(scene.ambient_color);
+        .chain(scene.ambient_color)
+        .chain([scene.environment_intensity, scene.environment_max_lod]);
     if values.clone().any(|value| !value.is_finite())
         || scene.light_direction.iter().all(|value| *value == 0.0)
         || scene.light_intensity < 0.0
         || scene.light_color.iter().any(|value| *value < 0.0)
         || scene.ambient_color.iter().any(|value| *value < 0.0)
+        || scene.environment_intensity < 0.0
+        || scene.environment_max_lod < 0.0
     {
         return Err(GltfMaterialError::InvalidSceneValues);
     }
@@ -189,14 +192,18 @@ pub struct GltfPbrSceneUniform {
     pub light_intensity: f32,
     /// Linear-light RGB color of the directional light.
     pub light_color: [f32; 3],
-    /// Linear-light ambient irradiance approximation.
+    /// Linear-light ambient irradiance approximation retained as an optional fill term.
     pub ambient_color: [f32; 3],
+    /// Non-negative multiplier applied to diffuse and specular image-based lighting.
+    pub environment_intensity: f32,
+    /// Maximum roughness-prefiltered specular mip level.
+    pub environment_max_lod: f32,
 }
 
 impl GltfPbrSceneUniform {
-    /// Encodes four std140 vec4 values (64 bytes).
+    /// Encodes five std140 vec4 values (80 bytes).
     #[must_use]
-    pub fn to_std140_bytes(self) -> [u8; 64] {
+    pub fn to_std140_bytes(self) -> [u8; 80] {
         let vectors = [
             [
                 self.camera_position[0],
@@ -222,8 +229,14 @@ impl GltfPbrSceneUniform {
                 self.ambient_color[2],
                 1.0,
             ],
+            [
+                self.environment_intensity,
+                self.environment_max_lod,
+                0.0,
+                0.0,
+            ],
         ];
-        let mut bytes = [0_u8; 64];
+        let mut bytes = [0_u8; 80];
         for (index, value) in vectors.into_iter().flatten().enumerate() {
             let offset = index * 4;
             bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -287,40 +300,68 @@ pub(crate) fn apply_gltf_material_pipeline_variant(
     Ok(())
 }
 
-/// Writes the PBR scene uniform to set 1 binding 0 and returns its resource lease.
-pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'pool, 'layout, 'device>(
+/// Writes the PBR scene uniform and image-based lighting resources to descriptor set 1.
+///
+/// Binding 0 is the 80-byte std140 scene block; bindings 1 and 2 are combined
+/// cube samplers for diffuse irradiance and roughness-prefiltered specular radiance.
+/// The caller owns the views, images, samplers, buffer, and descriptor set. The
+/// returned lease borrows all referenced resources for the duration of GPU use.
+pub fn write_gltf_pbr_scene_descriptor<'set, 'resource, 'image, 'pool, 'layout, 'device>(
     descriptor_set: &'set mut VulkanDescriptorSet<'pool, 'layout, 'device>,
     uniform_buffer: &'resource mut VulkanBuffer<'device>,
     scene: GltfPbrSceneUniform,
+    irradiance_view: &'image VulkanImageView<'_, 'device>,
+    irradiance_sampler: &'resource VulkanSampler<'device>,
+    specular_view: &'image VulkanImageView<'_, 'device>,
+    specular_sampler: &'resource VulkanSampler<'device>,
 ) -> Result<
-    DescriptorResourceLease<'set, 'resource, 'resource, 'pool, 'layout, 'device>,
+    DescriptorResourceLease<'set, 'resource, 'image, 'pool, 'layout, 'device>,
     GltfMaterialError,
 > {
     validate_scene_uniform(scene)?;
     let bindings = &descriptor_set.layout().config().bindings;
-    if bindings.len() != 1
-        || bindings[0].binding != 0
-        || bindings[0].descriptor_type != vk::DescriptorType::UNIFORM_BUFFER
-        || bindings[0].descriptor_count != 1
-        || !bindings[0]
-            .stage_flags
-            .contains(vk::ShaderStageFlags::FRAGMENT)
+    if bindings.len() != 3
+        || bindings.iter().any(|binding| {
+            let expected_type = if binding.binding == 0 {
+                vk::DescriptorType::UNIFORM_BUFFER
+            } else {
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+            };
+            binding.binding > 2
+                || binding.descriptor_type != expected_type
+                || binding.descriptor_count != 1
+                || !binding.stage_flags.contains(vk::ShaderStageFlags::FRAGMENT)
+        })
     {
         return Err(GltfMaterialError::DescriptorLayoutMismatch);
     }
-    if uniform_buffer.size() < 64 {
+    if uniform_buffer.size() < 80 {
         return Err(GltfMaterialError::UniformBufferTooSmall);
     }
     uniform_buffer.write(0, &scene.to_std140_bytes())?;
-    Ok(
-        descriptor_set.write_buffer_descriptors(&[BufferDescriptorWrite {
+    Ok(descriptor_set.write_descriptors(&[
+        DescriptorResourceWrite::Buffer(BufferDescriptorWrite {
             binding: 0,
             array_element: 0,
             buffer: uniform_buffer,
             offset: 0,
-            range: 64,
-        }])?,
-    )
+            range: 80,
+        }),
+        DescriptorResourceWrite::Image(ImageDescriptorWrite {
+            binding: 1,
+            array_element: 0,
+            view: irradiance_view,
+            sampler: Some(irradiance_sampler),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }),
+        DescriptorResourceWrite::Image(ImageDescriptorWrite {
+            binding: 2,
+            array_element: 0,
+            view: specular_view,
+            sampler: Some(specular_sampler),
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }),
+    ])?)
 }
 
 /// Owns the five GPU texture resources used by one glTF material.
@@ -540,13 +581,15 @@ impl<'resource, 'image, 'device> GltfMaterialTextureResources<'resource, 'image,
 /// Material descriptor creation and update failures.
 #[derive(Debug, Error)]
 pub enum GltfMaterialError {
-    /// The descriptor layout does not match the documented six-binding material contract.
+    /// A descriptor layout does not match the documented material or PBR scene contract.
     #[error(
         "glTF material descriptor layout must contain binding 0 uniform-buffer and bindings 1-5 combined-image-sampler, all fragment-visible"
     )]
     DescriptorLayoutMismatch,
-    /// The supplied uniform buffer is smaller than the 96-byte std140 payload.
-    #[error("glTF material uniform buffer must contain at least 96 bytes")]
+    /// A supplied uniform buffer is smaller than its std140 payload.
+    #[error(
+        "glTF material and scene uniform buffers must contain at least their std140 payload sizes"
+    )]
     UniformBufferTooSmall,
     /// Material factors, ranges, or texture-coordinate selections are invalid.
     #[error("glTF material factors or texture-coordinate selections are invalid")]
@@ -708,6 +751,8 @@ mod tests {
             light_intensity: 1.0,
             light_color: [1.0; 3],
             ambient_color: [0.1; 3],
+            environment_intensity: 1.0,
+            environment_max_lod: 2.0,
         };
         assert!(matches!(
             validate_scene_uniform(scene),
@@ -722,16 +767,18 @@ mod tests {
     }
 
     #[test]
-    fn scene_uniform_is_exactly_four_std140_vectors() {
+    fn scene_uniform_is_exactly_five_std140_vectors() {
         let scene = GltfPbrSceneUniform {
             camera_position: [1.0, 2.0, 3.0],
             light_direction: [0.0, -1.0, 0.0],
             light_intensity: 4.0,
             light_color: [5.0, 6.0, 7.0],
             ambient_color: [0.1, 0.2, 0.3],
+            environment_intensity: 0.75,
+            environment_max_lod: 4.0,
         };
         let bytes = scene.to_std140_bytes();
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 80);
         assert_eq!(
             f32::from_ne_bytes(bytes[28..32].try_into().expect("float")),
             4.0
@@ -739,6 +786,14 @@ mod tests {
         assert_eq!(
             f32::from_ne_bytes(bytes[48..52].try_into().expect("float")),
             0.1
+        );
+        assert_eq!(
+            f32::from_ne_bytes(bytes[64..68].try_into().expect("float")),
+            0.75
+        );
+        assert_eq!(
+            f32::from_ne_bytes(bytes[68..72].try_into().expect("float")),
+            4.0
         );
     }
 

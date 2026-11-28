@@ -27,7 +27,11 @@ layout(set = 1, binding = 0, std140) uniform SceneData {
     vec4 light_direction_intensity;
     vec4 light_color;
     vec4 ambient_color;
+    vec4 environment_intensity_max_lod;
 } scene;
+
+layout(set = 1, binding = 1) uniform samplerCube diffuse_irradiance_map;
+layout(set = 1, binding = 2) uniform samplerCube prefiltered_specular_map;
 
 vec2 material_uv(uint set_index) {
     return set_index == 1u ? uv1 : uv0;
@@ -76,6 +80,11 @@ vec3 fresnel_schlick(float cosine, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
 }
 
+vec3 fresnel_schlick_roughness(float cosine, vec3 f0, float roughness) {
+    return f0 + (max(vec3(1.0 - roughness), f0) - f0)
+         * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
 void main() {
     vec4 base = texture(base_color_texture, material_uv(material.texture_coordinates_0.x))
               * material.base_color_factor;
@@ -113,8 +122,24 @@ void main() {
     float occlusion = mix(1.0, occlusion_sample,
                           material.metallic_roughness_normal_occlusion.w);
     vec3 ambient = scene.ambient_color.rgb * base.rgb * diffuse_weight * occlusion;
+    float environment_intensity = scene.environment_intensity_max_lod.x;
+    float max_specular_lod = scene.environment_intensity_max_lod.y;
+    vec3 environment_fresnel = fresnel_schlick_roughness(n_dot_v, f0, roughness);
+    vec3 environment_diffuse_weight = (1.0 - environment_fresnel) * (1.0 - metallic);
+    vec3 irradiance = texture(diffuse_irradiance_map, n).rgb;
+    vec3 diffuse_ibl = irradiance * base.rgb * environment_diffuse_weight
+                     / 3.14159265;
+    vec3 reflection = reflect(-v, n);
+    vec3 prefiltered = textureLod(prefiltered_specular_map, reflection,
+                                  roughness * max_specular_lod).rgb;
+    // Analytic split-sum approximation; a BRDF integration LUT is not required.
+    float split_sum_a = 1.0 - 0.5 * roughness;
+    float split_sum_b = 0.04 * roughness;
+    vec3 specular_ibl = prefiltered
+                      * (f0 * split_sum_a + vec3(split_sum_b));
+    vec3 environment = (diffuse_ibl + specular_ibl) * environment_intensity * occlusion;
     vec3 emissive = texture(emissive_texture,
                             material_uv(material.texture_coordinates_1.x)).rgb
                   * material.emissive_alpha_cutoff.rgb;
-    out_color = vec4(direct + ambient + emissive, base.a);
+    out_color = vec4(direct + ambient + environment + emissive, base.a);
 }

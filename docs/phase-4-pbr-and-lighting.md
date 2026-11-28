@@ -1,6 +1,6 @@
 # Phase 4 — PBR and lighting
 
-**Status:** in progress. Implemented foundations now include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, and GGX roughness-prefiltered specular mip generation/upload. The existing PBR shader does not yet consume these environment maps; image-based lighting integration remains outstanding.
+**Status:** in progress. Implemented foundations include bounded, scene-linear Radiance RGBE equirectangular import, six-face cube conversion/upload, deterministic diffuse irradiance convolution, GGX roughness-prefiltered specular mip generation/upload, and runtime PBR image-based lighting using both environment maps.
 
 ## Roadmap scope
 
@@ -33,7 +33,6 @@
 
 ## Remaining work
 
-- Extend the PBR scene/material contract to sample diffuse irradiance and roughness-prefiltered specular maps and combine them with direct lighting in linear space.
 - Add point/spot light data and bounded light evaluation, with explicit limits and deterministic selection/order.
 - Implement filtered shadow maps and SSAO as independently testable render stages.
 - Add reference scenes and image regression comparisons with documented tolerances on supported Vulkan CI and hardware runners.
