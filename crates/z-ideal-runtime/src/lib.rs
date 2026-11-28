@@ -7,9 +7,14 @@ mod gltf_scene;
 mod render_scene;
 mod scene_renderer;
 mod shadow;
+mod simulation;
 mod ssao;
 mod vulkan_scene;
 
+pub use z_ideal_physics::{
+    FixedStepAccumulator, FixedStepConfig, FixedStepConfigError, FixedStepError, FixedStepPlan,
+    PhysicsScene, PhysicsSceneError, PhysicsSceneEvent, PhysicsWorldConfig,
+};
 pub use z_ideal_scripting::{
     DEFAULT_SCRIPT_MEMORY_LIMIT_BYTES, DEFAULT_SCRIPT_TIME_BUDGET, MAX_SCRIPT_MEMORY_LIMIT_BYTES,
     MAX_SCRIPT_TIME_BUDGET, MIN_SCRIPT_MEMORY_LIMIT_BYTES, MIN_SCRIPT_TIME_BUDGET, ScriptConfig,
@@ -20,6 +25,11 @@ pub use z_ideal_scripting::{
 pub use z_ideal_assets::{
     AssetUri, LuaScriptImporter, MAX_SCRIPT_ASSET_BYTES, SCRIPT_ASSET_API_VERSION, ScriptAsset,
     ScriptAssetImportError,
+};
+
+pub use simulation::{
+    RuntimeFrameReport, RuntimePhysicsOperation, RuntimeSimulation, RuntimeSimulationConfig,
+    RuntimeSimulationError,
 };
 
 pub use gltf_material::{

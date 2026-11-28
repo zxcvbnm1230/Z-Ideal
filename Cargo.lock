@@ -2472,9 +2472,12 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
+ "tracing",
  "z-ideal-assets",
  "z-ideal-math",
+ "z-ideal-physics",
  "z-ideal-renderer",
  "z-ideal-scene",
  "z-ideal-scripting",

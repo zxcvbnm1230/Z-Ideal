@@ -5,8 +5,10 @@ serializable scene physics components, ECS synchronization, collision filters,
 ray/shape queries, overlap queries, contact/sensor event delivery, Lua source
 import, and a Lua VM with scene bindings, lifecycle, events, prefab commands
 and bounded instruction, elapsed-time and Lua-VM memory execution are
-implemented. Script filesystem discovery and transactional package cooking are
-implemented. Runtime/editor integration, hard deadlines for native host calls
+implemented. Script filesystem discovery and transactional package cooking
+are implemented. The runtime simulation coordinator now drives script
+lifecycle, fixed-step physics, physics event delivery and diagnostics.
+Packaged application/editor integration, hard deadlines for native host calls
 and host API quotas remain outstanding. The VM allocator
 quota does not include Rust-side component snapshots or other host allocations.
 
@@ -146,9 +148,33 @@ colliders are not implemented.
 - Events use JSON payloads bounded to 64 KiB and 64 nesting levels, with names
   bounded to 128 bytes. Reload replaces the VM only while Loaded or Shutdown;
   running hot reload and state migration are not implemented.
-- Current focused coverage: 62 scripting tests, 46 scene tests, 40 physics
-  tests and 53 asset tests pass on the development host. These are focused
-  results, not the full workspace gate.
+- Current focused coverage: 62 scripting tests, 46 scene tests, 40 physics,
+  53 asset and 30 runtime tests pass on the development host. These are
+  focused results, not the full workspace gate.
+
+### Runtime simulation orchestration
+
+- RuntimeSimulation owns one ECS World, PhysicsScene, ScriptHost and
+  FixedStepAccumulator. PhysicsWorldConfig and FixedStepConfig must use the
+  same fixed-step duration; mismatches are rejected before native world setup.
+- advance starts newly attached scripts, runs fixed_update once per accumulated
+  fixed step, synchronizes ECS physics components, steps Box3D, writes dynamic
+  transforms back, and dispatches contact/sensor events to all started scripts.
+  Variable update runs once after the fixed steps, followed by a final scene
+  synchronization for changes made during that callback.
+- Physics events use stable scene entity index/generation pairs in their JSON
+  payloads. Event names are physics.contact_begin, physics.contact_end,
+  physics.sensor_begin and physics.sensor_end.
+- Script failures are isolated, returned in RuntimeFrameReport and emitted to
+  the z_ideal::script tracing target. Physics failures stop the frame and report
+  the planned and fully completed fixed-step counts; any unexecuted planned
+  steps are not retried automatically, while the accumulator retains only its
+  fractional remainder.
+- Pausing coordinates the fixed-step accumulator and ScriptHost. Shutdown,
+  application event dispatch, custom script instances and imported ScriptAsset
+  attachment are exposed by RuntimeSimulation.
+- The packaged runtime application is not yet connected to PlatformEventLoop,
+  a complete window/render frame loop or editor play mode.
 
 ### Script asset discovery and cooking
 
@@ -185,12 +211,10 @@ supported desktop targets.
 
 - Add joints, mesh/compound/height-field colliders, parent-transform support and
   collider scaling only when the public scene/physics contracts are specified.
-- Connect script diagnostics to editor tooling and the engine logging pipeline;
-  invoke the script package pipeline from the project build workflow.
+- Connect RuntimeSimulation to packaged startup, PlatformEventLoop, renderer
+  frame submission and editor play mode; invoke the script package pipeline
+  from the project build workflow.
 - Add hard deadlines for native host calls, native API quotas and a documented
   trusted/untrusted script policy.
-- Drive the runtime-exposed ScriptHost from packaged startup, fixed-step
-  scheduling and editor play mode; the packaged app has no complete game-loop
-  scheduler yet.
 - Add running hot reload with explicit state migration, if required by product
   behavior.

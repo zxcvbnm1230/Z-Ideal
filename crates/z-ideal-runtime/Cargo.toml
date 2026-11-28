@@ -12,6 +12,9 @@ z-ideal-math = { path = "../z-ideal-math" }
 z-ideal-scene = { path = "../z-ideal-scene" }
 z-ideal-renderer = { path = "../z-ideal-renderer" }
 z-ideal-scripting = { path = "../z-ideal-scripting" }
+z-ideal-physics = { path = "../z-ideal-physics" }
 ash.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
