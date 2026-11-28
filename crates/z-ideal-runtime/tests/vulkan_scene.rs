@@ -463,15 +463,6 @@ fn record_scene_draws(
         .bind_graphics_pipeline(&pipeline)
         .expect("bind scene graphics pipeline");
     recording
-        .bind_descriptor_sets(
-            vk::PipelineBindPoint::GRAPHICS,
-            &pipeline_layout,
-            0,
-            &[descriptor_lease.as_ref()],
-            &[],
-        )
-        .expect("bind glTF material descriptors");
-    recording
         .set_viewport(vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -491,8 +482,24 @@ fn record_scene_draws(
         })
         .expect("set scene scissor");
     let draw_count = gpu_scene
-        .record_draws(scene, &mut recording, &pipeline_layout)
-        .expect("record runtime scene draws");
+        .record_draws_with_materials(
+            scene,
+            &mut recording,
+            &pipeline_layout,
+            |material, recording, layout| {
+                if let Some(material) = material {
+                    assert_eq!(material.base_color_factor, material_factor);
+                }
+                recording.bind_descriptor_sets(
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[descriptor_lease.as_ref()],
+                    &[],
+                )
+            },
+        )
+        .expect("record runtime scene draws with per-primitive materials");
     recording
         .end_render_pass()
         .expect("end HDR scene render pass");

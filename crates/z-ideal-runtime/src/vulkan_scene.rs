@@ -159,6 +159,28 @@ impl<'device> VulkanSceneMeshes<'device> {
         recording: &mut CommandBufferRecording<'recording, 'pool, 'device>,
         layout: &'recording VulkanPipelineLayout<'_, 'device>,
     ) -> Result<usize, VulkanSceneMeshesError> {
+        self.record_draws_with_materials(snapshot, recording, layout, |_, _, _| Ok(()))
+    }
+
+    /// Records every primitive while invoking a caller-provided material binder before each draw.
+    ///
+    /// The callback receives the optional imported material pinned by this adapter and can
+    /// update/bind its descriptor set for the current primitive. Returning a Vulkan error
+    /// aborts recording immediately; the caller must discard the incomplete command buffer.
+    pub fn record_draws_with_materials<'recording, 'pool, F>(
+        &'recording self,
+        snapshot: &RenderSceneSnapshot,
+        recording: &mut CommandBufferRecording<'recording, 'pool, 'device>,
+        layout: &'recording VulkanPipelineLayout<'_, 'device>,
+        mut bind_material: F,
+    ) -> Result<usize, VulkanSceneMeshesError>
+    where
+        F: FnMut(
+            Option<&'recording ImportedMaterial>,
+            &mut CommandBufferRecording<'recording, 'pool, 'device>,
+            &'recording VulkanPipelineLayout<'_, 'device>,
+        ) -> Result<(), VulkanError>,
+    {
         let view_projection = snapshot.projection * snapshot.view;
         if !view_projection.is_finite() {
             return Err(VulkanSceneMeshesError::NonFiniteViewProjection);
@@ -195,6 +217,12 @@ impl<'device> VulkanSceneMeshes<'device> {
                         primitive_index,
                     }
                 })?;
+                let material = self.material_for_primitive(
+                    &instance.source.source_uri,
+                    instance.source.mesh_index,
+                    primitive_index,
+                )?;
+                bind_material(material, recording, layout)?;
                 mesh.record_draw(recording, layout, view_projection, instance.model)?;
                 draw_count += 1;
             }
