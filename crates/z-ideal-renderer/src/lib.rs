@@ -26,6 +26,7 @@ mod shader;
 mod surface;
 mod swapchain;
 mod sync;
+mod texture;
 
 pub use buffer::{BufferConfig, BufferMemoryLocation, VulkanBuffer};
 pub use command::{
@@ -58,6 +59,7 @@ pub use shader::{
 pub use surface::VulkanSurface;
 pub use swapchain::{AcquireResult, PresentResult, SwapchainConfig, VulkanSwapchain};
 pub use sync::{FenceConfig, FenceWaitResult, VulkanFence, VulkanSemaphore};
+pub use texture::{TextureUploadError, VulkanTexture2D};
 
 /// Stable package identifier.
 pub const CRATE_NAME: &str = "z-ideal-renderer";

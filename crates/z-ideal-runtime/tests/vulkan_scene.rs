@@ -10,10 +10,10 @@ use z_ideal_renderer::{
     BufferBarrier, BufferConfig, BufferMemoryLocation, CommandPoolConfig, FenceWaitResult,
     GraphicsPipelineConfig, ImageConfig, ImageViewConfig, MeshUploadError,
     RenderPassAttachmentConfig, RenderPassAttachmentReference, RenderPassConfig,
-    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage, VulkanBuffer,
-    VulkanCommandPool, VulkanConfig, VulkanDevice, VulkanFramebuffer, VulkanGraphicsPipeline,
-    VulkanImage, VulkanInstance, VulkanPipelineLayout, VulkanQueue, VulkanRenderPass,
-    VulkanShaderModule, compile_glsl,
+    RenderPassDependency, RenderPassSubpassConfig, ShaderCompileConfig, ShaderStage,
+    TextureUploadError, VulkanBuffer, VulkanCommandPool, VulkanConfig, VulkanDevice,
+    VulkanFramebuffer, VulkanGraphicsPipeline, VulkanImage, VulkanInstance, VulkanPipelineLayout,
+    VulkanQueue, VulkanRenderPass, VulkanShaderModule, VulkanTexture2D, compile_glsl,
 };
 use z_ideal_runtime::{
     GltfMeshInstance, RenderMeshInstance, RenderSceneSnapshot, VulkanSceneMeshes,
@@ -63,6 +63,39 @@ fn snapshot(uri: AssetUri, mesh_index: usize) -> RenderSceneSnapshot {
             model: Mat4::IDENTITY,
         }],
     }
+}
+
+fn record_texture_upload(device: &VulkanDevice, texture: &VulkanTexture2D<'_>) {
+    let command_pool = VulkanCommandPool::new(device, CommandPoolConfig::default())
+        .expect("create texture upload command pool");
+    let mut command_buffer = command_pool
+        .allocate_primary()
+        .expect("allocate texture upload command buffer");
+    let mut recording = command_buffer
+        .begin(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+        .expect("begin texture upload recording");
+    texture
+        .record_upload(&mut recording)
+        .expect("record imported texture upload and shader-read transition");
+    assert!(matches!(
+        texture.record_upload(&mut recording),
+        Err(TextureUploadError::AlreadyRecorded)
+    ));
+    let executable = recording
+        .end()
+        .expect("finish texture upload command buffer");
+    let queue = VulkanQueue::graphics(device);
+    let mut submission = queue
+        .submit(executable, &[], &[], &[])
+        .expect("submit imported texture upload");
+    assert_eq!(
+        submission.wait(u64::MAX).expect("wait for texture upload"),
+        FenceWaitResult::Signaled
+    );
+    drop(submission);
+    let view = texture.create_view().expect("create imported texture view");
+    assert_eq!(view.config().level_count, 1);
+    assert_eq!(texture.sampler().config().max_lod, 0.0);
 }
 
 fn record_scene_draws(
@@ -414,8 +447,10 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
 
     let asset_id = AssetId::from_uri(AssetKind::Mesh, &source_uri);
     let mut cache = AssetCache::new();
+    assert_eq!(imported.textures.len(), 1);
+    assert_eq!(imported.images.len(), 1);
     cache
-        .insert(asset_id, imported)
+        .insert(asset_id, imported.clone())
         .expect("cache imported sample scene");
     let instance = Arc::new(
         VulkanInstance::new(&VulkanConfig {
@@ -425,6 +460,9 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
         .expect("create Vulkan instance with validation enabled"),
     );
     let device = VulkanDevice::new(Arc::clone(&instance)).expect("create Vulkan device");
+    let texture = VulkanTexture2D::from_import(&device, &imported, 0)
+        .expect("create Vulkan image and sampler from imported texture");
+    record_texture_upload(&device, &texture);
     let gpu_scene = VulkanSceneMeshes::upload(&device, &cache, &scene_snapshot)
         .expect("upload imported scene meshes");
     let (draw_count, pixels) = record_scene_draws(&device, &gpu_scene, &scene_snapshot);
@@ -438,6 +476,7 @@ fn imported_gltf_scene_instantiates_extracts_and_renders_expected_pixels() {
     assert_eq!(&pixels[..4], &[0, 0, 0, 255], "unexpected clear pixel");
 
     drop(gpu_scene);
+    drop(texture);
     drop(device);
     let validation_errors: Vec<_> = instance
         .validation_messages()
