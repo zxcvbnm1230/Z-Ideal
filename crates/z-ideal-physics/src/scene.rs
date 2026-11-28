@@ -10,8 +10,8 @@ use z_ideal_scene::{
 };
 
 use crate::{
-    ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyType, PhysicsError, PhysicsWorld,
-    PhysicsWorldConfig, RigidBodyDesc,
+    ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyType, PhysicsError, PhysicsEvent,
+    PhysicsRayCast, PhysicsRayHit, PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,
 };
 
 /// Errors produced while synchronizing a scene with its physics world.
@@ -32,6 +32,35 @@ pub enum PhysicsSceneError {
     /// Scene transform could not be represented by a physics body.
     #[error("physics entity {0:?} has a transform that cannot be represented")]
     InvalidTransform(Entity),
+    /// A physics result referenced a body not currently mapped to this scene.
+    #[error("physics body {0:?} has no live scene entity mapping")]
+    UnmappedBody(PhysicsBodyHandle),
+}
+
+/// A physics event translated into stable scene entity references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicsSceneEvent {
+    /// Two solid scene colliders began touching.
+    ContactBegin { entity_a: Entity, entity_b: Entity },
+    /// Two solid scene colliders stopped touching.
+    ContactEnd { entity_a: Entity, entity_b: Entity },
+    /// A scene entity began overlapping a sensor entity.
+    SensorBegin { sensor: Entity, visitor: Entity },
+    /// A scene entity stopped overlapping a sensor entity.
+    SensorEnd { sensor: Entity, visitor: Entity },
+}
+
+/// A ray-cast hit translated into a scene entity reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsSceneRayHit {
+    /// Entity whose collider was hit.
+    pub entity: Entity,
+    /// World-space intersection point.
+    pub point: Vec3,
+    /// Surface normal at the intersection point.
+    pub normal: Vec3,
+    /// Fraction along the ray displacement.
+    pub fraction: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +79,8 @@ struct Binding {
 pub struct PhysicsScene {
     physics: PhysicsWorld,
     bindings: HashMap<Entity, Binding>,
+    retired_bindings: HashMap<PhysicsBodyHandle, Entity>,
+    event_bindings: HashMap<PhysicsBodyHandle, Entity>,
 }
 
 impl PhysicsScene {
@@ -58,6 +89,8 @@ impl PhysicsScene {
         Ok(Self {
             physics: PhysicsWorld::new(config)?,
             bindings: HashMap::new(),
+            retired_bindings: HashMap::new(),
+            event_bindings: HashMap::new(),
         })
     }
 
@@ -74,7 +107,14 @@ impl PhysicsScene {
 
     /// Advances exactly one configured fixed simulation step.
     pub fn step(&mut self) -> Result<(), PhysicsError> {
-        self.physics.step()
+        self.physics.step()?;
+        self.event_bindings = self
+            .bindings
+            .iter()
+            .map(|(entity, binding)| (binding.handle, *entity))
+            .chain(self.retired_bindings.drain())
+            .collect();
+        Ok(())
     }
 
     /// Creates, updates, and removes physics bodies to match scene components.
@@ -124,6 +164,7 @@ impl PhysicsScene {
         for entity in stale {
             if let Some(binding) = self.bindings.get(&entity).copied() {
                 self.physics.destroy_body(binding.handle)?;
+                self.retired_bindings.insert(binding.handle, entity);
                 self.bindings.remove(&entity);
             }
         }
@@ -135,6 +176,7 @@ impl PhysicsScene {
             if changed {
                 let binding = self.bindings[&entity];
                 self.physics.destroy_body(binding.handle)?;
+                self.retired_bindings.insert(binding.handle, entity);
                 self.bindings.remove(&entity);
             }
 
@@ -167,6 +209,8 @@ impl PhysicsScene {
                     sensor: collider.sensor,
                     contact_events: collider.contact_events,
                     sensor_events: collider.sensor_events,
+                    category_bits: collider.category_bits,
+                    mask_bits: collider.mask_bits,
                 };
                 let handle = self.physics.create_body(body_desc, collider_desc)?;
                 self.bindings.insert(
@@ -212,6 +256,83 @@ impl PhysicsScene {
             }
         }
         Ok(())
+    }
+
+    /// Returns latest-step physics events translated to scene entities.
+    ///
+    /// An unmapped body is reported as an error rather than silently dropping
+    /// an event. Removed entities retain their identity in end-event snapshots.
+    pub fn events(&self) -> Result<Vec<PhysicsSceneEvent>, PhysicsSceneError> {
+        self.physics
+            .events()
+            .iter()
+            .map(|event| {
+                let entity_for = |handle| {
+                    self.event_bindings
+                        .get(&handle)
+                        .copied()
+                        .or_else(|| {
+                            self.bindings.iter().find_map(|(entity, binding)| {
+                                (binding.handle == handle).then_some(*entity)
+                            })
+                        })
+                        .or_else(|| self.retired_bindings.get(&handle).copied())
+                        .ok_or(PhysicsSceneError::UnmappedBody(handle))
+                };
+                Ok(match *event {
+                    PhysicsEvent::ContactBegin { body_a, body_b } => {
+                        let mut entities = [entity_for(body_a)?, entity_for(body_b)?];
+                        entities.sort_unstable();
+                        PhysicsSceneEvent::ContactBegin {
+                            entity_a: entities[0],
+                            entity_b: entities[1],
+                        }
+                    }
+                    PhysicsEvent::ContactEnd { body_a, body_b } => {
+                        let mut entities = [entity_for(body_a)?, entity_for(body_b)?];
+                        entities.sort_unstable();
+                        PhysicsSceneEvent::ContactEnd {
+                            entity_a: entities[0],
+                            entity_b: entities[1],
+                        }
+                    }
+                    PhysicsEvent::SensorBegin { sensor, visitor } => {
+                        PhysicsSceneEvent::SensorBegin {
+                            sensor: entity_for(sensor)?,
+                            visitor: entity_for(visitor)?,
+                        }
+                    }
+                    PhysicsEvent::SensorEnd { sensor, visitor } => PhysicsSceneEvent::SensorEnd {
+                        sensor: entity_for(sensor)?,
+                        visitor: entity_for(visitor)?,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Casts a world-space ray and translates hits to scene entities.
+    pub fn cast_ray(
+        &self,
+        ray: PhysicsRayCast,
+    ) -> Result<Vec<PhysicsSceneRayHit>, PhysicsSceneError> {
+        self.physics
+            .cast_ray(ray)?
+            .into_iter()
+            .map(|hit: PhysicsRayHit| {
+                let entity = self
+                    .bindings
+                    .iter()
+                    .find_map(|(entity, binding)| (binding.handle == hit.body).then_some(*entity))
+                    .ok_or(PhysicsSceneError::UnmappedBody(hit.body))?;
+                Ok(PhysicsSceneRayHit {
+                    entity,
+                    point: hit.point,
+                    normal: hit.normal,
+                    fraction: hit.fraction,
+                })
+            })
+            .collect()
     }
 
     /// Returns the number of scene entities currently mapped to physics bodies.
@@ -407,5 +528,172 @@ mod tests {
         let new = physics.bindings[&entity].handle;
         assert_ne!(old, new);
         assert_eq!(physics.body_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod query_event_tests {
+    use super::*;
+    use z_ideal_math::Quat;
+
+    fn scene_with_physics_components() -> SceneWorld {
+        let mut scene = SceneWorld::new();
+        scene.register_component::<Transform>().expect("transform");
+        scene.register_component::<RigidBody>().expect("rigid body");
+        scene.register_component::<Collider>().expect("collider");
+        scene
+    }
+
+    #[test]
+    fn scene_ray_cast_hits_are_sorted_and_resolve_to_entities() {
+        let mut scene = scene_with_physics_components();
+        let far = scene.spawn().expect("far entity");
+        let near = scene.spawn().expect("near entity");
+        for (entity, y) in [(far, 0.0), (near, 2.0)] {
+            scene
+                .insert(
+                    entity,
+                    Transform::new(Vec3::new(0.0, y, 0.0), Quat::IDENTITY, Vec3::ONE)
+                        .expect("transform"),
+                )
+                .expect("insert transform");
+            scene
+                .insert(
+                    entity,
+                    RigidBody {
+                        body_type: RigidBodyType::Static,
+                        ..RigidBody::default()
+                    },
+                )
+                .expect("rigid body");
+            scene
+                .insert(entity, Collider::cuboid(Vec3::splat(0.5)))
+                .expect("collider");
+        }
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig::default()).expect("physics");
+        physics.synchronize(&mut scene).expect("sync");
+        let hits = physics
+            .cast_ray(PhysicsRayCast::new(
+                Vec3::new(0.0, 5.0, 0.0),
+                Vec3::new(0.0, -10.0, 0.0),
+            ))
+            .expect("ray cast");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entity, near);
+        assert_eq!(hits[1].entity, far);
+    }
+
+    #[test]
+    fn scene_sensor_end_events_keep_the_destroyed_entity_reference_for_the_step() {
+        let mut scene = scene_with_physics_components();
+        let sensor = scene.spawn().expect("sensor entity");
+        let visitor = scene.spawn().expect("visitor entity");
+        scene
+            .insert(
+                sensor,
+                RigidBody {
+                    body_type: RigidBodyType::Static,
+                    ..RigidBody::default()
+                },
+            )
+            .expect("sensor body");
+        scene
+            .insert(
+                sensor,
+                Collider {
+                    sensor: true,
+                    sensor_events: true,
+                    ..Collider::cuboid(Vec3::splat(1.0))
+                },
+            )
+            .expect("sensor collider");
+        scene
+            .insert(visitor, RigidBody::default())
+            .expect("visitor body");
+        scene
+            .insert(
+                visitor,
+                Collider {
+                    sensor_events: true,
+                    ..Collider::sphere(0.25)
+                },
+            )
+            .expect("visitor collider");
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig {
+            gravity: Vec3::ZERO,
+            ..PhysicsWorldConfig::default()
+        })
+        .expect("physics");
+        physics.synchronize(&mut scene).expect("initial sync");
+        physics.step().expect("begin step");
+        assert!(
+            physics
+                .events()
+                .expect("begin events")
+                .contains(&PhysicsSceneEvent::SensorBegin { sensor, visitor })
+        );
+
+        scene.despawn(visitor).expect("despawn visitor");
+        physics
+            .synchronize(&mut scene)
+            .expect("remove visitor body");
+        physics.step().expect("end step");
+        assert!(
+            physics
+                .events()
+                .expect("end events")
+                .contains(&PhysicsSceneEvent::SensorEnd { sensor, visitor })
+        );
+    }
+
+    #[test]
+    fn scene_sensor_events_resolve_to_scene_entities() {
+        let mut scene = scene_with_physics_components();
+        let sensor = scene.spawn().expect("sensor entity");
+        let visitor = scene.spawn().expect("visitor entity");
+        scene
+            .insert(
+                sensor,
+                RigidBody {
+                    body_type: RigidBodyType::Static,
+                    ..RigidBody::default()
+                },
+            )
+            .expect("sensor body");
+        scene
+            .insert(
+                sensor,
+                Collider {
+                    sensor: true,
+                    sensor_events: true,
+                    ..Collider::cuboid(Vec3::splat(1.0))
+                },
+            )
+            .expect("sensor collider");
+        scene
+            .insert(visitor, RigidBody::default())
+            .expect("visitor body");
+        scene
+            .insert(
+                visitor,
+                Collider {
+                    sensor_events: true,
+                    ..Collider::sphere(0.25)
+                },
+            )
+            .expect("visitor collider");
+        let mut physics = PhysicsScene::new(PhysicsWorldConfig {
+            gravity: Vec3::ZERO,
+            ..PhysicsWorldConfig::default()
+        })
+        .expect("physics");
+        physics.synchronize(&mut scene).expect("sync");
+        physics.step().expect("step");
+        assert!(
+            physics
+                .events()
+                .expect("scene events")
+                .contains(&PhysicsSceneEvent::SensorBegin { sensor, visitor })
+        );
     }
 }

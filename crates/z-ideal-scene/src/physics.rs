@@ -96,6 +96,16 @@ pub struct Collider {
     pub contact_events: bool,
     /// Whether sensor overlap events should be generated.
     pub sensor_events: bool,
+    /// Collision category bits assigned to this collider.
+    #[serde(default = "default_collision_bits")]
+    pub category_bits: u64,
+    /// Collision mask bits accepted by this collider.
+    #[serde(default = "default_collision_bits")]
+    pub mask_bits: u64,
+}
+
+const fn default_collision_bits() -> u64 {
+    u64::MAX
 }
 
 impl Collider {
@@ -110,6 +120,8 @@ impl Collider {
             sensor: false,
             contact_events: false,
             sensor_events: false,
+            category_bits: u64::MAX,
+            mask_bits: u64::MAX,
         }
     }
 
@@ -124,6 +136,8 @@ impl Collider {
             sensor: false,
             contact_events: false,
             sensor_events: false,
+            category_bits: u64::MAX,
+            mask_bits: u64::MAX,
         }
     }
 }
@@ -176,6 +190,12 @@ mod tests {
 
         let unknown_field = r#"{"body_type":"dynamic","gravity_scale":1.0,"linear_damping":0.0,"angular_damping":0.0,"allow_sleep":true,"bullet":false,"linear_velocity":[0.0,0.0,0.0],"unexpected":true}"#;
         assert!(serde_json::from_str::<RigidBody>(unknown_field).is_err());
+
+        let legacy_collider = r#"{"shape":{"kind":"sphere","radius":0.5},"density":1.0,"friction":0.6,"restitution":0.0,"sensor":false,"contact_events":false,"sensor_events":false}"#;
+        let decoded = serde_json::from_str::<Collider>(legacy_collider)
+            .expect("legacy collider defaults collision masks");
+        assert_eq!(decoded.category_bits, u64::MAX);
+        assert_eq!(decoded.mask_bits, u64::MAX);
 
         let invalid = Collider {
             shape: ColliderShape::Sphere { radius: 0.0 },

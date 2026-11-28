@@ -1,8 +1,9 @@
 # Phase 5 — Physics and Lua
 
-**Status:** in progress. Fixed-step timing, the initial Box3D world/body
-adapter, serializable scene physics components, and ECS synchronization are
-implemented. Events/queries and Lua have not yet been integrated.
+**Status:** in progress. Fixed-step timing, the Box3D world/body adapter,
+serializable scene physics components, ECS synchronization, collision filters,
+ray queries, and contact/sensor event delivery are implemented. Lua has not
+yet been integrated.
 
 ## Roadmap scope
 
@@ -59,8 +60,10 @@ tests. This gate is not yet met.
   components with stable IDs and strict unknown-field rejection.
 - RigidBody captures body type, gravity/damping, sleep and bullet settings,
   and initial linear velocity.
-- Collider captures sphere/box geometry, material properties, sensor state
-  and event-generation flags.
+- Collider captures sphere/box geometry, material properties, sensor state,
+  event-generation flags and collision category/mask bitsets.
+- Newly added category/mask fields default to all bits when loading older
+  serialized Collider payloads that predate filtering.
 - PhysicsScene owns a PhysicsWorld and a generation-safe mapping from scene
   Entity handles to physics body handles.
 - synchronize creates bodies for entities with both components, updates
@@ -74,9 +77,28 @@ tests. This gate is not yet met.
   are not silently approximated.
 - Entities with only one of RigidBody or Collider do not participate.
 
-The scene synchronizer does not yet deliver collision/sensor events, expose
-ray/shape queries, support parented transforms or collider scaling, or provide
-joints, mesh/compound/height-field colliders.
+### Collision filtering, queries and events
+
+- Collider category and mask bitsets are passed to Box3D shape filters.
+  The backend's collision filter rules are used without a separate engine-side
+  approximation.
+- PhysicsRayCast supports world-space origin/displacement and query category
+  and mask bitsets. PhysicsWorld::cast_ray returns world-space points/normals
+  and hit fractions, sorted by fraction and then stable engine body handle.
+- Contact and sensor begin/end events are copied into owned engine-facing
+  snapshots after each successful fixed step.
+- Contact pairs are canonicalized by engine body handle. Event ordering is
+  deterministic by event kind (contact begin, contact end, sensor begin,
+  sensor end), then by handle pair. Sensor/visitor roles remain explicit.
+- Shape-to-body mappings preserve retired handles for one step, allowing
+  end events after body destruction to retain their original identity.
+- PhysicsScene translates physics body handles to scene entities for ray hits
+  and event snapshots, including the entity identity for a body removed during
+  the immediately preceding synchronization.
+
+Shape casts and overlap queries are not implemented. Parent transforms,
+collider scaling, joints, mesh/compound/height-field colliders are also not
+implemented.
 
 ## Backend evaluation
 
@@ -90,8 +112,8 @@ supported desktop targets.
 
 ## Remaining work
 
-- Add collision filtering, ray/shape queries and deterministic ordered
-  collision/sensor event delivery; specify and test event ordering.
+- Add shape casts and overlap queries, and continue validating event ordering
+  and lifecycle behavior across mutation edge cases.
 - Add Lua VM, bounded execution and diagnostics, script asset contract,
   lifecycle and pause/reload behavior.
 - Bind entity/component access through validated handles and deferred scene

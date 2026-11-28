@@ -11,10 +11,11 @@ mod world;
 pub use fixed_step::{
     FixedStepAccumulator, FixedStepConfig, FixedStepConfigError, FixedStepError, FixedStepPlan,
 };
-pub use scene::{PhysicsScene, PhysicsSceneError};
+pub use scene::{PhysicsScene, PhysicsSceneError, PhysicsSceneEvent, PhysicsSceneRayHit};
 pub use world::{
     ColliderDesc, ColliderShape, PhysicsBodyHandle, PhysicsBodyState, PhysicsBodyType,
-    PhysicsConfigError, PhysicsError, PhysicsWorld, PhysicsWorldConfig, RigidBodyDesc,
+    PhysicsConfigError, PhysicsError, PhysicsEvent, PhysicsRayCast, PhysicsRayHit, PhysicsWorld,
+    PhysicsWorldConfig, RigidBodyDesc,
 };
 
 /// Returns the crate's stable package name for diagnostics and tooling.
