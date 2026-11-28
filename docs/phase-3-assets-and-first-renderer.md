@@ -1,6 +1,6 @@
 # Phase 3 — Asset pipeline and first renderer
 
-**Status:** implementation substantially complete; final cross-platform CI and exit-gate review are pending. This document records tested behavior and explicit limitations; it is not a phase-completion claim.
+**Status:** complete and validated. The deterministic sample-rendering and malformed-asset exit gate is met. Cross-platform quality CI and the Vulkan lavapipe/X11 workflow passed; hardware validation also passed on an NVIDIA GeForce 940MX. Known limitations below are explicit scope boundaries or follow-on work, not unreported failures.
 
 ## Roadmap scope
 
@@ -63,4 +63,4 @@ Local validation for the current Phase 3 implementation:
 
 All five ignored GPU integration tests were run manually on the connected NVIDIA GeForce 940MX host with Khronos validation enabled: the three runtime scene tests (including five-slot PBR material upload, four-variant VulkanSceneRenderer pipeline selection, actual PBR draw and lit/clear pixel readback), offscreen renderer readback, and X11 swapchain/depth presentation. All passed with no Vulkan validation errors. The imported glTF -> ECS -> snapshot -> mesh upload -> sRGB texture/mip upload -> HDR render -> Reinhard tone-map -> sRGB RGBA8 pixel-readback regression also passed.
 
-GitHub CI for the current changes has not yet been run; Windows, macOS, Ubuntu, and the lavapipe/X11 Vulkan workflow remain the final cross-platform gate.
+GitHub CI run 46108903116 passed all quality jobs on Ubuntu 24.04, Windows, and macOS. Vulkan validation workflow run 46108903194 passed lavapipe offscreen rendering/readback, runtime scene/PBR material validation, and X11 swapchain/depth presentation. The repository was clean after commit cb6dfb1.
